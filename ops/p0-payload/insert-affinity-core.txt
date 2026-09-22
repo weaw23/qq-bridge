@@ -1,0 +1,40 @@
+  // ── 关系记忆与自我演化注入（P4：好感度+自我笔记 → 唤醒提示，形成自学习闭环） ──
+  function withAffinityContext(key, promptText) {
+    try {
+      const db = getMemoryDb();
+      const parts = [];
+      const st = getSocialV2State(key);
+      if (st) {
+        const cutoff = Date.now() - 48 * 3600 * 1000;
+        const seen = new Map();
+        for (let i = st.recentMessages.length - 1; i >= 0 && seen.size < 12; i--) {
+          const m = st.recentMessages[i];
+          if (m.isSelf || !m.userId) continue;
+          if ((m.time ?? 0) < cutoff) break;
+          if (!seen.has(String(m.userId))) seen.set(String(m.userId), m.sender || '');
+        }
+        if (seen.size) {
+          const rows = [];
+          for (const [uid, name] of seen) {
+            const r = db.prepare('SELECT score, notes FROM affinity WHERE member_id = ?').get(uid);
+            rows.push({ uid, name, score: r?.score ?? 0, notes: r?.notes ?? '' });
+          }
+          rows.sort((a, b) => Math.abs(b.score) - Math.abs(a.score));
+          const top = rows.slice(0, 6).filter((r) => r.score !== 0 || r.notes);
+          if (top.length) {
+            const lines = top.map((r) => `- ${r.name}(${r.uid})：好感度 ${r.score}${r.notes ? '，' + String(r.notes).slice(0, 60) : ''}`);
+            parts.push('【关系记忆 · 好感度（-100 疏离 ~ +100 亲近）】\n' + lines.join('\n') + '\n（对高分的人毒舌/撒娇可以更放肆，对 0 分或负分的人礼貌但有距离；互动后有变化就用 qq_affinity 更新）');
+          }
+        }
+      }
+      const notes = db.prepare('SELECT kind, content FROM persona_notes ORDER BY id DESC LIMIT 3').all();
+      if (notes.length) {
+        parts.push('【你的自我演化笔记（最近）】\n' + notes.map((n) => '- (' + n.kind + ') ' + String(n.content).slice(0, 80)).join('\n') + '\n（这是你自己沉淀的风格与自我认知，自然体现在言行里；有新感悟用 qq_self_note 记录）');
+      }
+      if (!parts.length) return promptText;
+      return parts.join('\n\n') + '\n\n' + promptText;
+    } catch {
+      return promptText;
+    }
+  }
+

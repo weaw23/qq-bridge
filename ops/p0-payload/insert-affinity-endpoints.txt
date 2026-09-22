@@ -1,0 +1,66 @@
+        // ── 关系记忆端点（P4：好感度 upsert/查询） ───────────────────────
+        if (req.method === 'POST' && url.pathname === '/api/socialV2/affinity') {
+          const body = await readBody();
+          const token = String(body.token ?? '').trim();
+          const key = String(body.key ?? '').trim();
+          if (currentMode !== 'reserved2') { sendJson({ ok: false, error: '该接口仅 reserved2 模式可用' }, 403); return; }
+          if (!key || !agentTokenOk(key, token)) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
+          const db = getMemoryDb();
+          const now = Date.now();
+          const action = String(body.action ?? 'list').trim();
+          const clamp = (n) => Math.max(-100, Math.min(100, Math.round(n)));
+          if (action === 'list') {
+            const limit = Math.min(Math.max(Number(body.limit) || 20, 1), 50);
+            const rows = db.prepare('SELECT member_id AS memberId, name, score, notes, updated_at AS updatedAt FROM affinity ORDER BY ABS(score) DESC, updated_at DESC LIMIT ?').all(limit);
+            sendJson({ ok: true, count: rows.length, affinity: rows });
+            return;
+          }
+          const memberId = String(body.memberId ?? '').trim();
+          if (!/^\d{5,12}$/.test(memberId)) { sendJson({ ok: false, error: 'memberId 必须是 5-12 位 QQ 号' }, 400); return; }
+          if (action === 'get') {
+            const row = db.prepare('SELECT member_id AS memberId, name, score, notes, updated_at AS updatedAt FROM affinity WHERE member_id = ?').get(memberId);
+            sendJson({ ok: true, affinity: row ?? { memberId, name: '', score: 0, notes: '', updatedAt: null } });
+            return;
+          }
+          if (action === 'bump' || action === 'set') {
+            const cur = db.prepare('SELECT score, notes FROM affinity WHERE member_id = ?').get(memberId);
+            const score = action === 'set'
+              ? clamp(Number(body.score) || 0)
+              : clamp((cur?.score ?? 0) + Math.max(-20, Math.min(20, Number(body.delta) || 0)));
+            const name = String(body.name ?? '').trim().slice(0, 30) || null;
+            const note = body.note != null ? String(body.note).trim().slice(0, 120) : null;
+            db.prepare('INSERT INTO affinity (member_id, name, score, notes, updated_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT(member_id) DO UPDATE SET name = COALESCE(?, name), score = ?, notes = COALESCE(?, notes), updated_at = ?')
+              .run(memberId, name ?? '', score, note ?? '', now, name, score, note, now);
+            const row = db.prepare('SELECT member_id AS memberId, name, score, notes, updated_at AS updatedAt FROM affinity WHERE member_id = ?').get(memberId);
+            sendJson({ ok: true, affinity: row });
+            return;
+          }
+          sendJson({ ok: false, error: 'action 仅支持 list/get/bump/set' }, 400);
+          return;
+        }
+
+        // ── 自我演化笔记端点（P4：她自己的风格/自我认知沉淀） ─────────────
+        if (req.method === 'POST' && url.pathname === '/api/socialV2/self-note') {
+          const body = await readBody();
+          const token = String(body.token ?? '').trim();
+          const key = String(body.key ?? '').trim();
+          if (currentMode !== 'reserved2') { sendJson({ ok: false, error: '该接口仅 reserved2 模式可用' }, 403); return; }
+          if (!key || !agentTokenOk(key, token)) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
+          const db = getMemoryDb();
+          const action = String(body.action ?? 'list').trim();
+          if (action === 'add') {
+            const content = String(body.content ?? '').trim().slice(0, 200);
+            if (!content) { sendJson({ ok: false, error: 'content 不能为空' }, 400); return; }
+            const kind = String(body.kind ?? 'style').slice(0, 12);
+            const rIns = db.prepare('INSERT INTO persona_notes (kind, content, created_at) VALUES (?, ?, ?)').run(kind, content, Date.now());
+            // 有界：只保留最近 50 条
+            db.prepare('DELETE FROM persona_notes WHERE id NOT IN (SELECT id FROM persona_notes ORDER BY id DESC LIMIT 50)').run();
+            sendJson({ ok: true, id: Number(rIns.lastInsertRowid), kind });
+            return;
+          }
+          const limit = Math.min(Math.max(Number(body.limit) || 5, 1), 20);
+          const rows = db.prepare('SELECT id, kind, content, created_at AS createdAt FROM persona_notes ORDER BY id DESC LIMIT ?').all(limit);
+          sendJson({ ok: true, count: rows.length, notes: rows });
+          return;
+        }
+

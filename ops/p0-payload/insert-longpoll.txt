@@ -1,0 +1,44 @@
+
+// 长轮询专用：node:http 直连，绕过 undici 默认 300s headersTimeout。
+// 背景：qq_wait_for_messages 最长要挂 600s（沉睡前观察固定 300s），
+// 用全局 fetch 会在整 300s 处被掐断并抛 "fetch failed" —— 这正是「等消息一直炸」的根因。
+function agentApiLong(path, init = {}) {
+  const { timeoutMs: _omit, ...rest } = init;
+  const waitMs = Number(_omit) || 15000;
+  const consoleToken = readConsoleToken();
+  return new Promise((resolve, reject) => {
+    const u = new URL(agentApiBase() + path);
+    const req = http.request(
+      {
+        hostname: u.hostname,
+        port: u.port || 80,
+        path: u.pathname + u.search,
+        method: rest.method || 'POST',
+        headers: {
+          'content-type': 'application/json',
+          ...(consoleToken ? { 'x-console-token': consoleToken } : {}),
+          ...(rest.headers ?? {})
+        }
+      },
+      (res) => {
+        let data = '';
+        res.setEncoding('utf8');
+        res.on('data', (c) => { data += c; });
+        res.on('end', () => {
+          let body = null;
+          try { body = JSON.parse(data); } catch { body = null; }
+          if (res.statusCode && res.statusCode >= 400) {
+            reject(new Error(body?.error || `桥接 API HTTP ${res.statusCode}`));
+            return;
+          }
+          resolve(body);
+        });
+      }
+    );
+    req.setTimeout(waitMs + 30000, () => req.destroy(new Error('桥接请求超时（' + Math.round((waitMs + 30000) / 1000) + 's）')));
+    req.on('error', (e) => reject(e));
+    if (rest.body) req.write(rest.body);
+    req.end();
+  });
+}
+
