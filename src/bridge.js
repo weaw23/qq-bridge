@@ -1731,15 +1731,20 @@ async function main() {
         req.on('error', () => fail(400, '请求体读取失败'));
         req.on('aborted', () => fail(400, '请求体读取中断'));
       });
+      // 面板 HTML（把控制台令牌注入页面，本机打开即用；数据接口仍逐次校验令牌）
+      const panelHtmlWithToken = () => {
+        const raw = fs.readFileSync(path.join(ROOT, 'console-panel.html'), 'utf8');
+        const tok = String(consoleToken ?? '');
+        return tok ? raw.split('__CONSOLE_TOKEN__').join(tok) : raw;
+      };
       // 控制台鉴权：所有请求需带 x-console-token 或 ?token=
       const suppliedToken = url.searchParams.get('token') ?? req.headers['x-console-token'];
       if (consoleToken && suppliedToken !== consoleToken) {
         if (req.method === 'GET' && url.pathname === '/panel') {
           // 面板外壳免令牌（数据接口仍校验）；页面内会让用户填令牌
           try {
-            const html = fs.readFileSync(path.join(ROOT, 'console-panel.html'), 'utf8');
             res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', ...SECURITY_HEADERS });
-            res.end(html);
+            res.end(panelHtmlWithToken());
           } catch (error) {
             res.writeHead(500, { 'content-type': 'text/plain; charset=utf-8', ...SECURITY_HEADERS });
             res.end('面板文件缺失：' + (error?.message ?? error));
@@ -4661,14 +4666,11 @@ async function main() {
           sendJson({ ok: true, count: rows.length, notes: rows });
           return;
         }
-
-
         // ── 控制台面板 API（集中开关 + 一键控制） ────────────────────────
         if (req.method === 'GET' && url.pathname === '/panel') {
           try {
-            const html = fs.readFileSync(path.join(ROOT, 'console-panel.html'), 'utf8');
             res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', ...SECURITY_HEADERS });
-            res.end(html);
+            res.end(panelHtmlWithToken());
           } catch (error) {
             res.writeHead(500, { 'content-type': 'text/plain; charset=utf-8', ...SECURITY_HEADERS });
             res.end('面板文件缺失：' + (error?.message ?? error));
