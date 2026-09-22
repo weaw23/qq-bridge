@@ -4664,6 +4664,18 @@ async function main() {
 
 
         // ── 控制台面板 API（集中开关 + 一键控制） ────────────────────────
+        if (req.method === 'GET' && url.pathname === '/panel') {
+          try {
+            const html = fs.readFileSync(path.join(ROOT, 'console-panel.html'), 'utf8');
+            res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', ...SECURITY_HEADERS });
+            res.end(html);
+          } catch (error) {
+            res.writeHead(500, { 'content-type': 'text/plain; charset=utf-8', ...SECURITY_HEADERS });
+            res.end('面板文件缺失：' + (error?.message ?? error));
+          }
+          return;
+        }
+
         if (req.method === 'GET' && url.pathname === '/api/panel/overview') {
           const login = await (async () => {
             try {
