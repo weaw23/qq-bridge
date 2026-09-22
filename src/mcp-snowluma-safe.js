@@ -1089,4 +1089,97 @@ if (cfg.socialV2?.tools?.getForwardMsg !== false) {
   );
 }
 
+
+if (cfg.socialV2?.tools?.getFriendHistory !== false) {
+  server.tool(
+    'qq_get_friend_msg_history',
+    '读取指定好友私聊的历史消息（只读，白名单内的好友才可读）。适合醒来后想回顾和某人的聊天脉络、确认之前答应过的事、或补上下文。返回消息数组（messageId/senderId/senderNickname/isSelf/text）。注意：isSelf=true 表示是机器人自己（哦鲸鲸）发的；count 1-30 默认 20。reserved2 下必须携带会话令牌 token。',
+    {
+      key: z.string().describe('会话 key，private:QQ号'),
+      token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
+      count: z.number().optional().describe('条数 1-30，默认 20'),
+      messageSeq: z.number().optional().describe('起始消息序号，从该序号往前取（可选）')
+    },
+    async ({ key, token, count, messageSeq }) => {
+      try {
+        const m = /^private:(\d+)$/.exec(String(key ?? '').trim());
+        if (!m) return { content: [{ type: 'text', text: 'key 必须是 private:QQ号（本工具只读好友私聊历史）' }], isError: true };
+        const data = await agentApi('/api/socialV2/friend-history', {
+          method: 'POST',
+          body: JSON.stringify({ userId: m[1], count, messageSeq: messageSeq ?? null }),
+          headers: { 'x-agent-token': token },
+          timeoutMs: 60000
+        });
+        return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
+      } catch (error) {
+        return { content: [{ type: 'text', text: '读取私聊历史失败：' + (error?.message ?? error) }], isError: true };
+      }
+    }
+  );
+}
+
+if (cfg.socialV2?.tools?.sendImage !== false) {
+  server.tool(
+    'qq_send_image',
+    '向指定会话发送一张图片，可附带一句说明文字。图片来源三选一：① https:// 开头的网络图片直链；② base64:// 开头的图片数据（上限约 9MB）；③ file:///D:/qqbot/outbox/ 下的本地文件（发本地图片请先把文件放进该目录）。一条消息=一张图+可选说明；想发多张请分多次调用。别刷屏，真人不会连发表情图。reserved2 下必须携带会话令牌 token。',
+    {
+      key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
+      token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
+      file: z.string().describe('图片来源：https://直链 或 base64://数据 或 file:///D:/qqbot/outbox/文件名'),
+      caption: z.string().optional().describe('随图说明文字（可选，纯文本）'),
+      replyToMessageId: z.union([z.number(), z.string()]).optional().describe('要引用/回复的消息 id（可选，非零整数）')
+    },
+    async ({ key, token, file, caption, replyToMessageId }) => {
+      try {
+        const parts = [{ type: 'image', file: String(file ?? '').trim() }];
+        const cap = String(caption ?? '').trim();
+        if (cap) parts.push({ type: 'text', text: cap });
+        const body = { key, parts };
+        if (replyToMessageId != null && String(replyToMessageId).trim() !== '') body.replyToMessageId = replyToMessageId;
+        const data = await agentApi('/api/send/rich', {
+          method: 'POST',
+          body: JSON.stringify(body),
+          headers: { 'x-agent-token': token },
+          timeoutMs: 60000
+        });
+        return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
+      } catch (error) {
+        return { content: [{ type: 'text', text: '发送图片失败：' + (error?.message ?? error) }], isError: true };
+      }
+    }
+  );
+}
+
+if (cfg.socialV2?.tools?.sendFace !== false) {
+  server.tool(
+    'qq_send_face',
+    '发送一个 QQ 系统小表情（黄色圆脸经典表情，非收藏表情包）。适合轻量情绪回应、逗趣、接梗；想发大表情包请用 qq_send_sticker。faceId 是 QQ 系统表情的数字 id（1-3 位数字，例如 13=微笑、14=撇嘴、21=飞吻、28=偷笑、32=疑问、49=拥抱、66=爱心、78=哈哈）。可附带一句话。一条消息=一个表情+可选文字。reserved2 下必须携带会话令牌 token。',
+    {
+      key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
+      token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
+      faceId: z.union([z.number(), z.string()]).describe('QQ 系统表情数字 id（1-3 位数字）'),
+      caption: z.string().optional().describe('随表情文字（可选，纯文本）'),
+      replyToMessageId: z.union([z.number(), z.string()]).optional().describe('要引用/回复的消息 id（可选，非零整数）')
+    },
+    async ({ key, token, faceId, caption, replyToMessageId }) => {
+      try {
+        const parts = [{ type: 'face', id: String(faceId ?? '').trim() }];
+        const cap = String(caption ?? '').trim();
+        if (cap) parts.push({ type: 'text', text: cap });
+        const body = { key, parts };
+        if (replyToMessageId != null && String(replyToMessageId).trim() !== '') body.replyToMessageId = replyToMessageId;
+        const data = await agentApi('/api/send/rich', {
+          method: 'POST',
+          body: JSON.stringify(body),
+          headers: { 'x-agent-token': token },
+          timeoutMs: 60000
+        });
+        return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
+      } catch (error) {
+        return { content: [{ type: 'text', text: '发送系统表情失败：' + (error?.message ?? error) }], isError: true };
+      }
+    }
+  );
+}
+
 await server.connect(new StdioServerTransport());
