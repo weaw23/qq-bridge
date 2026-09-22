@@ -1285,7 +1285,7 @@ async function main() {
   const pendingSendToolCalls = new Map(); // sessionId -> Set<callId>：等待 tool/result 的发送类调用
   // reserved2 防“忘记设置唤醒条件”：key -> 当前是否等待 AI 处理唤醒回合 / 本回合已更新唤醒配置 / 连续未设置次数
   const pendingWakeKeys = new Set();
-  const activeWaits = new Set(); // key：正在执行 qq_wait_for_messages 长轮询的会话，防止同一会话并发挂起
+  const activeWaits = new Map(); // key -> { startedAt, supersede }：正在执行 qq_wait_for_messages 长轮询的会话
   const pendingWakeLeaseTimers = new Map(); // key -> timeout：防止 accepted 但无 turn/end 的唤醒把 key 永久标记为 busy
   const wakeConfigUpdatedKeys = new Set();
   const markReadCalledKeys = new Set();
@@ -3722,12 +3722,22 @@ async function main() {
           const timeoutMs = Math.min(maxMs, Math.max(minMs, Math.round(Number(body.timeoutMs) || defaultMs)));
           const st = getSocialV2State(key);
           // 同一会话只允许一个长轮询等待，避免并发挂起耗尽 HTTP handler。
-          if (activeWaits.has(key)) {
-            sendJson({ ok: false, error: '该会话已有一个等待中的 qq_wait_for_messages，请等待它结束' }, 429);
-            return;
+          let aborted = false;
+          // 并发保护：同一会话只允许一个长轮询；旧锁「被新请求取代」而不是硬报 429——
+          // MCP 客户端（undici）在 300s 处掐断连接时锁可能残留，硬 429 会让 AI 误判功能坏了。
+          const prevWait = activeWaits.get(key);
+          if (prevWait) {
+            if (Date.now() - prevWait.startedAt < 1200) {
+              sendJson({ ok: false, error: '该会话刚刚发起过等待，请 1 秒后重试' }, 429);
+              return;
+            }
+            prevWait.supersede();
           }
-          activeWaits.add(key);
-          const finishWait = () => activeWaits.delete(key);
+          const waitEntry = { startedAt: Date.now(), supersede: () => { aborted = true; } };
+          activeWaits.set(key, waitEntry);
+          const finishWait = () => {
+            if (activeWaits.get(key) === waitEntry) activeWaits.delete(key);
+          };
           req.on('close', finishWait);
           const minQuietAfterNewMs = Number.isFinite(Number(waitCfg.minQuietAfterNewMs)) ? Math.max(0, Number(waitCfg.minQuietAfterNewMs)) : 10000;
           const suggestedQuietMs = Math.max(suggestQuietMsV2(st), minQuietAfterNewMs);
@@ -3746,7 +3756,6 @@ async function main() {
           const start = Date.now();
           let arrived = false;
           let lastNewAt = 0;
-          let aborted = false;
           req.on('close', () => { aborted = true; });
           while (Date.now() - start < timeoutMs && !aborted) {
             let nowSeq = st.lastUnreadSeq || 0;
