@@ -4600,7 +4600,10 @@ async function main() {
               signal: AbortSignal.timeout(30000)
             });
             const rb = await res.json().catch(() => ({}));
-            if (!res.ok || rb.status !== 'ok' || rb.retcode !== 0) throw new Error('OneBot ' + actionRich + ' 失败: ' + (rb.wording || rb.retcode || res.status));
+            if (!res.ok || rb.status !== 'ok' || rb.retcode !== 0) {
+              const muteNoteR = await diagnoseGroupSendFailure(kindRich, idRich, rb);
+              throw new Error('OneBot ' + actionRich + ' 失败: ' + (rb.wording || rb.retcode || res.status) + muteNoteR);
+            }
             log('[reserved2] 工具富媒体发送 ' + key + ': 成功（' + segments.map((s) => s.type).join('+') + '）');
             appendActivity(key + ' 富媒体发送：' + segments.map((s) => s.type).join('+'));
             sendJson({ ok: true, messageId: rb?.data?.message_id ?? null });
@@ -5125,27 +5128,33 @@ async function main() {
     const body = await res.json().catch(() => ({}));
     if (!res.ok || body.status !== 'ok' || body.retcode !== 0) {
       const hint = res.status === 426 ? '（HTTP 426：snowluma.httpUrl 可能指向了 WebSocket 端口，请检查 config.json 的 snowluma.httpUrl 是否为 OneBot HTTP API 地址）' : '';
-      let muteNote = '';
-      // result=120（群发送被拒）时自查禁言状态，把原因直接告诉 agent，避免盲目重试
-      if (kind === 'group' && (body.retcode === 120 || /rejected/i.test(String(body.wording ?? '')))) {
-        try {
-          const miRes = await fetch(`${httpUrl}/get_group_member_info`, {
-            method: 'POST',
-            headers: { 'content-type': 'application/json', ...(cfg.snowluma?.accessToken ? { authorization: `Bearer ${cfg.snowluma.accessToken}` } : {}) },
-            body: JSON.stringify({ group_id: Number(id), user_id: selfUserId || Number(cfg.botQQ ?? 0) }),
-            signal: AbortSignal.timeout(8000)
-          });
-          const mi = await miRes.json().catch(() => ({}));
-          const shut = Number(mi?.data?.shut_up_timestamp ?? 0);
-          if (shut > Date.now() / 1000) {
-            const until = new Date(shut * 1000).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' });
-            muteNote = `（诊断：本账号在该群被禁言至 ${until}，期间所有发言必然失败。请勿重试发言，改用 qq_set_wake_config 设长时间潜水，并可在私聊里告知主人）`;
-          }
-        } catch {}
-      }
+      const muteNote = await diagnoseGroupSendFailure(kind, id, body);
       throw new Error(`OneBot ${action} 失败: ${body.wording || body.retcode || res.status}${hint}${muteNote}`);
     }
     return body.data;
+  }
+
+  // 群发送失败时的禁言自诊：retcode=120/rejected 时查自身成员信息，把禁言期限直接写进错误信息
+  async function diagnoseGroupSendFailure(kind, id, obBody) {
+    try {
+      if (kind !== 'group') return '';
+      const code = Number(obBody?.retcode ?? 0);
+      if (!(code === 120 || /rejected/i.test(String(obBody?.wording ?? '')))) return '';
+      const httpUrlD = String(cfg.snowluma?.httpUrl || 'http://127.0.0.1:3000').replace(/\/+$/, '');
+      const resD = await fetch(httpUrlD + '/get_group_member_info', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', ...(cfg.snowluma?.accessToken ? { authorization: 'Bearer ' + cfg.snowluma.accessToken } : {}) },
+        body: JSON.stringify({ group_id: Number(id), user_id: selfUserId || Number(cfg.botQQ ?? 0) }),
+        signal: AbortSignal.timeout(8000)
+      });
+      const mi = await resD.json().catch(() => ({}));
+      const shut = Number(mi?.data?.shut_up_timestamp ?? 0);
+      if (shut > Date.now() / 1000) {
+        const until = new Date(shut * 1000).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' });
+        return `（诊断：本账号在该群被禁言至 ${until}，期间所有发言必然失败。请勿重试发言，改用 qq_set_wake_config 设长时间潜水，并可在私聊里告知主人）`;
+      }
+    } catch {}
+    return '';
   }
 
   // ── 图片/表情字节解析（供一代自动内联与二代按需工具） ────────────────────
