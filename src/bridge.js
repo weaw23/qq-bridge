@@ -4693,7 +4693,10 @@ async function main() {
           const db = getMemoryDb();
           const countOf = (sql) => { try { return Number(db.prepare(sql).get()?.c ?? 0); } catch { return 0; } };
           let stickerCount = 0;
-          try { stickerCount = (JSON.parse(fs.readFileSync(path.join(STATE_DIR, 'stickers.json'), 'utf8'))?.stickers ?? []).length; } catch {}
+          try {
+            const sj = JSON.parse(fs.readFileSync(path.join(STATE_DIR, 'stickers.json'), 'utf8'));
+            stickerCount = Array.isArray(sj) ? sj.length : (sj?.stickers ?? []).length;
+          } catch {}
           const up = Math.round(process.uptime());
           const sessions = Object.keys(state.sessions ?? {}).map((k) => {
             const st = getSocialV2State(k);
