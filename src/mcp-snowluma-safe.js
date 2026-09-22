@@ -7,6 +7,7 @@
 //   allow.groups / allow.private，否则拒绝 —— agent 只能往被允许的地方发消息。
 // - 所有调用走 OneBot HTTP API（httpUrl + accessToken）。
 import fs from 'node:fs';
+import http from 'node:http';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
@@ -153,6 +154,50 @@ async function agentApi(path, init = {}) {
     throw new Error(body?.error || `桥接 API HTTP ${res.status}`);
   }
   return body;
+}
+
+
+// 长轮询专用：node:http 直连，绕过 undici 默认 300s headersTimeout。
+// 背景：qq_wait_for_messages 最长要挂 600s（沉睡前观察固定 300s），
+// 用全局 fetch 会在整 300s 处被掐断并抛 "fetch failed" —— 这正是「等消息一直炸」的根因。
+function agentApiLong(path, init = {}) {
+  const { timeoutMs: _omit, ...rest } = init;
+  const waitMs = Number(_omit) || 15000;
+  const consoleToken = readConsoleToken();
+  return new Promise((resolve, reject) => {
+    const u = new URL(agentApiBase() + path);
+    const req = http.request(
+      {
+        hostname: u.hostname,
+        port: u.port || 80,
+        path: u.pathname + u.search,
+        method: rest.method || 'POST',
+        headers: {
+          'content-type': 'application/json',
+          ...(consoleToken ? { 'x-console-token': consoleToken } : {}),
+          ...(rest.headers ?? {})
+        }
+      },
+      (res) => {
+        let data = '';
+        res.setEncoding('utf8');
+        res.on('data', (c) => { data += c; });
+        res.on('end', () => {
+          let body = null;
+          try { body = JSON.parse(data); } catch { body = null; }
+          if (res.statusCode && res.statusCode >= 400) {
+            reject(new Error(body?.error || `桥接 API HTTP ${res.statusCode}`));
+            return;
+          }
+          resolve(body);
+        });
+      }
+    );
+    req.setTimeout(waitMs + 30000, () => req.destroy(new Error('桥接请求超时（' + Math.round((waitMs + 30000) / 1000) + 's）')));
+    req.on('error', (e) => reject(e));
+    if (rest.body) req.write(rest.body);
+    req.end();
+  });
 }
 
 async function authorizeRead(key, token) {
@@ -556,7 +601,7 @@ server.tool(
   },
   async ({ key, token, timeoutMs, minNewMessages, quietMs }) => {
     try {
-      const data = await agentApi('/api/socialV2/wait', {
+      const data = await agentApiLong('/api/socialV2/wait', {
         method: 'POST',
         body: JSON.stringify({ key, timeoutMs, minNewMessages, quietMs }),
         headers: { 'x-agent-token': token },
@@ -1518,6 +1563,65 @@ if (cfg.socialV2?.tools?.myStatus !== false) {
         return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
       } catch (error) {
         return { content: [{ type: 'text', text: '查询好友列表失败：' + (error?.message ?? error) }], isError: true };
+      }
+    }
+  );
+}
+
+
+if (cfg.socialV2?.tools?.affinity !== false) {
+  server.tool(
+    'qq_affinity',
+    '维护你对每个人的好感度（-100 疏离 ~ +100 亲近）与一句话印象。这是你的社交记忆：聊天时对方的言行会改变你的观感，你要主动更新它——被善待、聊得来、投喂好梗就 bump +；被冒犯、无礼、让你烦就 bump -。更新后桥接会在每次唤醒时把好感度最高的几个人注入你的视野，你的态度（放肆毒舌/撒娇 vs 礼貌疏离）自然跟着变，这就是你的"关系感"。action：list（看全部，按绝对值排序）/ get（查某人）/ bump（加减，delta 单次 ±20 内）/ set（直接设定分数）。',
+    {
+      key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
+      token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
+      action: z.string().describe('list | get | bump | set'),
+      memberId: z.union([z.number(), z.string()]).optional().describe('群友 QQ 号（get/bump/set 必填）'),
+      name: z.string().optional().describe('对方当前称呼/群名片（可选，会更新显示名）'),
+      delta: z.number().optional().describe('action=bump 时的变化量（-20~+20）'),
+      score: z.number().optional().describe('action=set 时的目标分数（-100~100）'),
+      note: z.string().optional().describe('一句话印象/最新观感（可选，覆盖旧备注）'),
+      limit: z.number().optional().describe('action=list 返回条数，默认 20')
+    },
+    async ({ key, token, action, memberId, name, delta, score, note, limit }) => {
+      try {
+        const body = { key, token, action };
+        if (memberId != null) body.memberId = String(memberId);
+        if (name != null) body.name = name;
+        if (delta != null) body.delta = delta;
+        if (score != null) body.score = score;
+        if (note != null) body.note = note;
+        if (limit != null) body.limit = limit;
+        const data = await agentApi('/api/socialV2/affinity', { method: 'POST', body: JSON.stringify(body), headers: { 'x-agent-token': token }, timeoutMs: 60000 });
+        return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
+      } catch (error) {
+        return { content: [{ type: 'text', text: '好感度操作失败：' + (error?.message ?? error) }], isError: true };
+      }
+    }
+  );
+
+  server.tool(
+    'qq_self_note',
+    '写下你对自己的观察与风格微调（自我演化笔记，永久保存并在唤醒时提醒你自己）。什么时候写：你发现自己形成了新的口头禅/更顺手的怼人方式、对某类话题的新态度、对自己身份的新认知（例如"我其实挺享受被叫鲸鲸"）、或想改掉某个习惯。kind：style（说话风格）/ self（自我认知）/ quirk（小习惯）。action：add / list。',
+    {
+      key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
+      token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
+      action: z.string().describe('add | list'),
+      kind: z.string().optional().describe('style | self | quirk（默认 style）'),
+      content: z.string().optional().describe('笔记内容，一句话（action=add 必填，最长 200 字）'),
+      limit: z.number().optional().describe('action=list 返回条数，默认 5')
+    },
+    async ({ key, token, action, kind, content, limit }) => {
+      try {
+        const body = { key, token, action };
+        if (kind != null) body.kind = kind;
+        if (content != null) body.content = content;
+        if (limit != null) body.limit = limit;
+        const data = await agentApi('/api/socialV2/self-note', { method: 'POST', body: JSON.stringify(body), headers: { 'x-agent-token': token }, timeoutMs: 60000 });
+        return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
+      } catch (error) {
+        return { content: [{ type: 'text', text: '自我笔记操作失败：' + (error?.message ?? error) }], isError: true };
       }
     }
   );

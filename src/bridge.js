@@ -1192,6 +1192,46 @@ async function main() {
       .map(publicSlangEntry);
   }
 
+  // ── 关系记忆与自我演化注入（P4：好感度+自我笔记 → 唤醒提示，形成自学习闭环） ──
+  function withAffinityContext(key, promptText) {
+    try {
+      const db = getMemoryDb();
+      const parts = [];
+      const st = getSocialV2State(key);
+      if (st) {
+        const cutoff = Date.now() - 48 * 3600 * 1000;
+        const seen = new Map();
+        for (let i = st.recentMessages.length - 1; i >= 0 && seen.size < 12; i--) {
+          const m = st.recentMessages[i];
+          if (m.isSelf || !m.userId) continue;
+          if ((m.time ?? 0) < cutoff) break;
+          if (!seen.has(String(m.userId))) seen.set(String(m.userId), m.sender || '');
+        }
+        if (seen.size) {
+          const rows = [];
+          for (const [uid, name] of seen) {
+            const r = db.prepare('SELECT score, notes FROM affinity WHERE member_id = ?').get(uid);
+            rows.push({ uid, name, score: r?.score ?? 0, notes: r?.notes ?? '' });
+          }
+          rows.sort((a, b) => Math.abs(b.score) - Math.abs(a.score));
+          const top = rows.slice(0, 6).filter((r) => r.score !== 0 || r.notes);
+          if (top.length) {
+            const lines = top.map((r) => `- ${r.name}(${r.uid})：好感度 ${r.score}${r.notes ? '，' + String(r.notes).slice(0, 60) : ''}`);
+            parts.push('【关系记忆 · 好感度（-100 疏离 ~ +100 亲近）】\n' + lines.join('\n') + '\n（对高分的人毒舌/撒娇可以更放肆，对 0 分或负分的人礼貌但有距离；互动后有变化就用 qq_affinity 更新）');
+          }
+        }
+      }
+      const notes = db.prepare('SELECT kind, content FROM persona_notes ORDER BY id DESC LIMIT 3').all();
+      if (notes.length) {
+        parts.push('【你的自我演化笔记（最近）】\n' + notes.map((n) => '- (' + n.kind + ') ' + String(n.content).slice(0, 80)).join('\n') + '\n（这是你自己沉淀的风格与自我认知，自然体现在言行里；有新感悟用 qq_self_note 记录）');
+      }
+      if (!parts.length) return promptText;
+      return parts.join('\n\n') + '\n\n' + promptText;
+    } catch {
+      return promptText;
+    }
+  }
+
   function withSlangContext(promptText) {
     const now = new Date();
     const timeLine = `【当前时间】${now.toLocaleString('zh-CN', { hour12: false })}（${Intl.DateTimeFormat().resolvedOptions().timeZone}）`;
@@ -4536,6 +4576,72 @@ async function main() {
           return;
         }
 
+        // ── 关系记忆端点（P4：好感度 upsert/查询） ───────────────────────
+        if (req.method === 'POST' && url.pathname === '/api/socialV2/affinity') {
+          const body = await readBody();
+          const token = String(body.token ?? '').trim();
+          const key = String(body.key ?? '').trim();
+          if (currentMode !== 'reserved2') { sendJson({ ok: false, error: '该接口仅 reserved2 模式可用' }, 403); return; }
+          if (!key || !agentTokenOk(key, token)) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
+          const db = getMemoryDb();
+          const now = Date.now();
+          const action = String(body.action ?? 'list').trim();
+          const clamp = (n) => Math.max(-100, Math.min(100, Math.round(n)));
+          if (action === 'list') {
+            const limit = Math.min(Math.max(Number(body.limit) || 20, 1), 50);
+            const rows = db.prepare('SELECT member_id AS memberId, name, score, notes, updated_at AS updatedAt FROM affinity ORDER BY ABS(score) DESC, updated_at DESC LIMIT ?').all(limit);
+            sendJson({ ok: true, count: rows.length, affinity: rows });
+            return;
+          }
+          const memberId = String(body.memberId ?? '').trim();
+          if (!/^\d{5,12}$/.test(memberId)) { sendJson({ ok: false, error: 'memberId 必须是 5-12 位 QQ 号' }, 400); return; }
+          if (action === 'get') {
+            const row = db.prepare('SELECT member_id AS memberId, name, score, notes, updated_at AS updatedAt FROM affinity WHERE member_id = ?').get(memberId);
+            sendJson({ ok: true, affinity: row ?? { memberId, name: '', score: 0, notes: '', updatedAt: null } });
+            return;
+          }
+          if (action === 'bump' || action === 'set') {
+            const cur = db.prepare('SELECT score, notes FROM affinity WHERE member_id = ?').get(memberId);
+            const score = action === 'set'
+              ? clamp(Number(body.score) || 0)
+              : clamp((cur?.score ?? 0) + Math.max(-20, Math.min(20, Number(body.delta) || 0)));
+            const name = String(body.name ?? '').trim().slice(0, 30) || null;
+            const note = body.note != null ? String(body.note).trim().slice(0, 120) : null;
+            db.prepare('INSERT INTO affinity (member_id, name, score, notes, updated_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT(member_id) DO UPDATE SET name = COALESCE(?, name), score = ?, notes = COALESCE(?, notes), updated_at = ?')
+              .run(memberId, name ?? '', score, note ?? '', now, name, score, note, now);
+            const row = db.prepare('SELECT member_id AS memberId, name, score, notes, updated_at AS updatedAt FROM affinity WHERE member_id = ?').get(memberId);
+            sendJson({ ok: true, affinity: row });
+            return;
+          }
+          sendJson({ ok: false, error: 'action 仅支持 list/get/bump/set' }, 400);
+          return;
+        }
+
+        // ── 自我演化笔记端点（P4：她自己的风格/自我认知沉淀） ─────────────
+        if (req.method === 'POST' && url.pathname === '/api/socialV2/self-note') {
+          const body = await readBody();
+          const token = String(body.token ?? '').trim();
+          const key = String(body.key ?? '').trim();
+          if (currentMode !== 'reserved2') { sendJson({ ok: false, error: '该接口仅 reserved2 模式可用' }, 403); return; }
+          if (!key || !agentTokenOk(key, token)) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
+          const db = getMemoryDb();
+          const action = String(body.action ?? 'list').trim();
+          if (action === 'add') {
+            const content = String(body.content ?? '').trim().slice(0, 200);
+            if (!content) { sendJson({ ok: false, error: 'content 不能为空' }, 400); return; }
+            const kind = String(body.kind ?? 'style').slice(0, 12);
+            const rIns = db.prepare('INSERT INTO persona_notes (kind, content, created_at) VALUES (?, ?, ?)').run(kind, content, Date.now());
+            // 有界：只保留最近 50 条
+            db.prepare('DELETE FROM persona_notes WHERE id NOT IN (SELECT id FROM persona_notes ORDER BY id DESC LIMIT 50)').run();
+            sendJson({ ok: true, id: Number(rIns.lastInsertRowid), kind });
+            return;
+          }
+          const limit = Math.min(Math.max(Number(body.limit) || 5, 1), 20);
+          const rows = db.prepare('SELECT id, kind, content, created_at AS createdAt FROM persona_notes ORDER BY id DESC LIMIT ?').all(limit);
+          sendJson({ ok: true, count: rows.length, notes: rows });
+          return;
+        }
+
         // ── 富媒体发送端点（P0：图片/系统表情段式发送，同一套白名单/令牌/审计） ──
         if (req.method === 'POST' && url.pathname === '/api/send/rich') {
           const body = await readBody();
@@ -6457,7 +6563,7 @@ async function main() {
       }
       throw error;
     }
-    let content = [{ type: 'text', text: withSlangContext(promptText) }];
+    let content = [{ type: 'text', text: withAffinityContext(key, withSlangContext(promptText)) }];
     if (Array.isArray(opts.media) && opts.media.length > 0) {
       const imageParts = await resolveMediaList(opts.media);
       content = [{ type: 'text', text: withSlangContext(promptText) }, ...imageParts];
@@ -7142,6 +7248,8 @@ async function main() {
     db.exec("CREATE TABLE IF NOT EXISTS facts (id INTEGER PRIMARY KEY AUTOINCREMENT, content TEXT NOT NULL, category TEXT NOT NULL DEFAULT 'fact', source_key TEXT NOT NULL DEFAULT '', importance INTEGER NOT NULL DEFAULT 1, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)");
     db.exec("CREATE TABLE IF NOT EXISTS reminders (id INTEGER PRIMARY KEY AUTOINCREMENT, conv_key TEXT NOT NULL, text TEXT NOT NULL, fire_at INTEGER NOT NULL, status TEXT NOT NULL DEFAULT 'pending', created_at INTEGER NOT NULL, fired_at INTEGER)");
     db.exec('CREATE INDEX IF NOT EXISTS idx_reminders_due ON reminders (status, fire_at)');
+    db.exec("CREATE TABLE IF NOT EXISTS affinity (member_id TEXT PRIMARY KEY, name TEXT NOT NULL DEFAULT '', score INTEGER NOT NULL DEFAULT 0, notes TEXT NOT NULL DEFAULT '', updated_at INTEGER NOT NULL)");
+    db.exec("CREATE TABLE IF NOT EXISTS persona_notes (id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL DEFAULT 'style', content TEXT NOT NULL, created_at INTEGER NOT NULL)");
     memoryDb = db;
     log('记忆数据库已就绪：' + path.join(STATE_DIR, 'memory.db'));
     return db;
