@@ -1,0 +1,325 @@
+        // ── 控制台面板 API（集中开关 + 一键控制） ────────────────────────
+        if (req.method === 'GET' && url.pathname === '/panel') {
+          try {
+            const html = fs.readFileSync(path.join(ROOT, 'console-panel.html'), 'utf8');
+            res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', ...SECURITY_HEADERS });
+            res.end(html);
+          } catch (error) {
+            res.writeHead(500, { 'content-type': 'text/plain; charset=utf-8', ...SECURITY_HEADERS });
+            res.end('面板文件缺失：' + (error?.message ?? error));
+          }
+          return;
+        }
+
+        if (req.method === 'GET' && url.pathname === '/api/panel/overview') {
+          const login = await (async () => {
+            try {
+              const u = String(cfg.snowluma?.httpUrl || 'http://127.0.0.1:3000').replace(/\/+$/, '');
+              const r = await fetch(u + '/get_login_info', {
+                method: 'POST',
+                headers: { 'content-type': 'application/json', ...(cfg.snowluma?.accessToken ? { authorization: 'Bearer ' + cfg.snowluma.accessToken } : {}) },
+                body: '{}',
+                signal: AbortSignal.timeout(3000)
+              });
+              const j = await r.json().catch(() => ({}));
+              return { online: r.ok && j.status === 'ok' && j.retcode === 0, nickname: j.data?.nickname ?? '', userId: j.data?.user_id ?? null };
+            } catch { return { online: false, nickname: '', userId: null }; }
+          })();
+          const db = getMemoryDb();
+          const countOf = (sql) => { try { return Number(db.prepare(sql).get()?.c ?? 0); } catch { return 0; } };
+          let stickerCount = 0;
+          try { stickerCount = (JSON.parse(fs.readFileSync(path.join(STATE_DIR, 'stickers.json'), 'utf8'))?.stickers ?? []).length; } catch {}
+          const up = Math.round(process.uptime());
+          const sessions = Object.keys(state.sessions ?? {}).map((k) => {
+            const st = getSocialV2State(k);
+            return {
+              key: k,
+              sessionId: state.sessions[k],
+              unread: (st.unread ?? []).length,
+              lastWakeReason: st.lastWakeReason ?? '',
+              lastIncomingAt: st.lastIncomingAt ?? 0,
+              wakeMode: st.wakeConfig?.mode ?? '',
+              sleepUntil: st.wakeConfig?.sleepUntil ?? null
+            };
+          });
+          let toolCount = null;
+          try { toolCount = (fs.readFileSync(path.join(ROOT, 'src', 'mcp-snowluma-safe.js'), 'utf8').match(/server\.tool\(/g) ?? []).length; } catch {}
+          sendJson({
+            ok: true,
+            mode: currentMode,
+            paused: !!socialV2.paused,
+            dshReady,
+            gateway: login.online,
+            qq: login,
+            model: { provider: cfg.dsh?.provider ?? '', model: cfg.dsh?.model ?? '', reasoningEffort: cfg.dsh?.reasoningEffort ?? 'default' },
+            allowPrivate: cfg.allow?.private ?? [],
+            allowGroups: cfg.allow?.groups ?? [],
+            consolePort: Number(cfg.consolePort) || 3100,
+            pid: process.pid,
+            uptimeText: up > 3600 ? Math.floor(up / 3600) + ' 小时 ' + Math.floor((up % 3600) / 60) + ' 分' : Math.floor(up / 60) + ' 分 ' + (up % 60) + ' 秒',
+            toolCount,
+            toggles: {
+              pcControl: cfg.pcControl ?? {},
+              socialV2: { enabled: cfg.socialV2?.enabled !== false, tools: cfg.socialV2?.tools ?? {} },
+              slang: cfg.slang ?? {},
+              security: cfg.security ?? {}
+            },
+            wakeLimits: cfg.socialV2?.wake ?? {},
+            sessions,
+            counts: {
+              facts: countOf('SELECT COUNT(*) AS c FROM facts'),
+              affinity: countOf('SELECT COUNT(*) AS c FROM affinity'),
+              reminders: countOf("SELECT COUNT(*) AS c FROM reminders WHERE status = 'pending'"),
+              slang: Array.isArray(slangEntries) ? slangEntries.length : 0,
+              stickers: stickerCount
+            }
+          });
+          return;
+        }
+
+        if (req.method === 'POST' && url.pathname === '/api/panel/toggle') {
+          const body = await readBody();
+          const p = String(body.path ?? '').trim();
+          const allowedExact = new Set(['pcControl.enabled', 'socialV2.enabled', 'slang.enabled', 'security.interceptNotify', 'socialV2.paused']);
+          const isToolFlag = /^socialV2\.tools\.[A-Za-z]{2,24}$/.test(p);
+          const isWake = p === 'socialV2.wake';
+          if (!allowedExact.has(p) && !isToolFlag && !isWake) { sendJson({ ok: false, error: '不允许修改的配置项：' + p }, 400); return; }
+          // 内存态即时生效
+          const setPath = (obj, pathStr, value) => {
+            const ks = pathStr.split('.');
+            let cur = obj;
+            for (let i = 0; i < ks.length - 1; i++) { if (typeof cur[ks[i]] !== 'object' || cur[ks[i]] === null) cur[ks[i]] = {}; cur = cur[ks[i]]; }
+            cur[ks[ks.length - 1]] = value;
+          };
+          setPath(cfg, p, body.value);
+          // 落盘（读-合并-写，保留未知键）
+          try {
+            const configFile = path.join(ROOT, 'config.json');
+            const file = readJsonSafe(configFile, null, true) ?? {};
+            setPath(file, p, body.value);
+            fs.writeFileSync(configFile, JSON.stringify(file, null, 2) + '\n');
+          } catch (error) {
+            sendJson({ ok: false, error: '写入 config.json 失败：' + (error?.message ?? error) }, 500);
+            return;
+          }
+          log(`[panel] 开关变更 ${p} = ${JSON.stringify(body.value)}`);
+          sendJson({ ok: true, path: p, value: body.value });
+          return;
+        }
+
+        if (req.method === 'POST' && url.pathname === '/api/panel/model') {
+          const body = await readBody();
+          const provider = String(body.provider ?? '').trim();
+          const model = String(body.model ?? '').trim();
+          const effort = String(body.reasoningEffort ?? 'default').trim();
+          if (!provider || !model) { sendJson({ ok: false, error: 'provider / model 不能为空' }, 400); return; }
+          cfg.dsh.provider = provider;
+          cfg.dsh.model = model;
+          cfg.dsh.reasoningEffort = effort;
+          try {
+            const configFile = path.join(ROOT, 'config.json');
+            const file = readJsonSafe(configFile, null, true) ?? {};
+            file.dsh = { ...(file.dsh ?? {}), provider, model, reasoningEffort: effort };
+            fs.writeFileSync(configFile, JSON.stringify(file, null, 2) + '\n');
+          } catch (error) { sendJson({ ok: false, error: '保存失败：' + (error?.message ?? error) }, 500); return; }
+          log(`[panel] 模型切换为 ${provider}/${model}（effort=${effort}）`);
+          sendJson({ ok: true, note: `已保存 ${provider}/${model}（新会话生效；点「重建全部会话」立即生效）` });
+          return;
+        }
+
+        if (req.method === 'GET' && url.pathname === '/api/panel/data') {
+          const kind = String(url.searchParams.get('kind') ?? 'affinity');
+          const db = getMemoryDb();
+          const esc = (s) => String(s ?? '').replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+          let html = '';
+          if (kind === 'affinity') {
+            const rows = db.prepare('SELECT member_id AS memberId, name, score, notes, updated_at AS updatedAt FROM affinity ORDER BY ABS(score) DESC LIMIT 100').all();
+            html = '<table><tr><th>QQ</th><th>称呼</th><th>好感度</th><th>印象</th><th>操作</th></tr>' + rows.map((r) =>
+              `<tr><td>${esc(r.memberId)}</td><td>${esc(r.name)}</td>
+               <td><input type="number" value="${r.score}" style="width:78px" id="af_${r.memberId}"></td>
+               <td><input type="text" value="${esc(r.notes)}" style="width:100%" id="afn_${r.memberId}"></td>
+               <td><button class="sm" onclick="editRow('affinity','${r.memberId}')">保存</button>
+                   <button class="sm danger" onclick="delRow('affinity','${r.memberId}')">删</button></td></tr>`).join('') + '</table>';
+          } else if (kind === 'facts') {
+            const rows = db.prepare('SELECT id, content, category, importance, created_at FROM facts ORDER BY id DESC LIMIT 200').all();
+            html = '<table><tr><th>#</th><th>内容</th><th>类别</th><th>重要度</th><th></th></tr>' + rows.map((r) =>
+              `<tr><td>${r.id}</td><td>${esc(r.content)}</td><td>${esc(r.category)}</td><td>${r.importance}</td>
+               <td><button class="sm danger" onclick="delRow('facts',${r.id})">删</button></td></tr>`).join('') + '</table>';
+          } else if (kind === 'reminders') {
+            const rows = db.prepare('SELECT id, conv_key, text, fire_at, status FROM reminders ORDER BY fire_at DESC LIMIT 100').all();
+            html = '<table><tr><th>#</th><th>会话</th><th>内容</th><th>触发时间</th><th>状态</th><th></th></tr>' + rows.map((r) =>
+              `<tr><td>${r.id}</td><td>${esc(r.conv_key)}</td><td>${esc(r.text)}</td><td>${new Date(r.fire_at).toLocaleString('zh-CN')}</td><td>${esc(r.status)}</td>
+               <td>${r.status === 'pending' ? `<button class="sm" onclick="cancelReminder(${r.id},'${esc(r.conv_key)}')">取消</button>` : ''}</td></tr>`).join('') + '</table>';
+          } else if (kind === 'activity') {
+            const tail = readActivityTail(150).slice().reverse();
+            html = '<table><tr><th>时间</th><th>内容</th></tr>' + tail.map((l) => `<tr><td style="white-space:nowrap">${esc(String(l).slice(0, 19))}</td><td>${esc(String(l).slice(19))}</td></tr>`).join('') + '</table>';
+          } else if (kind === 'tool-log') {
+            let lines = [];
+            try { lines = fs.readFileSync(path.join(STATE_DIR, 'tool-calls.jsonl'), 'utf8').trim().split('\n').slice(-150).reverse(); } catch {}
+            html = '<table><tr><th>记录</th></tr>' + lines.map((l) => {
+              let txt = l;
+              try { const o = JSON.parse(l); txt = `${o.time ? new Date(o.time).toLocaleTimeString('zh-CN') : ''} ${o.key ?? ''} ${o.tool ?? o.name ?? ''} ${o.type ?? ''} ${o.ok === false ? '✗' : o.ok === true ? '✓' : ''}`; } catch {}
+              return `<tr><td>${esc(txt)}</td></tr>`;
+            }).join('') + '</table>';
+          } else if (kind === 'slang') {
+            const list = (Array.isArray(slangEntries) ? slangEntries : []).slice(-150).reverse();
+            html = '<table><tr><th>词条</th><th>含义</th><th>用法</th><th>确认</th></tr>' + list.map((e) =>
+              `<tr><td>${esc(e.term ?? e.word ?? '')}</td><td>${esc(e.meaning ?? '')}</td><td>${esc(e.usage ?? '')}</td><td>${e.confirmed === false ? '待确认' : '已确认'}</td></tr>`).join('') + '</table>';
+          } else if (kind === 'feedback') {
+            let list = [];
+            try { list = (JSON.parse(fs.readFileSync(path.join(STATE_DIR, 'feedback.json'), 'utf8'))?.items ?? []).slice(-100).reverse(); } catch {}
+            html = '<table><tr><th>时间</th><th>级别</th><th>会话</th><th>内容</th></tr>' + list.map((f) =>
+              `<tr><td>${f.time ? new Date(f.time).toLocaleString('zh-CN') : ''}</td><td>${esc(f.level ?? '')}</td><td>${esc(f.key ?? '')}</td><td>${esc(f.message ?? '')}</td></tr>`).join('') + '</table>';
+          } else {
+            sendJson({ ok: false, error: '未知数据类别：' + kind }, 400);
+            return;
+          }
+          sendJson({ ok: true, kind, html: html || '<div class="muted">（暂无数据）</div>' });
+          return;
+        }
+
+        if (req.method === 'POST' && url.pathname === '/api/panel/data') {
+          const body = await readBody();
+          const kind = String(body.kind ?? '');
+          const op = String(body.op ?? 'delete');
+          const db = getMemoryDb();
+          if (kind === 'affinity') {
+            const memberId = String(body.memberId ?? '');
+            if (op === 'delete') db.prepare('DELETE FROM affinity WHERE member_id = ?').run(memberId);
+            else db.prepare('UPDATE affinity SET score = ?, notes = ?, updated_at = ? WHERE member_id = ?')
+              .run(Math.max(-100, Math.min(100, Number(body.score) || 0)), String(body.note ?? '').slice(0, 120), Date.now(), memberId);
+            sendJson({ ok: true });
+            return;
+          }
+          if (kind === 'facts') { db.prepare('DELETE FROM facts WHERE id = ?').run(Number(body.id)); sendJson({ ok: true }); return; }
+          if (kind === 'reminders') {
+            db.prepare("UPDATE reminders SET status = 'cancelled' WHERE id = ?").run(Number(body.id));
+            sendJson({ ok: true });
+            return;
+          }
+          sendJson({ ok: false, error: '不支持的数据操作' }, 400);
+          return;
+        }
+
+        if (req.method === 'POST' && url.pathname === '/api/panel/control') {
+          const body = await readBody();
+          const action = String(body.action ?? '').trim();
+          const key = String(body.key ?? '').trim();
+          const obUrl = () => String(cfg.snowluma?.httpUrl || 'http://127.0.0.1:3000').replace(/\/+$/, '');
+          const obHeaders = () => ({ 'content-type': 'application/json', ...(cfg.snowluma?.accessToken ? { authorization: 'Bearer ' + cfg.snowluma.accessToken } : {}) });
+          const gatewayOnline = async () => {
+            try {
+              const r = await fetch(obUrl() + '/get_login_info', { method: 'POST', headers: obHeaders(), body: '{}', signal: AbortSignal.timeout(3000) });
+              const j = await r.json().catch(() => ({}));
+              return j.retcode === 0;
+            } catch { return false; }
+          };
+          const startSnowluma = () => {
+            const launcher = cfg.snowluma?.launcherPath;
+            if (!launcher) throw new Error('未配置 snowluma.launcherPath');
+            const child = spawn('cmd.exe', ['/c', 'start', '', `"${launcher}"`], { detached: true, stdio: 'ignore', windowsHide: true });
+            child.unref();
+          };
+          const stopSnowluma = () => {
+            const home = String(cfg.snowluma?.homeDir ?? '');
+            if (!home) throw new Error('未配置 snowluma.homeDir');
+            const psScript = `Get-CimInstance Win32_Process -Filter "Name='node.exe'" | Where-Object { $_.CommandLine -like '*${home.replace(/'/g, "''")}*' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }`;
+            execFileSync('powershell.exe', ['-NoProfile', '-Command', psScript], { timeout: 20000, windowsHide: true });
+          };
+          const resetOne = async (k) => {
+            if (!state.sessions[k]) return false;
+            sessionEpoch++;
+            const oldSessionId = state.sessions[k];
+            delete state.sessions[k];
+            delete state.sessionPolicies[k];
+            reverse.delete(oldSessionId);
+            collectors.delete(oldSessionId);
+            sendToolSucceededSessions.delete(oldSessionId);
+            pendingSendToolCalls.delete(oldSessionId);
+            v2TurnStartAt.delete(oldSessionId);
+            toolCallNames.delete(oldSessionId);
+            const pe = pending.get(k);
+            if (pe) { clearTimeout(pe.timer); cancelPendingEntry(pe).catch(() => {}); pending.delete(k); }
+            saveState();
+            try { unwrap(await api.workspace.archiveSession({ sessionId: oldSessionId }), 'archive'); } catch {}
+            return true;
+          };
+          try {
+            let note = '';
+            switch (action) {
+              case 'start-all': {
+                const online = await gatewayOnline();
+                if (!online) { startSnowluma(); note = 'SnowLuma 启动中（约 10-30 秒就绪）；'; }
+                else note = 'SnowLuma 已在线；';
+                let online2 = online;
+                for (let i = 0; i < 20 && !online2; i++) {
+                  await new Promise((r) => setTimeout(r, 1500));
+                  online2 = await gatewayOnline();
+                }
+                note += '桥接运行中（PID ' + process.pid + '）、DSH ' + (dshReady ? '已连接' : '连接中');
+                break;
+              }
+              case 'start-snowluma': { startSnowluma(); note = 'SnowLuma 启动指令已发出（约 10-30 秒就绪）'; break; }
+              case 'stop-snowluma': { stopSnowluma(); note = 'SnowLuma 已停止（QQ 连接断开）'; break; }
+              case 'pause-ai': { socialV2.paused = true; saveSocialV2State(); log('[panel] AI 已暂停'); note = 'AI 已暂停：所有 v2 工具调用会被拒绝'; break; }
+              case 'resume-ai': { socialV2.paused = false; saveSocialV2State(); log('[panel] AI 已恢复'); note = 'AI 已恢复运行'; break; }
+              case 'wake': {
+                if (!key) { sendJson({ ok: false, error: '需要 key' }, 400); return; }
+                sendWakePromptV2(key, 'admin');
+                note = '已唤醒 ' + key;
+                break;
+              }
+              case 'reset-session': {
+                if (!key) { sendJson({ ok: false, error: '需要 key' }, 400); return; }
+                note = (await resetOne(key)) ? ('已重建 ' + key + '（下次唤醒用新上下文）') : (key + ' 当前没有活动会话');
+                break;
+              }
+              case 'reset-all-sessions': {
+                let n = 0;
+                for (const k of Object.keys(state.sessions ?? {})) if (await resetOne(k)) n++;
+                note = '已重建 ' + n + ' 个会话（记忆/好感度/提醒保留在桥接侧）';
+                break;
+              }
+              case 'sync-stickers': {
+                const res = await syncStickerLibrary();
+                note = '表情库已同步' + (res?.length ? '（' + res.length + ' 个）' : '');
+                break;
+              }
+              case 'clear-activity': {
+                const f = path.join(STATE_DIR, 'qq-activity.log');
+                try { fs.writeFileSync(f, ''); note = '活动日志已清空'; } catch (e) { note = '清空失败：' + (e?.message ?? e); }
+                break;
+              }
+              case 'restart-bridge': {
+                sendJson({ ok: true, note: '桥接正在重启（约 5 秒后恢复，页面稍后自动重连）' });
+                setTimeout(() => {
+                  try {
+                    const logOut = path.join(ROOT, '..', 'logs', 'bridge.out.log');
+                    const logErr = path.join(ROOT, '..', 'logs', 'bridge.err.log');
+                    const cmd = `timeout /t 3 /nobreak >nul & "${process.execPath}" "${process.argv[1]}" >> "${logOut}" 2>> "${logErr}"`;
+                    const child = spawn('cmd.exe', ['/c', cmd], { detached: true, stdio: 'ignore', windowsHide: true, cwd: ROOT });
+                    child.unref();
+                  } catch (e) { log('自动重启拉起失败: ' + (e?.message ?? e)); }
+                  releaseLock();
+                  process.exit(0);
+                }, 400);
+                return;
+              }
+              case 'stop-all': {
+                sendJson({ ok: true, note: 'SnowLuma 与桥接正在停止…' });
+                setTimeout(() => {
+                  try { stopSnowluma(); } catch {}
+                  releaseLock();
+                  process.exit(0);
+                }, 400);
+                return;
+              }
+              default: { sendJson({ ok: false, error: '未知操作：' + action }, 400); return; }
+            }
+            sendJson({ ok: true, action, note });
+          } catch (error) {
+            sendJson({ ok: false, error: String(error?.message ?? error) }, 500);
+          }
+          return;
+        }
+
