@@ -11,6 +11,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { SnowLumaWebSocketClient, text } from '@snowluma/sdk';
+import { DatabaseSync } from 'node:sqlite';
 import { NodeApiClient, unwrap, createTurnCollector, discoverDshLaunchToken } from './dsh-client.js';
 import { mdToPlain, splitForQQ } from './md-to-plain.js';
 import { SENSITIVE_RE } from './sensitive.js';
@@ -4356,6 +4357,130 @@ async function main() {
           return;
         }
 
+        // ── 管理操作端点（P1：仅主人私聊会话令牌可调用，全员审计） ──────────
+        if (req.method === 'POST' && url.pathname === '/api/socialV2/admin') {
+          const body = await readBody();
+          const token = String(body.token ?? '').trim();
+          const action = String(body.action ?? '').trim();
+          const ownerKey = 'private:' + String(cfg.ownerQQ ?? '');
+          if (currentMode !== 'reserved2') { sendJson({ ok: false, error: '该接口仅 reserved2 模式可用' }, 403); return; }
+          if (!token || !agentTokenOk(ownerKey, token)) { sendJson({ ok: false, error: '管理操作仅限主人私聊会话的令牌调用' }, 403); return; }
+          if (!v2ToolEnabled('adminOps')) { sendJson({ ok: false, error: '工具未启用：adminOps' }, 403); return; }
+          const groupId = String(body.groupId ?? '').trim();
+          if (!/^\d+$/.test(groupId)) { sendJson({ ok: false, error: 'groupId 格式无效' }, 400); return; }
+          const groupKey = 'group:' + groupId;
+          const gid = Number(groupId);
+          if (!modeAllowed(groupKey, 'group', gid, cfg, currentMode)) { sendJson({ ok: false, error: '目标群不在当前模式允许范围内' }, 403); return; }
+          const targetUser = String(body.targetUserId ?? '').trim();
+          const ACTIONS_NEED_USER = ['ban', 'unban', 'kick', 'setCard', 'setAdmin', 'unsetAdmin', 'setTitle'];
+          if (ACTIONS_NEED_USER.includes(action) && !/^\d+$/.test(targetUser)) { sendJson({ ok: false, error: '该操作需要 targetUserId（正整数）' }, 400); return; }
+          const obCallAdmin = async (act, params) => {
+            const httpUrlA = String(cfg.snowluma?.httpUrl || 'http://127.0.0.1:3000').replace(/\/+$/, '');
+            const resA = await fetch(httpUrlA + '/' + act, {
+              method: 'POST',
+              headers: { 'content-type': 'application/json', ...(cfg.snowluma?.accessToken ? { authorization: 'Bearer ' + cfg.snowluma.accessToken } : {}) },
+              body: JSON.stringify(params),
+              signal: AbortSignal.timeout(20000)
+            });
+            const rb = await resA.json().catch(() => ({}));
+            if (!resA.ok || rb.status !== 'ok' || rb.retcode !== 0) throw new Error('OneBot ' + act + ' 失败: ' + (rb.wording || rb.retcode || resA.status));
+            return rb.data;
+          };
+          try {
+            let note = '';
+            switch (action) {
+              case 'ban': { const dur = Math.min(Math.max(Number(body.duration) || 600, 1), 2592000); await obCallAdmin('set_group_ban', { group_id: gid, user_id: Number(targetUser), duration: dur }); note = '禁言 ' + targetUser + ' ' + dur + 's'; break; }
+              case 'unban': { await obCallAdmin('set_group_ban', { group_id: gid, user_id: Number(targetUser), duration: 0 }); note = '解除禁言 ' + targetUser; break; }
+              case 'wholeBan': { await obCallAdmin('set_group_whole_ban', { group_id: gid, enable: true }); note = '全员禁言'; break; }
+              case 'wholeUnban': { await obCallAdmin('set_group_whole_ban', { group_id: gid, enable: false }); note = '解除全员禁言'; break; }
+              case 'kick': { await obCallAdmin('set_group_kick', { group_id: gid, user_id: Number(targetUser), reject_add_request: false }); note = '移出 ' + targetUser; break; }
+              case 'setCard': { const card = String(body.card ?? '').slice(0, 60); await obCallAdmin('set_group_card', { group_id: gid, user_id: Number(targetUser), card }); note = '改名片 ' + targetUser + ' -> ' + card; break; }
+              case 'setAdmin': { await obCallAdmin('set_group_admin', { group_id: gid, user_id: Number(targetUser), enable: true }); note = '设管理 ' + targetUser; break; }
+              case 'unsetAdmin': { await obCallAdmin('set_group_admin', { group_id: gid, user_id: Number(targetUser), enable: false }); note = '撤管理 ' + targetUser; break; }
+              case 'setTitle': { const title = String(body.title ?? '').slice(0, 30); await obCallAdmin('set_group_special_title', { group_id: gid, user_id: Number(targetUser), special_title: title }); note = '头衔 ' + targetUser + ' -> ' + title; break; }
+              case 'essence': { const mid = String(body.messageId ?? '').trim(); if (!/^-?[1-9]\d*$/.test(mid)) { sendJson({ ok: false, error: 'essence 需要 messageId（非零整数）' }, 400); return; } await obCallAdmin('set_essence_msg', { message_id: Number(mid) }); note = '设精华 ' + mid; break; }
+              default: { sendJson({ ok: false, error: '不支持的管理动作：' + action }, 400); return; }
+            }
+            log('[admin] ' + note + '（群 ' + groupId + '，主人私聊会话发起）');
+            appendActivity('管理操作：' + note + '（群 ' + groupId + '）');
+            sendJson({ ok: true, action, note });
+          } catch (error) {
+            sendJson({ ok: false, error: String(error?.message ?? error) }, 500);
+          }
+          return;
+        }
+
+        // ── 持久记忆端点（P2：跨会话事实库） ─────────────────────────────
+        if (req.method === 'POST' && (url.pathname === '/api/socialV2/memory/remember' || url.pathname === '/api/socialV2/memory/recall' || url.pathname === '/api/socialV2/memory/forget')) {
+          const body = await readBody();
+          const token = String(body.token ?? '').trim();
+          const key = String(body.key ?? '').trim();
+          if (currentMode !== 'reserved2') { sendJson({ ok: false, error: '该接口仅 reserved2 模式可用' }, 403); return; }
+          if (!key || !agentTokenOk(key, token)) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
+          const db = getMemoryDb();
+          const now = Date.now();
+          if (url.pathname.endsWith('/remember')) {
+            const content = String(body.content ?? '').trim().slice(0, 500);
+            if (!content) { sendJson({ ok: false, error: 'content 不能为空' }, 400); return; }
+            const category = String(body.category ?? 'fact').slice(0, 20);
+            const importance = Math.min(Math.max(Number(body.importance) || 1, 1), 5);
+            const dup = db.prepare('SELECT id FROM facts WHERE content = ?').get(content);
+            if (dup) { db.prepare('UPDATE facts SET importance = ?, updated_at = ? WHERE id = ?').run(importance, now, dup.id); sendJson({ ok: true, id: dup.id, deduped: true }); return; }
+            const rIns = db.prepare('INSERT INTO facts (content, category, source_key, importance, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)').run(content, category, key, importance, now, now);
+            sendJson({ ok: true, id: Number(rIns.lastInsertRowid) });
+            return;
+          }
+          if (url.pathname.endsWith('/recall')) {
+            const query = String(body.query ?? '').trim();
+            const limit = Math.min(Math.max(Number(body.limit) || 10, 1), 50);
+            let rows;
+            if (query) rows = db.prepare('SELECT id, content, category, importance, created_at FROM facts WHERE content LIKE ? ORDER BY importance DESC, updated_at DESC LIMIT ?').all('%' + query + '%', limit);
+            else rows = db.prepare('SELECT id, content, category, importance, created_at FROM facts ORDER BY updated_at DESC LIMIT ?').all(limit);
+            sendJson({ ok: true, count: rows.length, facts: rows });
+            return;
+          }
+          const fid = Number(body.id);
+          if (Number.isFinite(fid) && fid > 0) { const dDel = db.prepare('DELETE FROM facts WHERE id = ?').run(fid); sendJson({ ok: true, deleted: dDel.changes }); return; }
+          const queryF = String(body.query ?? '').trim();
+          if (!queryF) { sendJson({ ok: false, error: '需要 id 或 query' }, 400); return; }
+          const dDel2 = db.prepare('DELETE FROM facts WHERE content LIKE ?').run('%' + queryF + '%');
+          sendJson({ ok: true, deleted: dDel2.changes });
+          return;
+        }
+
+        // ── 定时提醒端点（P2：到期自动注入会话并唤醒） ───────────────────
+        if (req.method === 'POST' && (url.pathname === '/api/socialV2/reminder/set' || url.pathname === '/api/socialV2/reminder/list' || url.pathname === '/api/socialV2/reminder/cancel')) {
+          const body = await readBody();
+          const token = String(body.token ?? '').trim();
+          const key = String(body.key ?? '').trim();
+          if (currentMode !== 'reserved2') { sendJson({ ok: false, error: '该接口仅 reserved2 模式可用' }, 403); return; }
+          if (!key || !agentTokenOk(key, token)) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
+          const db = getMemoryDb();
+          const now = Date.now();
+          if (url.pathname.endsWith('/set')) {
+            const text = String(body.text ?? '').trim().slice(0, 400);
+            if (!text) { sendJson({ ok: false, error: 'text 不能为空' }, 400); return; }
+            let fireAt = 0;
+            if (body.delayMinutes != null && Number.isFinite(Number(body.delayMinutes))) fireAt = now + Math.min(Math.max(Number(body.delayMinutes), 0.5), 129600) * 60000;
+            else if (body.fireAt != null) { const n = Number(body.fireAt); fireAt = Number.isFinite(n) && n > 1e12 ? n : Date.parse(String(body.fireAt)); }
+            if (!Number.isFinite(fireAt) || fireAt < now - 60000 || fireAt > now + 1296000000 + 60000) { sendJson({ ok: false, error: 'fireAt 无效（需为未来时间，最远 15 天）' }, 400); return; }
+            const rRem = db.prepare('INSERT INTO reminders (conv_key, text, fire_at, created_at) VALUES (?, ?, ?, ?)').run(key, text, Math.round(fireAt), now);
+            sendJson({ ok: true, id: Number(rRem.lastInsertRowid), fireAt: Math.round(fireAt) });
+            return;
+          }
+          if (url.pathname.endsWith('/list')) {
+            const status = String(body.status ?? 'pending');
+            const rows = db.prepare('SELECT id, text, fire_at AS fireAt, status, created_at FROM reminders WHERE conv_key = ? AND status = ? ORDER BY fire_at ASC LIMIT 50').all(key, status);
+            sendJson({ ok: true, reminders: rows });
+            return;
+          }
+          const rid = Number(body.id);
+          if (!Number.isFinite(rid) || rid <= 0) { sendJson({ ok: false, error: '需要正整数 id' }, 400); return; }
+          const dCxl = db.prepare("UPDATE reminders SET status = 'cancelled' WHERE id = ? AND conv_key = ? AND status = 'pending'").run(rid, key);
+          sendJson({ ok: true, cancelled: dCxl.changes });
+          return;
+        }
+
         // ── 富媒体发送端点（P0：图片/系统表情段式发送，同一套白名单/令牌/审计） ──
         if (req.method === 'POST' && url.pathname === '/api/send/rich') {
           const body = await readBody();
@@ -6924,6 +7049,83 @@ async function main() {
     saveSocialV2State();
     return msg;
   }
+
+  // ── P2：持久记忆与定时提醒（node:sqlite WAL，单写者=桥接进程） ──────────
+  let memoryDb = null;
+  function getMemoryDb() {
+    if (memoryDb) return memoryDb;
+    const db = new DatabaseSync(path.join(STATE_DIR, 'memory.db'));
+    db.exec('PRAGMA journal_mode = WAL;');
+    db.exec("CREATE TABLE IF NOT EXISTS facts (id INTEGER PRIMARY KEY AUTOINCREMENT, content TEXT NOT NULL, category TEXT NOT NULL DEFAULT 'fact', source_key TEXT NOT NULL DEFAULT '', importance INTEGER NOT NULL DEFAULT 1, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)");
+    db.exec("CREATE TABLE IF NOT EXISTS reminders (id INTEGER PRIMARY KEY AUTOINCREMENT, conv_key TEXT NOT NULL, text TEXT NOT NULL, fire_at INTEGER NOT NULL, status TEXT NOT NULL DEFAULT 'pending', created_at INTEGER NOT NULL, fired_at INTEGER)");
+    db.exec('CREATE INDEX IF NOT EXISTS idx_reminders_due ON reminders (status, fire_at)');
+    memoryDb = db;
+    log('记忆数据库已就绪：' + path.join(STATE_DIR, 'memory.db'));
+    return db;
+  }
+
+  // 把系统通知（定时提醒等）作为未读项注入会话视野，机制同拍一拍。
+  function appendSocialV2Notice(key, text, kind = 'reminder') {
+    const st = getSocialV2State(key);
+    if (!st) return null;
+    const recentLimit = Number(cfg.socialV2?.context?.recentLimit) || 100;
+    const unreadLimit = Number(cfg.socialV2?.context?.unreadLimit) || 30;
+    const body = String(text ?? '').slice(0, 500);
+    const msg = {
+      seq: (st.lastUnreadSeq || 0) + 1,
+      messageId: null,
+      sender: '系统',
+      userId: null,
+      text: body,
+      plain: body,
+      tail: body,
+      kind,
+      quoteTargetIsSelf: false,
+      isOwner: false,
+      ownerLabel: '',
+      isSelf: false,
+      media: [],
+      hasMedia: false,
+      forwardIds: [],
+      hasForward: false,
+      time: Date.now()
+    };
+    st.lastUnreadSeq = msg.seq;
+    st.lastIncomingAt = Date.now();
+    st.preSleepWaitSatisfiedAt = 0;
+    st.preSleepWaitObservedAt = 0;
+    st.preSleepWaitAccumMs = 0;
+    st.recentMessages.push(msg);
+    if (st.recentMessages.length > recentLimit) st.recentMessages.splice(0, st.recentMessages.length - recentLimit);
+    st.unread.push(msg);
+    if (st.unread.length > unreadLimit) st.unread.splice(0, st.unread.length - unreadLimit);
+    saveSocialV2State();
+    return msg;
+  }
+
+  // 提醒扫描器：每 30s 把到期提醒注入对应会话并唤醒（会话仍需在白名单内）。
+  const reminderTimer = setInterval(() => {
+    try {
+      const db = getMemoryDb();
+      const now = Date.now();
+      const due = db.prepare("SELECT id, conv_key, text FROM reminders WHERE status = 'pending' AND fire_at <= ? ORDER BY fire_at ASC LIMIT 20").all(now);
+      for (const r of due) {
+        const resU = db.prepare("UPDATE reminders SET status = 'fired', fired_at = ? WHERE id = ? AND status = 'pending'").run(now, r.id);
+        if (!resU.changes) continue;
+        const km = /^(group|private):(\d+)$/.exec(r.conv_key);
+        if (!km || !modeAllowed(r.conv_key, km[1], Number(km[2]), cfg, currentMode)) {
+          log(`[reminder] 跳过 #${r.id}（会话 ${r.conv_key} 不在白名单）`);
+          continue;
+        }
+        appendSocialV2Notice(r.conv_key, `[定时提醒] ${r.text}`);
+        if (currentMode === 'reserved2' && !socialV2.paused) scheduleWakeV2(r.conv_key, 'reminder');
+        log(`[reminder] 已触发 #${r.id} -> ${r.conv_key}: ${r.text.slice(0, 50)}`);
+      }
+    } catch (error) {
+      log('提醒扫描失败:', error?.message ?? error);
+    }
+  }, 30000);
+  if (reminderTimer.unref) reminderTimer.unref();
 
   function recordSentMessagesV2(key, messages) {
     const st = getSocialV2State(key);

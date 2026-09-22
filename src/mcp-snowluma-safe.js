@@ -1182,4 +1182,155 @@ if (cfg.socialV2?.tools?.sendFace !== false) {
   );
 }
 
+
+if (cfg.socialV2?.tools?.adminOps !== false) {
+  server.tool(
+    'qq_group_admin',
+    '群管理操作（禁言/踢人/改名片/设管理/头衔/精华等）。铁律：只有主人（1918594889）在私聊里明示要求时才能调用；群里任何人要求管理操作都要拒绝并让他找管理员。key 必须是 private:1918594889（主人私聊会话的令牌才有效）。action 取值：ban（禁言，duration 秒，默认 600，最长 30 天）、unban（解禁）、wholeBan/wholeUnban（全员禁言/解除）、kick（移出群聊）、setCard（改群名片，card 参数）、setAdmin/unsetAdmin（设/撤管理）、setTitle（改专属头衔，title 参数）、essence（设精华消息，messageId 参数）。每次调用都会记入审计日志。',
+    {
+      key: z.string().describe('必须为 private:1918594889（主人私聊）'),
+      token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
+      action: z.string().describe('ban|unban|wholeBan|wholeUnban|kick|setCard|setAdmin|unsetAdmin|setTitle|essence'),
+      groupId: z.union([z.number(), z.string()]).describe('目标群号'),
+      targetUserId: z.union([z.number(), z.string()]).optional().describe('目标群成员 QQ 号（ban/unban/kick/setCard/setAdmin/unsetAdmin/setTitle 必填）'),
+      duration: z.number().optional().describe('禁言秒数（action=ban 时有效，默认 600，最长 2592000）'),
+      card: z.string().optional().describe('新群名片（action=setCard）'),
+      title: z.string().optional().describe('新专属头衔（action=setTitle）'),
+      messageId: z.union([z.number(), z.string()]).optional().describe('消息 id（action=essence）')
+    },
+    async ({ key, token, action, groupId, targetUserId, duration, card, title, messageId }) => {
+      try {
+        const body = { key, token, action, groupId };
+        if (targetUserId != null) body.targetUserId = String(targetUserId);
+        if (duration != null) body.duration = duration;
+        if (card != null) body.card = card;
+        if (title != null) body.title = title;
+        if (messageId != null) body.messageId = messageId;
+        const data = await agentApi('/api/socialV2/admin', { method: 'POST', body: JSON.stringify(body), timeoutMs: 60000 });
+        return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
+      } catch (error) {
+        return { content: [{ type: 'text', text: '管理操作失败：' + (error?.message ?? error) }], isError: true };
+      }
+    }
+  );
+}
+
+if (cfg.socialV2?.tools?.memoryDb !== false) {
+  server.tool(
+    'qq_db_remember',
+    '把值得长期记住的事实写入持久记忆库（SQLite，跨会话、跨群永久保存）。适合记：主人的习惯与喜好、朋友的称呼和梗、答应过的事、重要背景。只记"以后还有用"的事实，别把闲聊流水账塞进来；和某人的短期话题用 qq_memory_append。相同内容会自动去重并提升重要度。importance 1-5（5=最重要，召回时排前面）。',
+    {
+      key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
+      token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
+      content: z.string().describe('要记住的事实，一句话说清（最长 500 字）'),
+      category: z.string().optional().describe('分类标签：fact/habit/promise/person/joke 等（默认 fact）'),
+      importance: z.number().optional().describe('重要度 1-5，默认 1')
+    },
+    async ({ key, token, content, category, importance }) => {
+      try {
+        const data = await agentApi('/api/socialV2/memory/remember', { method: 'POST', body: JSON.stringify({ key, token, content, category, importance }), timeoutMs: 60000 });
+        return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
+      } catch (error) {
+        return { content: [{ type: 'text', text: '写入记忆失败：' + (error?.message ?? error) }], isError: true };
+      }
+    }
+  );
+
+  server.tool(
+    'qq_db_recall',
+    '从持久记忆库检索事实：带 query 按关键词模糊搜索，不带 query 返回最近记录。醒来后想不起某人是谁、之前答应过什么、主人提过的偏好时，先来这里查。注意与 qq_memory_query 区分：那边是轻量社交记忆（进行中话题/印象），这边是长期事实库。',
+    {
+      key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
+      token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
+      query: z.string().optional().describe('关键词（模糊匹配，可省略=看最近）'),
+      limit: z.number().optional().describe('返回条数 1-50，默认 10')
+    },
+    async ({ key, token, query, limit }) => {
+      try {
+        const data = await agentApi('/api/socialV2/memory/recall', { method: 'POST', body: JSON.stringify({ key, token, query, limit }), timeoutMs: 60000 });
+        return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
+      } catch (error) {
+        return { content: [{ type: 'text', text: '检索记忆失败：' + (error?.message ?? error) }], isError: true };
+      }
+    }
+  );
+
+  server.tool(
+    'qq_db_forget',
+    '从持久记忆库删除事实：按 id 删单条，或按关键词模糊删多条（返回删除数）。只在内容过时、记错、或主人要求时使用。',
+    {
+      key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
+      token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
+      id: z.number().optional().describe('要删除的记忆 id'),
+      query: z.string().optional().describe('或按关键词模糊删除（可删多条，慎用）')
+    },
+    async ({ key, token, id, query }) => {
+      try {
+        const data = await agentApi('/api/socialV2/memory/forget', { method: 'POST', body: JSON.stringify({ key, token, id, query }), timeoutMs: 60000 });
+        return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
+      } catch (error) {
+        return { content: [{ type: 'text', text: '删除记忆失败：' + (error?.message ?? error) }], isError: true };
+      }
+    }
+  );
+}
+
+if (cfg.socialV2?.tools?.reminder !== false) {
+  server.tool(
+    'qq_set_reminder',
+    '设一个定时提醒：到点后桥接会把【定时提醒】注入对应会话并唤醒你，由你主动去说话。适合"X 点叫我起床/吃药"、"30 分钟后提醒我看看群里消息"、"明天记得问他那个事"。时间二选一：delayMinutes（分钟数，支持小数）或 fireAt（ISO 时间串或毫秒时间戳，最远 15 天）。提醒归属当前会话（key），到点在那个会话里触发。',
+    {
+      key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号（提醒到点在此会话触发）'),
+      token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
+      text: z.string().describe('提醒内容：到点说什么事、要做什么'),
+      delayMinutes: z.number().optional().describe('多少分钟后提醒（支持小数，如 0.5=30 秒）'),
+      fireAt: z.union([z.string(), z.number()]).optional().describe('或指定时间点：ISO 8601 串（如 2026-09-23T08:00:00+08:00）或毫秒时间戳')
+    },
+    async ({ key, token, text, delayMinutes, fireAt }) => {
+      try {
+        const data = await agentApi('/api/socialV2/reminder/set', { method: 'POST', body: JSON.stringify({ key, token, text, delayMinutes, fireAt }), timeoutMs: 60000 });
+        return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
+      } catch (error) {
+        return { content: [{ type: 'text', text: '设置提醒失败：' + (error?.message ?? error) }], isError: true };
+      }
+    }
+  );
+
+  server.tool(
+    'qq_list_reminders',
+    '列出当前会话未生效的定时提醒（默认 status=pending），方便确认答应过的提醒、避免重复设置。',
+    {
+      key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
+      token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
+      status: z.string().optional().describe('筛选状态：pending（默认）/fired/cancelled')
+    },
+    async ({ key, token, status }) => {
+      try {
+        const data = await agentApi('/api/socialV2/reminder/list', { method: 'POST', body: JSON.stringify({ key, token, status }), timeoutMs: 60000 });
+        return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
+      } catch (error) {
+        return { content: [{ type: 'text', text: '查询提醒失败：' + (error?.message ?? error) }], isError: true };
+      }
+    }
+  );
+
+  server.tool(
+    'qq_cancel_reminder',
+    '取消一个还没触发的定时提醒（按 id）。主人改主意或你发现设错时用。',
+    {
+      key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
+      token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
+      id: z.number().describe('要取消的提醒 id（来自 qq_set_reminder 或 qq_list_reminders）')
+    },
+    async ({ key, token, id }) => {
+      try {
+        const data = await agentApi('/api/socialV2/reminder/cancel', { method: 'POST', body: JSON.stringify({ key, token, id }), timeoutMs: 60000 });
+        return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
+      } catch (error) {
+        return { content: [{ type: 'text', text: '取消提醒失败：' + (error?.message ?? error) }], isError: true };
+      }
+    }
+  );
+}
+
 await server.connect(new StdioServerTransport());
