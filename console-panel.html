@@ -208,6 +208,15 @@ function showAuthBanner(show) {
   document.querySelector('.grid').prepend(el);
   $('token').focus();
 }
+function showDownBanner(msg) {
+  let el = $('downBanner');
+  if (el) { el.innerHTML = '🔌 <b>服务未连接</b><br>' + msg; return; }
+  el = document.createElement('div');
+  el.id = 'downBanner';
+  el.style.cssText = 'grid-column:1/-1;background:#3a2a1f;border:1px solid #ffb454;color:#ffe9cf;padding:12px 16px;border-radius:12px;margin-bottom:4px;line-height:1.7';
+  el.innerHTML = '🔌 <b>服务未连接</b><br>' + msg;
+  document.querySelector('.grid').prepend(el);
+}
 
 function toast(msg, isErr) {
   const t = $('toast');
@@ -218,7 +227,14 @@ function toast(msg, isErr) {
 }
 function saveToken() { TOKEN = $('token').value.trim(); localStorage.setItem('whaleToken', TOKEN); toast('令牌已保存'); refresh(); }
 async function api(path, opt = {}) {
-  const res = await fetch(path, { ...opt, headers: { 'Content-Type': 'application/json', 'x-console-token': TOKEN, ...(opt.headers || {}) } });
+  // 允许从本地文件（file://）打开时也指向本机服务，避免相对路径变成 file:///api/...
+  const base = location.protocol === 'file:' ? 'http://127.0.0.1:3100' : '';
+  let res;
+  try {
+    res = await fetch(base + path, { ...opt, headers: { 'Content-Type': 'application/json', 'x-console-token': TOKEN, ...(opt.headers || {}) } });
+  } catch (e) {
+    throw new Error('NETDOWN');   // 网络层失败：服务没起 / 地址不对 / 不是这台机器
+  }
   const body = await res.json().catch(() => ({}));
   if (!res.ok || body.ok === false) throw new Error(body.error || ('HTTP ' + res.status));
   return body;
@@ -323,6 +339,13 @@ async function refresh(allowRetry = true) {
     renderToggles();
     if (!$('tabBody').dataset.loaded) { $('tabBody').dataset.loaded = '1'; showTab(curTab); }
   } catch (e) {
+    if (e.message === 'NETDOWN') {
+      showDownBanner(location.protocol === 'file:'
+        ? '你是直接打开了本地文件（file://），浏览器不会把它当成网页服务。请改为访问：http://127.0.0.1:3100/panel（或双击 D:\\qqbot\\鲸鲸一键启动.cmd）'
+        : '连不上桥接服务（http://127.0.0.1:3100）。可能原因：服务没在运行 / 你不在运行它的那台电脑上 / 浏览器走了代理。可双击 D:\\qqbot\\鲸鲸一键启动.cmd 一键恢复（看门狗每分钟也会自动救一次）。');
+      $('pills').innerHTML = '<span class="pill"><span class="dot off"></span>连不上服务</span>';
+      return;
+    }
     const needAuth = /未授权|令牌/.test(e.message);
     // 自愈：本地存的/URL 带的令牌失效时，自动改用桥接注入的令牌重试一次
     if (needAuth && allowRetry && INJECTED_OK && TOKEN !== INJECTED) {
