@@ -4481,6 +4481,61 @@ async function main() {
           return;
         }
 
+        // ── 自身状态端点（P3.5：查自己在群里的名片/角色/禁言等 + 好友清单） ──
+        if (req.method === 'POST' && (url.pathname === '/api/socialV2/my-status' || url.pathname === '/api/socialV2/friend-list')) {
+          const body = await readBody();
+          const token = String(body.token ?? '').trim();
+          const key = String(body.key ?? '').trim();
+          if (currentMode !== 'reserved2') { sendJson({ ok: false, error: '该接口仅 reserved2 模式可用' }, 403); return; }
+          if (!key || !agentTokenOk(key, token)) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
+          const obStatus = async (act, params) => {
+            const httpUrlS = String(cfg.snowluma?.httpUrl || 'http://127.0.0.1:3000').replace(/\/+$/, '');
+            const resS = await fetch(httpUrlS + '/' + act, {
+              method: 'POST',
+              headers: { 'content-type': 'application/json', ...(cfg.snowluma?.accessToken ? { authorization: 'Bearer ' + cfg.snowluma.accessToken } : {}) },
+              body: JSON.stringify(params),
+              signal: AbortSignal.timeout(15000)
+            });
+            const rb = await resS.json().catch(() => ({}));
+            if (!resS.ok || rb.status !== 'ok' || rb.retcode !== 0) throw new Error('OneBot ' + act + ' 失败: ' + (rb.wording || rb.retcode || resS.status));
+            return rb.data;
+          };
+          try {
+            if (url.pathname.endsWith('/friend-list')) {
+              const friends = await obStatus('get_friend_list', {});
+              const selfIdFl = selfUserId || Number(cfg.botQQ ?? -1);
+              sendJson({ ok: true, count: friends.length, friends: friends.map((f) => ({ userId: f.user_id, nickname: f.nickname, remark: f.remark || '', isSelf: Number(f.user_id) === selfIdFl })) });
+              return;
+            }
+            // my-status：群会话查自己所在群；主人私聊会话可传 groupId 查任意白名单群
+            let gid = Number(body.groupId);
+            if (!Number.isFinite(gid) || gid <= 0) {
+              const kmS = /^group:(\d+)$/.exec(key);
+              if (!kmS) { sendJson({ ok: false, error: '请在群会话中调用，或由主人私聊会话传 groupId' }, 400); return; }
+              gid = Number(kmS[1]);
+            } else if (!key.startsWith('group:') && key !== 'private:' + String(cfg.ownerQQ ?? '')) {
+              sendJson({ ok: false, error: '指定 groupId 查询仅限主人私聊会话或该群自己的会话' }, 403); return;
+            }
+            if (!modeAllowed('group:' + gid, 'group', gid, cfg, currentMode)) { sendJson({ ok: false, error: '目标群不在当前模式允许范围内' }, 403); return; }
+            if (!selfUserId) {
+              const li = await obStatus('get_login_info', {});
+              selfUserId = Number(li?.user_id ?? 0);
+            }
+            const [gi, mi] = await Promise.all([
+              obStatus('get_group_info', { group_id: gid }),
+              obStatus('get_group_member_info', { group_id: gid, user_id: selfUserId })
+            ]);
+            const shut = Number(mi?.shut_up_timestamp ?? 0);
+            const nowS = Date.now() / 1000;
+            const muted = shut > nowS;
+            const remainText = muted ? '剩余约 ' + Math.ceil((shut - nowS) / 86400) + ' 天（至 ' + new Date(shut * 1000).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' }) + '）' : null;
+            sendJson({ ok: true, group: { groupId: gid, groupName: gi?.group_name ?? '', memberCount: gi?.member_count ?? null, groupMemo: String(gi?.group_memo ?? '').slice(0, 100) }, me: { userId: selfUserId, nickname: mi?.nickname ?? '', card: mi?.card || '', role: mi?.role ?? '', level: mi?.level ?? '', title: mi?.title || '', joinTime: mi?.join_time ?? null, muted, muteUntil: muted ? shut : null, muteRemaining: remainText } });
+          } catch (error) {
+            sendJson({ ok: false, error: String(error?.message ?? error) }, 500);
+          }
+          return;
+        }
+
         // ── 富媒体发送端点（P0：图片/系统表情段式发送，同一套白名单/令牌/审计） ──
         if (req.method === 'POST' && url.pathname === '/api/send/rich') {
           const body = await readBody();
@@ -5070,7 +5125,25 @@ async function main() {
     const body = await res.json().catch(() => ({}));
     if (!res.ok || body.status !== 'ok' || body.retcode !== 0) {
       const hint = res.status === 426 ? '（HTTP 426：snowluma.httpUrl 可能指向了 WebSocket 端口，请检查 config.json 的 snowluma.httpUrl 是否为 OneBot HTTP API 地址）' : '';
-      throw new Error(`OneBot ${action} 失败: ${body.wording || body.retcode || res.status}${hint}`);
+      let muteNote = '';
+      // result=120（群发送被拒）时自查禁言状态，把原因直接告诉 agent，避免盲目重试
+      if (kind === 'group' && (body.retcode === 120 || /rejected/i.test(String(body.wording ?? '')))) {
+        try {
+          const miRes = await fetch(`${httpUrl}/get_group_member_info`, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json', ...(cfg.snowluma?.accessToken ? { authorization: `Bearer ${cfg.snowluma.accessToken}` } : {}) },
+            body: JSON.stringify({ group_id: Number(id), user_id: selfUserId || Number(cfg.botQQ ?? 0) }),
+            signal: AbortSignal.timeout(8000)
+          });
+          const mi = await miRes.json().catch(() => ({}));
+          const shut = Number(mi?.data?.shut_up_timestamp ?? 0);
+          if (shut > Date.now() / 1000) {
+            const until = new Date(shut * 1000).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' });
+            muteNote = `（诊断：本账号在该群被禁言至 ${until}，期间所有发言必然失败。请勿重试发言，改用 qq_set_wake_config 设长时间潜水，并可在私聊里告知主人）`;
+          }
+        } catch {}
+      }
+      throw new Error(`OneBot ${action} 失败: ${body.wording || body.retcode || res.status}${hint}${muteNote}`);
     }
     return body.data;
   }
@@ -5647,6 +5720,7 @@ async function main() {
     return Math.floor(min + Math.random() * (max - min + 1));
   };
   let selfNickname = 'deepseek'; // 机器人昵称（启动时从网关获取，识别"被提到"用）
+  let selfUserId = Number(cfg?.botQQ ?? 0) || 0; // 机器人自身 QQ（启动时从网关获取，自查群状态用）
   const SILENT_TURN_TIMEOUT_MS = 300000; // 摘要静默名额 5 分钟未消费则作废，避免吞掉后续正常回复
   const social = {
     states: new Map(),             // key -> { phase: 'idle'|'active'|'probing'|'exiting', lastCheckAt, nextCheckAt, lastActiveMessageAt, activeEnteredAt, activeDeadlineAt, activeExitAt, probeDeadline }
@@ -8639,6 +8713,10 @@ async function main() {
       if (login?.nickname) {
         selfNickname = String(login.nickname).toLowerCase();
         log(`机器人昵称: ${login.nickname}`);
+      }
+      if (login?.user_id) {
+        selfUserId = Number(login.user_id);
+        log(`机器人 QQ: ${selfUserId}`);
       }
     }).catch(() => {});
   });

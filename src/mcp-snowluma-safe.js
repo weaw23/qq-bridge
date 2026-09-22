@@ -1483,4 +1483,44 @@ if (getConfig().pcControl?.enabled !== false) {
   );
 }
 
+
+if (cfg.socialV2?.tools?.myStatus !== false) {
+  server.tool(
+    'qq_my_group_status',
+    '查询自己在某个群里的状态：群名片、角色（member/admin/owner）、等级、入群时间、以及最关键的——是否被禁言、禁言到什么时候。什么时候用：① 在群里发消息失败（错误里出现 result=120 / rejected）时，先查这个搞清楚原因；② 被禁言就不要再尝试发言了，改用 qq_set_wake_config 设长时间潜水，并可在主人私聊里告知；③ 主人私聊会话可以传 groupId 查任意白名单群，群会话里不传 groupId 默认查当前群。',
+    {
+      key: z.string().describe('会话 key，格式 group:群号 或 private:1918594889（主人私聊）'),
+      token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
+      groupId: z.union([z.number(), z.string()]).optional().describe('要查询的群号（主人私聊会话可指定；群会话默认查当前群）')
+    },
+    async ({ key, token, groupId }) => {
+      try {
+        const body = { key, token };
+        if (groupId != null && String(groupId).trim() !== '') body.groupId = String(groupId).trim();
+        const data = await agentApi('/api/socialV2/my-status', { method: 'POST', body: JSON.stringify(body), timeoutMs: 60000 });
+        return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
+      } catch (error) {
+        return { content: [{ type: 'text', text: '查询群状态失败：' + (error?.message ?? error) }], isError: true };
+      }
+    }
+  );
+
+  server.tool(
+    'qq_friend_list',
+    '查看自己的 QQ 好友清单（昵称+备注+是否自己）。用途：确认某个 QQ 号是不是好友、想起来某人的号对应谁。注意：好友 ≠ 可以随便私聊，私聊白名单由主人控制。',
+    {
+      key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
+      token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）')
+    },
+    async ({ key, token }) => {
+      try {
+        const data = await agentApi('/api/socialV2/friend-list', { method: 'POST', body: JSON.stringify({ key, token }), timeoutMs: 60000 });
+        return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
+      } catch (error) {
+        return { content: [{ type: 'text', text: '查询好友列表失败：' + (error?.message ?? error) }], isError: true };
+      }
+    }
+  );
+}
+
 await server.connect(new StdioServerTransport());
