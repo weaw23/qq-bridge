@@ -4804,7 +4804,8 @@ async function main() {
               `<tr><td>${r.id}</td><td>${esc(r.conv_key)}</td><td>${esc(r.text)}</td><td>${new Date(r.fire_at).toLocaleString('zh-CN')}</td><td>${esc(r.status)}</td>
                <td>${r.status === 'pending' ? `<button class="sm" onclick="cancelReminder(${r.id},'${esc(r.conv_key)}')">取消</button>` : ''}</td></tr>`).join('') + '</table>';
           } else if (kind === 'activity') {
-            const tail = readActivityTail(150).slice().reverse();
+            const rawTail = readActivityTail(150);
+            const tail = (Array.isArray(rawTail) ? rawTail : String(rawTail ?? '').split(/\r?\n/)).filter(Boolean).slice().reverse();
             html = '<table><tr><th>时间</th><th>内容</th></tr>' + tail.map((l) => `<tr><td style="white-space:nowrap">${esc(String(l).slice(0, 19))}</td><td>${esc(String(l).slice(19))}</td></tr>`).join('') + '</table>';
           } else if (kind === 'tool-log') {
             let lines = [];
