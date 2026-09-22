@@ -189,9 +189,12 @@
 <script>
 const $ = (id) => document.getElementById(id);
 const qs = new URLSearchParams(location.search);
-// 令牌优先级：URL ?token= → 本地保存 → 桥接服务时注入的 __CONSOLE_TOKEN__（本机零配置）
-let TOKEN = (qs.get('token') || localStorage.getItem('whaleToken') || '__CONSOLE_TOKEN__').trim();
-if (TOKEN === '__CONSOLE_TOKEN__') TOKEN = '';
+// 令牌优先级：URL ?token=（长度合理才算）→ 本地保存 → 桥接注入的令牌（本机零配置）
+// 注意：桥接会把下面这个占位符替换成真实令牌，所以用正则判断"是否真的被注入过"。
+const INJECTED = '__CONSOLE_TOKEN__';
+const INJECTED_OK = !/^__.*__$/.test(INJECTED);
+const urlTok = qs.get('token');
+let TOKEN = (urlTok && urlTok.length >= 16 ? urlTok : (localStorage.getItem('whaleToken') || (INJECTED_OK ? INJECTED : ''))).trim();
 $('token').value = TOKEN;
 let S = null;
 function showAuthBanner(show) {
@@ -273,7 +276,7 @@ async function showTab(k) {
   } catch (e) { $('tabBody').textContent = '读取失败：' + e.message; }
 }
 
-async function refresh() {
+async function refresh(allowRetry = true) {
   try {
     S = await api('/api/panel/overview');
     const o = S;
@@ -313,6 +316,13 @@ async function refresh() {
     if (!$('tabBody').dataset.loaded) { $('tabBody').dataset.loaded = '1'; showTab(curTab); }
   } catch (e) {
     const needAuth = /未授权|令牌/.test(e.message);
+    // 自愈：本地存的/URL 带的令牌失效时，自动改用桥接注入的令牌重试一次
+    if (needAuth && allowRetry && INJECTED_OK && TOKEN !== INJECTED) {
+      TOKEN = INJECTED;
+      localStorage.setItem('whaleToken', TOKEN);
+      $('token').value = TOKEN;
+      return refresh(false);
+    }
     if (needAuth) showAuthBanner(true);
     $('pills').innerHTML = `<span class="pill"><span class="dot off"></span>${needAuth ? '需要令牌（右上角填入）' : e.message}</span>`;
   }
