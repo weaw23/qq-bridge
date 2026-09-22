@@ -1,0 +1,77 @@
+  // ── P2：持久记忆与定时提醒（node:sqlite WAL，单写者=桥接进程） ──────────
+  let memoryDb = null;
+  function getMemoryDb() {
+    if (memoryDb) return memoryDb;
+    const db = new DatabaseSync(path.join(STATE_DIR, 'memory.db'));
+    db.exec('PRAGMA journal_mode = WAL;');
+    db.exec("CREATE TABLE IF NOT EXISTS facts (id INTEGER PRIMARY KEY AUTOINCREMENT, content TEXT NOT NULL, category TEXT NOT NULL DEFAULT 'fact', source_key TEXT NOT NULL DEFAULT '', importance INTEGER NOT NULL DEFAULT 1, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)");
+    db.exec("CREATE TABLE IF NOT EXISTS reminders (id INTEGER PRIMARY KEY AUTOINCREMENT, conv_key TEXT NOT NULL, text TEXT NOT NULL, fire_at INTEGER NOT NULL, status TEXT NOT NULL DEFAULT 'pending', created_at INTEGER NOT NULL, fired_at INTEGER)");
+    db.exec('CREATE INDEX IF NOT EXISTS idx_reminders_due ON reminders (status, fire_at)');
+    memoryDb = db;
+    log('记忆数据库已就绪：' + path.join(STATE_DIR, 'memory.db'));
+    return db;
+  }
+
+  // 把系统通知（定时提醒等）作为未读项注入会话视野，机制同拍一拍。
+  function appendSocialV2Notice(key, text, kind = 'reminder') {
+    const st = getSocialV2State(key);
+    if (!st) return null;
+    const recentLimit = Number(cfg.socialV2?.context?.recentLimit) || 100;
+    const unreadLimit = Number(cfg.socialV2?.context?.unreadLimit) || 30;
+    const body = String(text ?? '').slice(0, 500);
+    const msg = {
+      seq: (st.lastUnreadSeq || 0) + 1,
+      messageId: null,
+      sender: '系统',
+      userId: null,
+      text: body,
+      plain: body,
+      tail: body,
+      kind,
+      quoteTargetIsSelf: false,
+      isOwner: false,
+      ownerLabel: '',
+      isSelf: false,
+      media: [],
+      hasMedia: false,
+      forwardIds: [],
+      hasForward: false,
+      time: Date.now()
+    };
+    st.lastUnreadSeq = msg.seq;
+    st.lastIncomingAt = Date.now();
+    st.preSleepWaitSatisfiedAt = 0;
+    st.preSleepWaitObservedAt = 0;
+    st.preSleepWaitAccumMs = 0;
+    st.recentMessages.push(msg);
+    if (st.recentMessages.length > recentLimit) st.recentMessages.splice(0, st.recentMessages.length - recentLimit);
+    st.unread.push(msg);
+    if (st.unread.length > unreadLimit) st.unread.splice(0, st.unread.length - unreadLimit);
+    saveSocialV2State();
+    return msg;
+  }
+
+  // 提醒扫描器：每 30s 把到期提醒注入对应会话并唤醒（会话仍需在白名单内）。
+  const reminderTimer = setInterval(() => {
+    try {
+      const db = getMemoryDb();
+      const now = Date.now();
+      const due = db.prepare("SELECT id, conv_key, text FROM reminders WHERE status = 'pending' AND fire_at <= ? ORDER BY fire_at ASC LIMIT 20").all(now);
+      for (const r of due) {
+        const resU = db.prepare("UPDATE reminders SET status = 'fired', fired_at = ? WHERE id = ? AND status = 'pending'").run(now, r.id);
+        if (!resU.changes) continue;
+        const km = /^(group|private):(\d+)$/.exec(r.conv_key);
+        if (!km || !modeAllowed(r.conv_key, km[1], Number(km[2]), cfg, currentMode)) {
+          log(`[reminder] 跳过 #${r.id}（会话 ${r.conv_key} 不在白名单）`);
+          continue;
+        }
+        appendSocialV2Notice(r.conv_key, `[定时提醒] ${r.text}`);
+        if (currentMode === 'reserved2' && !socialV2.paused) scheduleWakeV2(r.conv_key, 'reminder');
+        log(`[reminder] 已触发 #${r.id} -> ${r.conv_key}: ${r.text.slice(0, 50)}`);
+      }
+    } catch (error) {
+      log('提醒扫描失败:', error?.message ?? error);
+    }
+  }, 30000);
+  if (reminderTimer.unref) reminderTimer.unref();
+
