@@ -1218,6 +1218,28 @@ async function main() {
   const collectors = new Map(); // sessionId -> turn collector
   const sendToolSucceededSessions = new Set(); // sessionId：当前 turn 内 MCP 发送类工具至少成功一次
   const v2TurnStartAt = new Map(); // sessionId -> timestamp：reserved2 turn 开始时间，用于判断是否“无行动”
+  // 回合看门狗：DSH 侧模型流挂死时 turn 永不结束，busy 标记会把会话永久卡死。
+  // 规则：turn 开始后若连续 12 分钟没有任何会话事件（正常沉睡等待最长 10 分钟，
+  // 且工具调用/回合事件会刷新时间戳），判定为挂死 → session/cancel 并清理本地标记，
+  // 让暂存唤醒在 turn/end 后正常补发。
+  const v2TurnLastEvent = new Map(); // sessionId -> timestamp：该会话最近一次事件时间
+  const TURN_STALL_MS = 12 * 60 * 1000;
+  const turnWatchdog = setInterval(() => {
+    const now = Date.now();
+    for (const [sid, t0] of v2TurnStartAt) {
+      const last = Math.max(t0, v2TurnLastEvent.get(sid) ?? t0);
+      if (now - last < TURN_STALL_MS) continue;
+      log(`⚠️ 回合看门狗：${sid} 已 ${Math.round((now - last) / 60000)} 分钟无事件，判定模型流挂死，强制取消该回合`);
+      void (async () => {
+        try { await api.callUnary('session/cancel', { sessionId: sid }); log(`看门狗已请求取消 ${sid}`); }
+        catch (e) { log(`看门狗取消失败 ${sid}: ${e?.message ?? e}`); }
+        v2TurnStartAt.delete(sid);
+        collectors.delete(sid);
+        v2TurnLastEvent.delete(sid);
+      })();
+    }
+  }, 60 * 1000);
+  turnWatchdog.unref?.();
   const toolCallNames = new Map(); // sessionId -> Map<callId, toolName>：用于结果日志关联工具名
   const pendingSendToolCalls = new Map(); // sessionId -> Set<callId>：等待 tool/result 的发送类调用
   // reserved2 防“忘记设置唤醒条件”：key -> 当前是否等待 AI 处理唤醒回合 / 本回合已更新唤醒配置 / 连续未设置次数
@@ -4334,6 +4356,117 @@ async function main() {
           return;
         }
 
+        // ── 富媒体发送端点（P0：图片/系统表情段式发送，同一套白名单/令牌/审计） ──
+        if (req.method === 'POST' && url.pathname === '/api/send/rich') {
+          const body = await readBody();
+          const token = String(body.token ?? '').trim();
+          const key = String(body.key ?? '').trim();
+          const parts = Array.isArray(body.parts) ? body.parts.slice(0, 9) : [];
+          const replyToMessageId = body.replyToMessageId;
+          const atUserId = body.atUserId ?? null;
+          if (currentMode === 'chat' || currentMode === 'reserved') { sendJson({ ok: false, error: '发送工具仅限 closed-agent / reserved2 模式使用' }, 403); return; }
+          if (socialV2.paused && token) { sendJson({ ok: false, error: 'AI 已暂停，当前不允许执行发送工具' }, 403); return; }
+          if (currentMode === 'reserved2' && !token) { sendJson({ ok: false, error: 'reserved2 模式发送必须携带 agent token' }, 403); return; }
+          const keyMatchRich = /^(group|private):(\d+)$/.exec(key);
+          if (!keyMatchRich) { sendJson({ ok: false, error: 'key 格式应为 group:群号 或 private:QQ号' }, 400); return; }
+          if (token && !agentTokenOk(key, token)) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
+          if (token && !v2ToolEnabled('sendMessage')) { sendJson({ ok: false, error: '工具未启用：sendMessage' }, 403); return; }
+          if (shouldBlockSilentReply(key)) { sendJson({ ok: false, error: '静默模式已开启，当前不允许发送' }, 403); return; }
+          const kindRich = keyMatchRich[1];
+          const idRich = Number(keyMatchRich[2]);
+          if (!Number.isFinite(idRich) || idRich <= 0 || !modeAllowed(key, kindRich, idRich, cfg, currentMode)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
+          if (replyToMessageId != null && String(replyToMessageId).trim() !== '' && !/^-?[1-9]\d*$/.test(String(replyToMessageId).trim())) { sendJson({ ok: false, error: 'replyToMessageId 必须是非零整数' }, 400); return; }
+          if (!parts.length) { sendJson({ ok: false, error: 'parts 不能为空' }, 400); return; }
+          if (token && JSON.stringify(parts).includes(token)) { sendJson({ ok: false, error: '内容包含会话令牌，已阻止发送' }, 400); return; }
+          // 段白名单化：text / image(base64://、https?://、file:///D:/qqbot/outbox/) / face
+          const segments = [];
+          if (replyToMessageId != null && String(replyToMessageId).trim() !== '') segments.push({ type: 'reply', data: { id: String(replyToMessageId).trim() } });
+          if (atUserId != null && String(atUserId).trim() !== '') {
+            if (!/^\d+$/.test(String(atUserId).trim())) { sendJson({ ok: false, error: 'atUserId 必须是正整数 QQ 号' }, 400); return; }
+            segments.push({ type: 'at', data: { qq: String(atUserId).trim() } });
+          }
+          for (const p of parts) {
+            const type = String(p?.type ?? '').trim();
+            if (type === 'text') {
+              const text = String(p?.text ?? '');
+              if (!text) continue;
+              segments.push({ type: 'text', data: { text: escapeCqText(text.slice(0, 4500)) } });
+            } else if (type === 'face') {
+              const fid = String(p?.id ?? '').trim();
+              if (!/^\d{1,3}$/.test(fid)) { sendJson({ ok: false, error: 'face.id 必须是 1-3 位数字' }, 400); return; }
+              segments.push({ type: 'face', data: { id: fid } });
+            } else if (type === 'image') {
+              const src = String(p?.file ?? '').trim();
+              const isB64 = src.startsWith('base64://');
+              const isHttp = /^https?:\/\//i.test(src);
+              const norm = src.replace(/\\/g, '/');
+              const isFile = /^file:\/\/\/D:\/qqbot\/outbox\//i.test(norm) && !norm.includes('..');
+              if (isB64 && src.length > 12000000) { sendJson({ ok: false, error: '图片 base64 过大（上限约 9MB）' }, 400); return; }
+              if (!isB64 && !isHttp && !isFile) { sendJson({ ok: false, error: '图片仅支持 base64://、http(s):// 或 file:///D:/qqbot/outbox/ 下的本地文件' }, 400); return; }
+              segments.push({ type: 'image', data: { file: isB64 ? src : norm } });
+            } else {
+              sendJson({ ok: false, error: '不支持的段类型：' + type }, 400); return;
+            }
+          }
+          if (!segments.length) { sendJson({ ok: false, error: '没有可发送的内容' }, 400); return; }
+          const actionRich = kindRich === 'private' ? 'send_private_msg' : 'send_group_msg';
+          const paramsRich = kindRich === 'private' ? { user_id: idRich, message: segments } : { group_id: idRich, message: segments };
+          const httpUrlRich = String(cfg.snowluma?.httpUrl || 'http://127.0.0.1:3000').replace(/\/+$/, '');
+          try {
+            const res = await fetch(httpUrlRich + '/' + actionRich, {
+              method: 'POST',
+              headers: { 'content-type': 'application/json', ...(cfg.snowluma?.accessToken ? { authorization: 'Bearer ' + cfg.snowluma.accessToken } : {}) },
+              body: JSON.stringify(paramsRich),
+              signal: AbortSignal.timeout(30000)
+            });
+            const rb = await res.json().catch(() => ({}));
+            if (!res.ok || rb.status !== 'ok' || rb.retcode !== 0) throw new Error('OneBot ' + actionRich + ' 失败: ' + (rb.wording || rb.retcode || res.status));
+            log('[reserved2] 工具富媒体发送 ' + key + ': 成功（' + segments.map((s) => s.type).join('+') + '）');
+            appendActivity(key + ' 富媒体发送：' + segments.map((s) => s.type).join('+'));
+            sendJson({ ok: true, messageId: rb?.data?.message_id ?? null });
+          } catch (error) {
+            log('富媒体发送失败 (' + key + '): ' + (error?.message ?? error));
+            sendJson({ ok: false, error: String(error?.message ?? error) }, 500);
+          }
+          return;
+        }
+
+        // ── 私聊历史代理（P0：qq_get_friend_msg_history 走这里，白名单内才可读） ──
+        if (req.method === 'POST' && url.pathname === '/api/socialV2/friend-history') {
+          const body = await readBody();
+          const token = String(body.token ?? '').trim();
+          const userId = String(body.userId ?? '').trim();
+          const count = Math.min(Math.max(Number(body.count) || 20, 1), 30);
+          const messageSeq = body.messageSeq != null && Number.isFinite(Number(body.messageSeq)) ? Number(body.messageSeq) : undefined;
+          if (currentMode !== 'reserved2') { sendJson({ ok: false, error: '该接口仅 reserved2 模式可用' }, 403); return; }
+          if (!/^\d+$/.test(userId)) { sendJson({ ok: false, error: 'userId 格式无效' }, 400); return; }
+          const keyFH = 'private:' + userId;
+          if (!agentTokenOk(keyFH, token)) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
+          if (!modeAllowed(keyFH, 'private', Number(userId), cfg, currentMode)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
+          const httpUrlFH = String(cfg.snowluma?.httpUrl || 'http://127.0.0.1:3000').replace(/\/+$/, '');
+          try {
+            const res = await fetch(httpUrlFH + '/get_friend_msg_history', {
+              method: 'POST',
+              headers: { 'content-type': 'application/json', ...(cfg.snowluma?.accessToken ? { authorization: 'Bearer ' + cfg.snowluma.accessToken } : {}) },
+              body: JSON.stringify({ user_id: Number(userId), count, ...(messageSeq !== undefined ? { message_seq: messageSeq } : {}) }),
+              signal: AbortSignal.timeout(20000)
+            });
+            const rb = await res.json().catch(() => ({}));
+            const arr = Array.isArray(rb?.data) ? rb.data : (Array.isArray(rb?.data?.messages) ? rb.data.messages : []);
+            sendJson({ ok: true, count: arr.length, messages: arr.map((m) => ({
+              messageId: m.message_id,
+              time: m.time,
+              senderId: m.sender?.user_id ?? null,
+              senderNickname: m.sender?.nickname ?? '',
+              isSelf: m.sender?.user_id === 3692140164,
+              text: Array.isArray(m.message) ? m.message.map((s) => (s.type === 'text' ? s.data?.text : '[' + s.type + ']')).join('') : String(m.raw_message ?? '')
+            })) });
+          } catch (error) {
+            sendJson({ ok: false, error: String(error?.message ?? error) }, 500);
+          }
+          return;
+        }
+
         // ── 统一发送端点（MCP 旧发送工具也走这里） ───────────────────────────
         if (req.method === 'POST' && (url.pathname === '/api/send/group' || url.pathname === '/api/send/private' || url.pathname === '/api/send/reply')) {
           const body = await readBody();
@@ -5277,7 +5410,11 @@ async function main() {
     if (modelAppliedSessions.has(sessionId)) return;
     const provider = String(cfg.dsh?.provider || 'deepseek-official');
     const model = String(cfg.dsh?.model || 'deepseek-flash');
-    const effort = String(cfg.dsh?.reasoningEffort || 'max');
+    const rawEffort = cfg.dsh?.reasoningEffort;
+    // 本机模型目录各自声明支持的 effort 档位；'default'/空 = 不发送该字段，交给模型默认档。
+    const effort = rawEffort === undefined || rawEffort === null || String(rawEffort) === '' || String(rawEffort) === 'default'
+      ? undefined
+      : String(rawEffort);
     for (let attempt = 1; attempt <= 2; attempt += 1) {
       try {
         const result = unwrap(await api.sessions.selectModel({ sessionId, provider, model, reasoningEffort: effort }), 'session.selectModel');
@@ -7875,6 +8012,7 @@ async function main() {
             }
             // 追踪当前 turn 是否成功调用过 MCP 发送类工具：
             if (!isCurrentSession(key, frame.sessionId)) continue;
+            v2TurnLastEvent.set(frame.sessionId, Date.now()); // 看门狗：刷新该会话最近事件时间
             // 只有“发送成功”才跳过自动转发；如果工具调用失败，仍允许 AI 的文本正常发出。
             if (frame.event.type === 'turn/start') {
               sendToolSucceededSessions.delete(frame.sessionId);
@@ -7958,6 +8096,7 @@ async function main() {
               }
               v2TurnStartAt.delete(frame.sessionId);
               collectors.delete(frame.sessionId);
+              v2TurnLastEvent.delete(frame.sessionId);
               const sendToolSucceeded = sendToolSucceededSessions.has(frame.sessionId);
               sendToolSucceededSessions.delete(frame.sessionId);
               pendingSendToolCalls.delete(frame.sessionId);
@@ -8259,6 +8398,7 @@ async function main() {
         sendToolSucceededSessions.clear();
         pendingSendToolCalls.clear();
         v2TurnStartAt.clear();
+        v2TurnLastEvent.clear();
         toolCallNames.clear();
         pendingWakeKeys.clear();
         clearAllPendingWakeLeases();

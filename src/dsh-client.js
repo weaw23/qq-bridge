@@ -11,7 +11,7 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { randomUUID } from 'node:crypto';
+import { randomUUID, createHash, createHmac } from 'node:crypto';
 import { AbstractApiClient } from '@deepseek-ai/dsh-host-apiproxy/client';
 
 /** 从 DSH guard 日志里自动发现最新的进程启动 token（新版 DSH 打印在 dsh web URL 上）。 */
@@ -39,6 +39,44 @@ export function discoverDshLaunchToken() {
     }
   } catch {}
   return '';
+}
+
+/**
+ * DSH Desktop（如 2.0.5）没有 `dsh web` 的 launch token，也不写 guard 日志，
+ * 因而无法走 token exchange。但浏览器会话签名密钥持久保存在
+ * `<DSH_HOME>/.credentials.yaml` 的 `client-connection/browser-session` 记录里，
+ * 而 Cookie 只是该密钥对 {version, authority, issuedAt, expiresAt} 的 HMAC 签名。
+ * 这里按同一规则自行签发 Cookie，使桥接无需人工干预即可接入桌面版 DSH。
+ * 注意：authority 必须与请求的 Host 完全一致，故端口变化（DSH 换端口重启）后
+ * 由 invalidateAuth() 重新推导。
+ */
+function deriveBrowserCookie(baseUrl) {
+  try {
+    const home = process.env.DSH_HOME || path.join(os.homedir(), '.dsh');
+    const raw = fs.readFileSync(path.join(home, '.credentials.yaml'), 'utf8');
+    const at = raw.indexOf('client-connection/browser-session');
+    if (at === -1) return '';
+    const secret = raw.slice(at).match(/secret:\s*([A-Za-z0-9_\-=]+)/)?.[1];
+    if (!secret) return '';
+    const b64u = (buf) => Buffer.from(buf).toString('base64')
+      .replaceAll('+', '-').replaceAll('/', '_').replace(/=+$/, '');
+    const secretBytes = Buffer.from(
+      secret.replaceAll('-', '+').replaceAll('_', '/') + '='.repeat((4 - (secret.length % 4)) % 4),
+      'base64',
+    );
+    // 只接受 32 字节的规范密钥，与 DSH 的 canonicalSecret 校验保持一致。
+    if (secretBytes.byteLength !== 32) return '';
+    const authority = new URL(baseUrl).host;
+    const name = `dsh-auth-${b64u(createHash('sha256').update(authority).digest())}`;
+    const now = Date.now();
+    const body = b64u(Buffer.from(JSON.stringify({
+      version: 1, authority, issuedAt: now, expiresAt: now + 30 * 24 * 60 * 60 * 1000,
+    }), 'utf8'));
+    const sig = b64u(createHmac('sha256', secretBytes).update(body).digest());
+    return `${name}=v1.${body}.${sig}`;
+  } catch {
+    return '';
+  }
 }
 
 /** 新协议 RPC 的 args 包装：旧 payload -> { <参数名>: payload }。 */
@@ -126,10 +164,27 @@ export class NodeApiClient extends AbstractApiClient {
     if (discovered) this.launchToken = discovered;
   }
 
+  /**
+   * DSH Desktop 没有 launch token，改用持久密钥直接签发 Cookie。
+   * 与 token exchange 一样是幂等的：拿到即缓存，401 后由 invalidateAuth 清掉重签。
+   */
+  ensureDesktopCookie() {
+    if (this.cookie) return this.cookie;
+    const cookie = deriveBrowserCookie(this.baseUrl);
+    if (!cookie) return '';
+    this.cookie = cookie;
+    return cookie;
+  }
+
   /** 新版 DSH 要求先用 launch token 换 Cookie，之后所有请求带 Cookie。 */
   async ensureAuth(signal) {
     signal?.throwIfAborted();
     if (this.cookie) return this.cookie;
+    // 桌面版路径优先：无 launch token 时直接用签名密钥自签 Cookie。
+    if (!this.launchToken) {
+      const derived = this.ensureDesktopCookie();
+      if (derived) return derived;
+    }
     if (!this.launchToken) throw new Error('DSH auth token missing: set dsh.authToken in config.json (or let auto-discovery read it from DSH guard logs)');
     if (this.cookiePromise) return waitWithSignal(this.cookiePromise, signal);
     const promise = (async () => {
@@ -251,21 +306,21 @@ export class NodeApiClient extends AbstractApiClient {
     const authEpoch = this._authEpoch;
     init?.signal?.throwIfAborted();
     const headers = new Headers(init?.headers);
-    if (this.launchToken) {
-      try {
-        const cookie = await this.ensureAuth(init?.signal);
-        headers.set('cookie', cookie);
-      } catch (error) {
-        if (!isRetry && this.launchToken && /token exchange failed|invalidated during token exchange/i.test(error?.message ?? '')) {
-          if (authEpoch === this._authEpoch) this.invalidateAuth();
-          return this._doFetchWithAuth(input, init, true);
-        }
-        throw error;
+    // 桌面版与 CLI 版都要先拿凭据：桌面版由 ensureAuth 内部自签 Cookie，
+    // 因此这里必须无条件走鉴权（曾因按 launchToken 判断而漏掉首次请求）。
+    try {
+      const cookie = await this.ensureAuth(init?.signal);
+      headers.set('cookie', cookie);
+    } catch (error) {
+      if (!isRetry && this.launchToken && /token exchange failed|invalidated during token exchange/i.test(error?.message ?? '')) {
+        if (authEpoch === this._authEpoch) this.invalidateAuth();
+        return this._doFetchWithAuth(input, init, true);
       }
+      throw error;
     }
     init?.signal?.throwIfAborted();
     const response = await fetch(input, { ...init, headers });
-    if (!isRetry && response.status === 401 && this.launchToken) {
+    if (!isRetry && response.status === 401) {
       await response.body?.cancel();
       // 同一旧 Cookie 的并发 401 只能触发一次换票，不能使已开始的新换票失效。
       if (authEpoch === this._authEpoch) this.invalidateAuth();
