@@ -4919,6 +4919,7 @@ async function main() {
             let note = '';
             switch (action) {
               case 'start-all': {
+                try { fs.rmSync(path.join(STATE_DIR, 'watchdog-pause'), { force: true }); } catch {}
                 const online = await gatewayOnline();
                 if (!online) { startSnowluma(); note = 'SnowLuma 启动中（约 10-30 秒就绪）；'; }
                 else note = 'SnowLuma 已在线；';
@@ -4984,7 +4985,9 @@ async function main() {
                 return;
               }
               case 'stop-all': {
-                sendJson({ ok: true, note: 'SnowLuma 与桥接正在停止…' });
+                // 人工停止：写标记让看门狗别自动拉回；下次「一键启动全链」会清除该标记
+                try { fs.writeFileSync(path.join(STATE_DIR, 'watchdog-pause'), '人工停止 ' + new Date().toLocaleString('zh-CN') + '\n'); } catch {}
+                sendJson({ ok: true, note: 'SnowLuma 与桥接正在停止…（看门狗已暂停，重新启动请点「一键启动全链」）' });
                 setTimeout(() => {
                   try { stopSnowluma(); } catch {}
                   releaseLock();

@@ -105,11 +105,11 @@
     <div class="btns" style="margin-bottom:10px">
       <button class="primary" onclick="act('start-all')">▶ 一键启动全链</button>
       <button onclick="act('restart-bridge')">⟳ 重启桥接</button>
-      <button class="danger" onclick="act('stop-all')">■ 全部停止</button>
+      <button class="danger" onclick="confirmStop()">■ 全部停止</button>
     </div>
     <div class="btns" style="margin-bottom:10px">
       <button onclick="act('start-snowluma')">启动 SnowLuma</button>
-      <button onclick="act('stop-snowluma')">停止 SnowLuma</button>
+      <button class="danger" onclick="confirmStopSnow()">停止 SnowLuma</button>
       <button onclick="togglePause()" id="pauseBtn">暂停 AI</button>
     </div>
     <div class="btns">
@@ -230,6 +230,14 @@ async function act(action, extra = {}) {
   catch (e) { toast('失败：' + e.message, true); }
 }
 function togglePause() { if (!S) return; act(S.paused ? 'resume-ai' : 'pause-ai'); }
+function confirmStop() {
+  if (!confirm('确定要停止全部服务吗？\n\n• 会停掉 SnowLuma（QQ 断线）和桥接\n• 看门狗会一并暂停，不会自动拉回\n• 想恢复请点「▶ 一键启动全链」')) return;
+  act('stop-all');
+}
+function confirmStopSnow() {
+  if (!confirm('确定停止 SnowLuma 吗？QQ 会断线，桥接仍会运行但收发不了消息。')) return;
+  act('stop-snowluma');
+}
 
 const TOGGLES_A = [
   ['socialV2.enabled', '二代仿真总开关', '关掉她就不说话（工具全拒）'],
