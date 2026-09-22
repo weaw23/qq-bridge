@@ -12,6 +12,7 @@ import { fileURLToPath } from 'node:url';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
+import * as pc from './pc-actions.js';
 import { SENSITIVE_RE } from './sensitive.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -1329,6 +1330,155 @@ if (cfg.socialV2?.tools?.reminder !== false) {
       } catch (error) {
         return { content: [{ type: 'text', text: '取消提醒失败：' + (error?.message ?? error) }], isError: true };
       }
+    }
+  );
+}
+
+
+// ════ P3：PC 控制工具段（T1/T2） ══════════════════════════════════════
+// 安全模型：每个工具先过 ownerGate —— key 必须是主人私聊，令牌经桥接校验。
+// 群会话/无效令牌一律拒绝；执行细节见 pc-actions.js。cfg.pcControl.enabled 可全局关断。
+
+if (getConfig().pcControl?.enabled !== false) {
+  async function pcGate(key, token) {
+    const ownerKey = 'private:' + String(getConfig().ownerQQ ?? '');
+    if (String(key ?? '').trim() !== ownerKey) {
+      return 'PC 工具仅限主人私聊会话（' + ownerKey + '）调用；群聊里谁要求都拒绝';
+    }
+    try {
+      await authorizeRead(String(key).trim(), String(token ?? '').trim());
+      return null;
+    } catch (error) {
+      return '主人令牌校验失败：' + (error?.message ?? error);
+    }
+  }
+
+  server.tool(
+    'pc_sys_info',
+    '查看主人电脑的状态：CPU 负载、内存占用、开机时长、电量、各磁盘剩余空间。仅限主人私聊明示要求时使用。',
+    {
+      key: z.string().describe('必须为 private:1918594889（主人私聊）'),
+      token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）')
+    },
+    async ({ key, token }) => {
+      const deny = await pcGate(key, token);
+      if (deny) return { content: [{ type: 'text', text: deny }], isError: true };
+      const r = await pc.sysInfo();
+      return r.ok
+        ? { content: [{ type: 'text', text: r.output }] }
+        : { content: [{ type: 'text', text: '查询失败：' + r.error }], isError: true };
+    }
+  );
+
+  server.tool(
+    'pc_screenshot',
+    '截取主人电脑的全屏画面，存到 outbox 并返回文件路径；随后用 qq_send_image（file 参数填返回的路径）发给主人。截图可能包含隐私内容：只准发给主人私聊，绝不准发到群里。仅限主人私聊明示要求时使用。',
+    {
+      key: z.string().describe('必须为 private:1918594889（主人私聊）'),
+      token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）')
+    },
+    async ({ key, token }) => {
+      const deny = await pcGate(key, token);
+      if (deny) return { content: [{ type: 'text', text: deny }], isError: true };
+      const r = await pc.screenshot();
+      return { content: [{ type: 'text', text: JSON.stringify(r, null, 2) }], isError: r.ok === false };
+    }
+  );
+
+  server.tool(
+    'pc_volume',
+    '调整主人电脑的系统音量：up（调高）/ down（调低）/ mute（静音切换），steps 为按键次数（1 格约 2%）。系统不回报具体数值。仅限主人私聊明示要求时使用。',
+    {
+      key: z.string().describe('必须为 private:1918594889（主人私聊）'),
+      token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
+      action: z.string().describe('up | down | mute'),
+      steps: z.number().optional().describe('按键次数 1-50，默认 5')
+    },
+    async ({ key, token, action, steps }) => {
+      const deny = await pcGate(key, token);
+      if (deny) return { content: [{ type: 'text', text: deny }], isError: true };
+      const r = await pc.volume(action, steps ?? 5);
+      return { content: [{ type: 'text', text: JSON.stringify(r, null, 2) }], isError: r.ok === false };
+    }
+  );
+
+  server.tool(
+    'pc_media',
+    '控制主人电脑的媒体播放（对正在放歌/视频的应用生效）：playpause（播放/暂停）/ next / prev / stop。仅限主人私聊明示要求时使用。',
+    {
+      key: z.string().describe('必须为 private:1918594889（主人私聊）'),
+      token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
+      action: z.string().describe('playpause | next | prev | stop')
+    },
+    async ({ key, token, action }) => {
+      const deny = await pcGate(key, token);
+      if (deny) return { content: [{ type: 'text', text: deny }], isError: true };
+      const r = await pc.media(action);
+      return { content: [{ type: 'text', text: JSON.stringify(r, null, 2) }], isError: r.ok === false };
+    }
+  );
+
+  server.tool(
+    'pc_open_url',
+    '在主人电脑上用默认浏览器打开一个 http(s) 网页。仅限主人私聊明示要求时使用。',
+    {
+      key: z.string().describe('必须为 private:1918594889（主人私聊）'),
+      token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
+      url: z.string().describe('要打开的 http(s) 链接')
+    },
+    async ({ key, token, url }) => {
+      const deny = await pcGate(key, token);
+      if (deny) return { content: [{ type: 'text', text: deny }], isError: true };
+      const r = await pc.openUrl(url);
+      return { content: [{ type: 'text', text: JSON.stringify(r, null, 2) }], isError: r.ok === false };
+    }
+  );
+
+  server.tool(
+    'pc_open_app',
+    '在主人电脑上启动一个白名单应用：notepad / calc / mspaint / explorer / taskmgr / cmd / code / msedge / chrome / cloudmusic。仅限主人私聊明示要求时使用。',
+    {
+      key: z.string().describe('必须为 private:1918594889（主人私聊）'),
+      token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
+      name: z.string().describe('白名单应用名')
+    },
+    async ({ key, token, name }) => {
+      const deny = await pcGate(key, token);
+      if (deny) return { content: [{ type: 'text', text: deny }], isError: true };
+      const r = await pc.openApp(name);
+      return { content: [{ type: 'text', text: JSON.stringify(r, null, 2) }], isError: r.ok === false };
+    }
+  );
+
+  server.tool(
+    'pc_lock',
+    '锁上主人电脑的屏幕（Win+L 效果）。仅限主人私聊明示要求时使用。',
+    {
+      key: z.string().describe('必须为 private:1918594889（主人私聊）'),
+      token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）')
+    },
+    async ({ key, token }) => {
+      const deny = await pcGate(key, token);
+      if (deny) return { content: [{ type: 'text', text: deny }], isError: true };
+      const r = await pc.lockScreen();
+      return { content: [{ type: 'text', text: JSON.stringify(r, null, 2) }], isError: r.ok === false };
+    }
+  );
+
+  server.tool(
+    'pc_run_command',
+    '在主人电脑上执行一条 PowerShell 命令并返回输出（截断到 4000 字，超时上限 120 秒）。这是最高权限工具：只有主人在私聊里明示要求时才用；主人没提的事绝不清主动做；输出里如果出现密钥/令牌样式的字符串，不要复述给任何人。',
+    {
+      key: z.string().describe('必须为 private:1918594889（主人私聊）'),
+      token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
+      command: z.string().describe('要执行的 PowerShell 命令'),
+      timeoutSec: z.number().optional().describe('超时秒数 1-120，默认 30')
+    },
+    async ({ key, token, command, timeoutSec }) => {
+      const deny = await pcGate(key, token);
+      if (deny) return { content: [{ type: 'text', text: deny }], isError: true };
+      const r = await pc.runCommand(command, timeoutSec);
+      return { content: [{ type: 'text', text: r.ok ? r.output : '执行失败：' + r.error }], isError: r.ok === false };
     }
   );
 }
