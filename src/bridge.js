@@ -4962,8 +4962,15 @@ async function main() {
                   try {
                     const logOut = path.join(ROOT, '..', 'logs', 'bridge.out.log');
                     const logErr = path.join(ROOT, '..', 'logs', 'bridge.err.log');
-                    const cmd = `timeout /t 3 /nobreak >nul & "${process.execPath}" "${process.argv[1]}" >> "${logOut}" 2>> "${logErr}"`;
-                    const child = spawn('cmd.exe', ['/c', cmd], { detached: true, stdio: 'ignore', windowsHide: true, cwd: ROOT });
+                    const helper = path.join(ROOT, 'ops', 'restart-helper.mjs');
+                    // 用独立 helper 脚本延迟拉起（Node 直接 spawn，避免 cmd.exe 引号转义问题）
+                    const child = spawn(process.execPath, [helper, process.argv[1], ROOT, logOut, logErr, '3000'], {
+                      detached: true,
+                      stdio: 'ignore',
+                      windowsHide: true,
+                      cwd: ROOT,
+                      env: process.env
+                    });
                     child.unref();
                   } catch (e) { log('自动重启拉起失败: ' + (e?.message ?? e)); }
                   releaseLock();

@@ -35,6 +35,10 @@
   .row { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 7px 0;
          border-bottom: 1px dashed rgba(255,255,255,.06); }
   .row:last-child { border-bottom: 0; }
+  .rowstack { padding: 8px 0; border-bottom: 1px dashed rgba(255,255,255,.06); }
+  .rowstack:last-child { border-bottom: 0; }
+  .rowstack .ctl { display: flex; gap: 8px; margin-top: 6px; }
+  .rowstack select { flex: 1; max-width: 340px; }
   .row .lbl { color: var(--text); }
   .row .hint { color: var(--dim2); font-size: 12px; margin-left: 8px; }
   .switch { position: relative; width: 46px; height: 26px; flex: none; cursor: pointer; }
@@ -114,11 +118,13 @@
       <button onclick="act('clear-activity')">清空活动日志</button>
     </div>
     <div class="sep"></div>
-    <div class="row"><span class="lbl">立即唤醒某个会话</span>
-      <span style="display:flex;gap:8px"><select id="wakeKey"></select><button class="sm" onclick="act('wake',{key:val('wakeKey')})">唤醒</button></span>
+    <div class="rowstack">
+      <div class="lbl">立即唤醒某个会话</div>
+      <div class="ctl"><select id="wakeKey"></select><button class="sm" onclick="act('wake',{key:val('wakeKey')})">唤醒</button></div>
     </div>
-    <div class="row"><span class="lbl">重建某个会话（清空上下文，保留记忆）</span>
-      <span style="display:flex;gap:8px"><select id="resetKey"></select><button class="sm" onclick="act('reset-session',{key:val('resetKey')})">重建</button></span>
+    <div class="rowstack">
+      <div class="lbl">重建某个会话<span class="hint">清空 DSH 上下文，记忆/好感度/提醒保留</span></div>
+      <div class="ctl"><select id="resetKey"></select><button class="sm" onclick="act('reset-session',{key:val('resetKey')})">重建</button></div>
     </div>
   </div>
 
