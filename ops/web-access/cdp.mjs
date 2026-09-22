@@ -179,7 +179,7 @@ async function main() {
     case 'goto': {
       const url = positional[0];
       if (!url) die('用法：goto <url>');
-      const full = /^https?:\/\//i.test(url) ? url : `https://${url}`;
+      const full = /^(https?|file):\/\//i.test(url) ? url : `https://${url}`;
       await withTab(async (cdp) => {
         await cdp.send('Page.navigate', { url: full });
         await sleep(Number(flags.wait) || 2500);
