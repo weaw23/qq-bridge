@@ -114,6 +114,7 @@
     </div>
     <div class="btns">
       <button onclick="act('sync-stickers')">同步收藏表情</button>
+      <button onclick="learnNow()">立即学一次（黑话+表达）</button>
       <button onclick="resetAllSessions()">重建全部会话</button>
       <button onclick="act('clear-activity')">清空活动日志</button>
     </div>
@@ -379,6 +380,10 @@ async function saveWake() {
       maxWakePerMinute: Number(val('wakePerMin')), maxWakePerHour: Number(val('wakePerHour')),
       defaultMs: Number(val('waitDefault')), maxMs: Number(val('waitMax')), preSleepWaitMs: Number(val('preSleep')) } }) });
     toast('唤醒限制已保存'); setTimeout(refresh, 600); }
+  catch (e) { toast('失败：' + e.message, true); }
+}
+async function learnNow() {
+  try { const r = await api('/api/panel/style/extract-now', { method: 'POST', body: JSON.stringify({}) }); toast(r.note || '已开始学习'); setTimeout(() => showTab('expressions'), 20000); }
   catch (e) { toast('失败：' + e.message, true); }
 }
 async function resetAllSessions() {

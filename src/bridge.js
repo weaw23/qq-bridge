@@ -4689,6 +4689,30 @@ async function main() {
           sendJson({ ok: true, count: rows.length, notes: rows });
           return;
         }
+        // ── 立即学一次（用桥接侧历史消息播种学习窗口，跑黑话+表达提取） ──
+        if (req.method === 'POST' && url.pathname === '/api/panel/style/extract-now') {
+          const body = await readBody();
+          const onlyKey = String(body.key ?? '').trim();
+          const keys = onlyKey ? [onlyKey] : Object.keys(state.sessions ?? {});
+          const seeded = [];
+          for (const k of keys) {
+            const st = getSocialV2State(k);
+            const msgs = (st?.recentMessages ?? []).filter((m) => !m.isSelf && String(m.text ?? '').trim().length >= 2).slice(-30);
+            if (msgs.length >= 8) { slangWindows.set(k, msgs); seeded.push(k + '(' + msgs.length + ')'); }
+          }
+          if (!seeded.length) { sendJson({ ok: false, error: '没有足够的历史消息可学（每个会话至少 8 条）' }, 400); return; }
+          sendJson({ ok: true, seeded, note: '已开始学习：' + seeded.join('、') });
+          setTimeout(() => {
+            for (const k of keys) {
+              queueSlangTask(async () => {
+                try { await runSlangExtraction(k); } catch (e) { log('[learn] 黑话失败 ' + k + ': ' + (e?.message ?? e)); }
+                try { await runExpressionExtraction(k); } catch (e) { log('[learn] 表达失败 ' + k + ': ' + (e?.message ?? e)); }
+              }).catch(() => {});
+            }
+          }, 500);
+          return;
+        }
+
         // ── 控制台面板 API（集中开关 + 一键控制） ────────────────────────
         if (req.method === 'GET' && url.pathname === '/panel') {
           try {
