@@ -5050,7 +5050,7 @@ async function main() {
               db.prepare('INSERT INTO affinity (member_id, name, score, notes, profile, updated_at) VALUES (?, ?, ?, ?, ?, ?)')
                 .run(memberId, String(body.name ?? '').slice(0, 30), 0, String(body.note ?? '').slice(0, 120), JSON.stringify(prof), now);
             } else {
-              db.prepare('UPDATE affinity SET profile = ?, notes = COALESCE(NULLIF(?, ""), notes), name = COALESCE(NULLIF(?, ""), name), updated_at = ? WHERE member_id = ?')
+              db.prepare("UPDATE affinity SET profile = ?, notes = COALESCE(NULLIF(?, ''), notes), name = COALESCE(NULLIF(?, ''), name), updated_at = ? WHERE member_id = ?")
                 .run(JSON.stringify(prof), String(body.note ?? '').trim(), String(body.name ?? '').trim(), now, memberId);
             }
             log(`[memory] 人物画像更新 ${memberId}: ${Object.entries(prof).filter(([, v]) => v).map(([k, v]) => k + '=' + v).join(' ')}`);
@@ -7950,7 +7950,7 @@ async function main() {
           status: p.status || oldProf.status || ''
         };
         const score = Math.max(-100, Math.min(100, Number(row.score || 0) + (Number(p.scoreDelta) || 0)));
-        db.prepare('UPDATE affinity SET name = COALESCE(NULLIF(?, ""), name), score = ?, notes = COALESCE(NULLIF(?, ""), notes), profile = ?, updated_at = ? WHERE member_id = ?')
+        db.prepare("UPDATE affinity SET name = COALESCE(NULLIF(?, ''), name), score = ?, notes = COALESCE(NULLIF(?, ''), notes), profile = ?, updated_at = ? WHERE member_id = ?")
           .run(p.name || '', score, p.note || '', JSON.stringify(merged), now, row.memberId);
         peopleUpdated++;
       }
