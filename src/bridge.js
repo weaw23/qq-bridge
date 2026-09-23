@@ -6728,6 +6728,7 @@ async function main() {
         preSleepWaitObservedAt: 0,
         preSleepWaitAccumMs: 0,
         lastUnreadSeq: 0,
+        lastSummarizedSeq: 0,
         activeTopics: [],
         pendingThoughts: [],
         memberImpressions: {}
@@ -6780,6 +6781,7 @@ async function main() {
             preSleepWaitObservedAt: Number(val.preSleepWaitObservedAt) || 0,
             preSleepWaitAccumMs: Number(val.preSleepWaitAccumMs) || 0,
             lastUnreadSeq: Number(val.lastUnreadSeq) || 0,
+            lastSummarizedSeq: Number(val.lastSummarizedSeq) || 0,
             activeTopics: Array.isArray(val.activeTopics) ? val.activeTopics : [],
             pendingThoughts: Array.isArray(val.pendingThoughts) ? val.pendingThoughts : [],
             memberImpressions: (() => {
@@ -6852,6 +6854,7 @@ async function main() {
           preSleepWaitObservedAt: st.preSleepWaitObservedAt || 0,
           preSleepWaitAccumMs: st.preSleepWaitAccumMs || 0,
           lastUnreadSeq: st.lastUnreadSeq || 0,
+          lastSummarizedSeq: Number(st.lastSummarizedSeq) || 0,
           activeTopics: Array.isArray(st.activeTopics) ? st.activeTopics.slice(-50) : [],
           pendingThoughts: Array.isArray(st.pendingThoughts) ? st.pendingThoughts.slice(-50) : [],
           memberImpressions: st.memberImpressions && typeof st.memberImpressions === 'object' ? st.memberImpressions : {},
