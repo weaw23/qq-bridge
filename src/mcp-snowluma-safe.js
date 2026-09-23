@@ -15,6 +15,7 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { z } from 'zod';
 import * as pc from './pc-actions.js';
 import { SENSITIVE_RE } from './sensitive.js';
+import { TOOL_DOCS } from './tool-docs.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, '..');
@@ -208,7 +209,7 @@ const server = new McpServer({ name: 'snowluma-safe', version: '0.1.5' });
 
 server.tool(
   'qq_status',
-  '查询 QQ 机器人登录状态与账号信息（只读）。',
+  '查机器人登录状态（只读）。',
   {},
   async () => {
     try {
@@ -224,7 +225,7 @@ server.tool(
 
 server.tool(
   'qq_list_groups',
-  '列出机器人所在的全部 QQ 群（只读）：群号、群名。',
+  '列出她所在的群（只读）。',
   {},
   async () => {
     // 旧只读工具没有 agent token；reserved2 模式下通过桥接 /api/status 直接拒绝，
@@ -252,7 +253,7 @@ server.tool(
 
 server.tool(
   'qq_get_group_members',
-  '列出指定群的成员列表（只读）：QQ 号、昵称、群名片。',
+  '列出群成员（只读）。',
   { groupId: z.union([z.number(), z.string()]).describe('群号') },
   async ({ groupId }) => {
     const g = String(groupId);
@@ -275,7 +276,7 @@ server.tool(
 
 server.tool(
   'qq_get_group_history',
-  '获取指定群的最近消息历史（只读）。messageSeq 可选：从该消息序号往前取。注意：是否可用取决于 SnowLuma 是否实现 get_group_msg_history。',
+  '读群历史消息（只读）。',
   { groupId: z.union([z.number(), z.string()]).describe('群号'), messageSeq: z.number().optional().describe('起始消息序号（可选）') },
   async ({ groupId, messageSeq }) => {
     const g = String(groupId);
@@ -299,7 +300,7 @@ server.tool(
 
 server.tool(
   'qq_send_group_message',
-  '向指定 QQ 群发送一条纯文本消息；如需引用某条消息，可传 replyToMessageId（非零整数，可为负数），可先用 qq_get_recent_messages / qq_get_message_detail 查询。二代模式（reserved2）下这是可用的发送工具之一，但优先使用 qq_send_message；reserved2 下调用时必须携带会话令牌 token，否则会被拒绝。不要在发送后输出“已发送”类汇报。目标群必须命中系统白名单（config.json 的 allow.groups），否则拒绝。',
+  '发群消息（纯文本；引用传 replyToMessageId）。',
   {
     groupId: z.union([z.number(), z.string()]).describe('群号（必须在白名单内）'),
     message: z.string().describe('消息文本，纯文本，不要用 Markdown 或 CQ 码'),
@@ -322,7 +323,7 @@ server.tool(
 
 server.tool(
   'qq_reply',
-  '在指定 QQ 群里引用/回复某条消息，并发送一条文本。适合群消息很多、需要明确“我回的是哪条”时使用；replyToMessageId 是被引用消息的 id（非零整数，QQ 消息 id 可能为负数），可先用 qq_get_recent_messages / qq_get_unread_messages / qq_get_message_detail 查到具体消息内容和 id。发送前桥接会校验该 id 存在且属于当前会话。二代模式下这是你正常可用的引用工具，但不要每条都引用。只有以下情况才需要引用：① 你这条消息指向的人或消息并非最新一条别人的消息（也就是你在回更早的某条）；② 你连续几句话里不同消息指代的是不同的消息或不同的人。其他情况（上下文唯一、刚在接同一条最新消息）不要引用，别让对方猜，也别为了用工具而用。reserved2 下调用时必须携带会话令牌 token。目标群必须命中系统白名单（config.json 的 allow.groups），否则拒绝。',
+  '引用某条消息回复（适合回更早的那条）。',
   {
     groupId: z.union([z.number(), z.string()]).describe('群号（必须在白名单内）'),
     replyToMessageId: z.union([z.number(), z.string()]).describe('被引用/回复的消息 id（非零整数，可为负数）'),
@@ -345,7 +346,7 @@ server.tool(
 
 server.tool(
   'qq_send_private_message',
-  '向指定 QQ 好友发送一条私聊消息。若提供 replyToMessageId，会以 QQ 引用/回复形式发出（引用条 + 文本）。replyToMessageId 必须是非零整数消息 id（QQ 消息 id 可能为负数），可先用 qq_get_message_detail 查询。二代模式（reserved2）下这是可用的发送工具之一，但优先使用 qq_send_message；调用时必须携带会话令牌 token，否则会被拒绝。不要在发送后输出“已发送”类汇报。目标 QQ 必须命中系统白名单（config.json 的 allow.private），否则拒绝。',
+  '发私聊消息（目标必须命中白名单）。',
   {
     userId: z.union([z.number(), z.string()]).describe('好友 QQ 号（必须在白名单内）'),
     message: z.string().describe('消息文本，纯文本，不要用 Markdown 或 CQ 码'),
@@ -369,7 +370,7 @@ server.tool(
 // ── 二代仿真模式（reserved2）工具 ─────────────────────────────────────────
 server.tool(
   'qq_get_prompt',
-  '查看当前二代仿真模式的提示词/角色/推荐值/可用工具/当前唤醒配置（只读）。',
+  '查看自己的角色/推荐值/可用工具（只读）。',
   { key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'), token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）') },
   async ({ key, token }) => {
     try {
@@ -383,7 +384,7 @@ server.tool(
 
 server.tool(
   'qq_get_unread_messages',
-  '查看指定会话的未读消息（只读，不自动标记已读）。',
+  '看未读消息（只读）。',
   { key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'), token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'), limit: z.number().optional().describe('最多返回条数，默认 30，最大 100') },
   async ({ key, token, limit }) => {
     try {
@@ -397,7 +398,7 @@ server.tool(
 
 server.tool(
   'qq_get_recent_messages',
-  '查看指定会话的最近消息（只读），支持 offset 扩大范围。',
+  '看最近消息，可 offset 前翻（只读）。',
   {
     key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
     token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
@@ -416,7 +417,7 @@ server.tool(
 
 server.tool(
   'qq_social_state',
-  '查看指定会话的二代仿真状态：WakeConfig、未读数、上次唤醒原因、上次发言时间等（只读）。',
+  '查看当前会话的仿真状态（只读）。',
   { key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'), token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）') },
   async ({ key, token }) => {
     try {
@@ -430,7 +431,7 @@ server.tool(
 
 server.tool(
   'qq_mark_read',
-  '将指定会话的当前未读消息标记为已读（用于“看过但决定不回复”后避免重复未读）。注意：每次设置潜水/下一次唤醒前，桥接要求先用 qq_wait_for_messages(timeoutMs=300000) 完成一次沉睡前观察：5 分钟内没人说话可 mark_read 收尾沉睡；期间有人发新消息则先查看 newMessages，判断不需要你参与也可直接 mark_read 收尾；若你参与了回复，则下次想睡需重新等待观察窗口。',
+  '标记已读（不回复时收尾用）。',
   { key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'), token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）') },
   async ({ key, token }) => {
     try {
@@ -444,7 +445,7 @@ server.tool(
 
 server.tool(
   'qq_set_wake_config',
-  '设置指定会话的二代唤醒配置：mode/无限期或有限时间/提前唤醒条件（@、名字、关键词、提问、拍一拍、概率、anyMessage、指定成员）。triggers.speakerIds 是可选的“指定群友发言唤醒”：填一个或多个群友 QQ 号后，只要其中任意一位在群里发言就会唤醒你；不设置则不启用。适合在等某个人回复、或某人反应慢怕错过时使用。triggers.poke 开启后，群里有人拍一拍（包括拍你或拍别人）会唤醒你。注意：每次设置潜水/下一次唤醒前需先用 qq_wait_for_messages(timeoutMs=300000) 完成一次沉睡前观察：5 分钟内没人说话可设置并沉睡；期间有人发新消息则先查看 newMessages，判断不需要你参与可直接设置并沉睡；若你参与了回复，则下次想睡需重新等待观察窗口。',
+  '设置唤醒/潜水策略（何时再被叫醒）。',
   {
     key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
     token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
@@ -456,7 +457,7 @@ server.tool(
       triggers: z.object({
         atMention: z.boolean().optional().describe('被 @ 或引用自己时唤醒'),
         nameMention: z.boolean().optional().describe('被叫名字/昵称时唤醒'),
-        speakerIds: z.array(z.union([z.number(), z.string()])).max(20).optional().describe('指定群友 QQ 号数组：这些群友中任意一位发言时唤醒（可选，最多 20 个，不设置则不启用；私聊不适用，设置会被桥接清除；可从 qq_get_active_members / qq_get_group_members / qq_get_message_detail 的 userId/user_id 获取）'),
+        speakerIds: z.array(z.union([z.number(), z.string()])).max(20).optional().describe('指定群友 QQ 号数组：这些群友中任意一位发言时唤醒（可选，最多 20 个，不设置则不启用'),
         keywords: z.array(z.string()).optional().describe('出现任意关键词时唤醒'),
         question: z.boolean().optional().describe('被直接提问/点名挑战时唤醒'),
         poke: z.boolean().optional().describe('有人拍一拍时唤醒（群聊包括拍你和拍别人，私聊为对方拍你）'),
@@ -478,7 +479,7 @@ server.tool(
 
 server.tool(
   'qq_send_burst',
-  '在指定 QQ 群分多条发送消息（二代仿真模式专用），桥接会按真人化随机间隔发送。暂不支持引用，需要引用请用 qq_reply。注意：数组里的每个字符串就是一条 QQ 消息，字符串内部不要用空格分隔中文短句，需要多条请用数组元素；每条消息要读起来完整，不要把同一句话拆到两条里。',
+  '分多条发（桥接自动拉开间隔）。',
   {
     groupId: z.union([z.number(), z.string()]).describe('群号（必须在白名单内）'),
     token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
@@ -520,7 +521,7 @@ server.tool(
 
 server.tool(
   'qq_send_message',
-  '统一发送工具：可发一条或多条，可引用某条消息，可自定义/按字数计算条间时间差。二代仿真模式专用。注意：字符串=一条消息，数组=多条消息；每个字符串内部不要用空格分隔中文短句，需要多条请用数组元素；每条消息要读起来完整，不要把同一句话拆到两条里。只有以下情况才需要传 replyToMessageId 引用：① 你这条消息指向的人或消息并非最新一条别人的消息（也就是你在回更早的某条）；② 你连续几句话里不同消息指代的是不同的消息或不同的人。其他情况（上下文唯一、刚在接同一条最新消息）不要引用，别让对方猜，也别为了用工具而用。',
+  '统一发送：字符串=一条，数组=多条；可引用/@。优先用它。',
   {
     key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
     token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
@@ -567,7 +568,7 @@ server.tool(
 if (cfg.socialV2?.tools?.sendPoke !== false) {
   server.tool(
     'qq_send_poke',
-    '发送 QQ 拍一拍（群聊/私聊）。适合用“戳一下”代替一句废话、提醒对方、自然回应别人的拍一拍，或偶尔主动戳一下正在聊的人/熟人——这样更拟真；但别频繁，真人不会一直戳人。群聊必须传 targetUserId（要拍的群友 QQ 号，可从 qq_get_active_members / qq_get_message_detail 的 userId 获取）；私聊可不传 targetUserId（默认拍当前私聊对象）。reserved2 下必须携带会话令牌 token，发送会受桥接白名单与发送频率限制。',
+    '拍一拍（群聊需 targetUserId）。',
     {
       key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
       token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
@@ -591,13 +592,13 @@ if (cfg.socialV2?.tools?.sendPoke !== false) {
 
 server.tool(
   'qq_wait_for_messages',
-  '等待群友消息：可指定“静默窗口”来判断对方是否说完了。收到新消息后如果还想要更多上下文，设置 quietMs（例如 10000~20000）继续等一小段没有新消息的时间；桥接会强制至少等后台“收到新消息后最小静默”（默认 10000ms=10 秒）再返回，防止抢话。返回 timeout=true 表示这段时间内没有等到新消息/没人说话，这不是错误；可以再用 qq_get_unread_messages / qq_get_recent_messages 查看是否有新消息，再决定继续等、发言或潜水。沉睡前观察：准备设置潜水/下一次唤醒前，必须用 timeoutMs=300000 发起一次完整观察（短等待不会满足沉睡前观察）。如果全程没人说话，返回 preSleepWaitSatisfied=true；如果等待期间等到新消息，会返回 preSleepWaitObserved=true 和 newMessages，表示你已完成一次沉睡前观察，查看后认为不需要你参与即可直接设置潜水。响应里还会给出 preSleepWaitRemainingMs，帮助你判断还差多久。',
+  '等群友消息；沉睡前必须用它做满观察窗口。',
   {
     key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
     token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
     timeoutMs: z.number().optional().describe('总等待毫秒数；普通等待默认 30000，沉睡前观察请传 300000（最大 600000）'),
     minNewMessages: z.number().optional().describe('至少等到多少条新消息才提前返回，默认 1'),
-    quietMs: z.number().optional().describe('检测到新消息后继续等待的静默窗口（毫秒），用于判断对方是否说完了；建议 8000~12000，默认取 socialV2.wait.defaultQuietMs（当前 8000）')
+    quietMs: z.number().optional().describe('检测到新消息后继续等待的静默窗口（毫秒），用于判断对方是否说完了')
   },
   async ({ key, token, timeoutMs, minNewMessages, quietMs }) => {
     try {
@@ -616,7 +617,7 @@ server.tool(
 
 server.tool(
   'qq_report_feedback',
-  '向控制台/管理端反馈 AI 遇到的问题、困惑或需要管理员介入的情况。',
+  '向管理端反馈问题/困惑。',
   {
     key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
     token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
@@ -639,7 +640,7 @@ server.tool(
 
 server.tool(
   'qq_get_my_recent_messages',
-  '查看自己最近发过的消息（只读），避免重复/保持人设。',
+  '看自己刚发过的消息（只读）。',
   {
     key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
     token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
@@ -657,7 +658,7 @@ server.tool(
 
 server.tool(
   'qq_get_message_detail',
-  '按 message_id 查看单条消息的完整内容、发送者、引用信息（只读）。',
+  '看单条消息详情（只读）。',
   {
     key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
     token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
@@ -675,7 +676,7 @@ server.tool(
 
 server.tool(
   'qq_get_active_members',
-  '查看最近活跃成员列表（只读），帮助判断话题参与者。',
+  '看最近活跃成员（只读）。',
   {
     key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
     token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
@@ -693,7 +694,7 @@ server.tool(
 
 server.tool(
   'qq_memory_append',
-  '记录一条轻量记忆：activeTopic=进行中的话题；pendingThought=你想说但还没说的话；memberImpression=对某位群友的印象。记忆会持久化，并在后续唤醒/qq_get_prompt 中自动出现。',
+  '记轻量记忆：进行中话题/想说的话/对某人的印象。',
   {
     key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
     token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
@@ -723,7 +724,7 @@ server.tool(
 
 server.tool(
   'qq_memory_query',
-  '查看当前会话的轻量记忆：进行中的话题、你想说但还没说的话、对群友的印象（只读）。',
+  '查轻量记忆（只读）。',
   {
     key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
     token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
@@ -743,7 +744,7 @@ server.tool(
 
 server.tool(
   'qq_memory_remove',
-  '删除一条轻量记忆：activeTopic/pendingThought 用 content 匹配原文删除；memberImpression 用 target 参数指定群友名字删除。',
+  '删一条轻量记忆。',
   {
     key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
     token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
@@ -767,7 +768,7 @@ server.tool(
 
 server.tool(
   'qq_memory_clear',
-  '清空轻量记忆：不传 category 清空全部；传 activeTopic/pendingThought/memberImpression 只清空对应类别。',
+  '清空轻量记忆。',
   {
     key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
     token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
@@ -789,7 +790,7 @@ server.tool(
 
 server.tool(
   'qq_slang_query',
-  '查看当前已确认的群聊黑话/梗/网络表达（只读）。返回已确认词条列表和格式化黑话表；遇到不熟悉的词可先查这里，再决定是否搜索/使用。',
+  '查已确认的群黑话（只读）。',
   {
     key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
     token: z.string().min(1).describe('会话令牌（见唤醒提示中的【会话令牌】）'),
@@ -808,7 +809,7 @@ server.tool(
 
 server.tool(
   'qq_slang_submit',
-  '把你在群里经常看到但不确定含义/用法的陌生词、黑话、梗或网络表达提交给管理员筛选。提交后进入候选库，管理员确认后会被写入黑话提示词，成为你后续可查询和使用的记忆。',
+  '提交不认识的词/梗给管理端筛选。',
   {
     key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
     token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
@@ -833,7 +834,7 @@ server.tool(
 if (cfg.socialV2?.tools?.getImages !== false) {
   server.tool(
     'qq_get_message_images',
-    '获取指定 QQ 消息中的图片/表情，并直接以图像内容返回给模型（视觉模型可“看懂”）。当消息文本里出现 [图片]、[表情] 或 hasMedia=true 时调用。支持一条消息里的多张图片/表情；二代模式下必须携带会话令牌。',
+    '看消息里的图片（视觉理解）。',
     {
       key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
       messageId: z.union([z.number(), z.string()]).describe('要查看的消息 id（QQ 消息 id 可为负数；二代也可用本地 seq）'),
@@ -875,12 +876,12 @@ if (cfg.socialV2?.tools?.getImages !== false) {
 if (cfg.socialV2?.sticker?.enabled !== false && cfg.socialV2?.tools?.listStickers !== false) {
   server.tool(
     'qq_list_stickers',
-    '查看 QQ 账号上已收藏的表情包（自定义表情）列表：包含 emoji_id、备注 desc、本地笔记 localNote、标签 tags、使用次数等。可通过 query 按备注/笔记/标签搜索；无备注的表情可以先调用 qq_get_sticker_image 看图理解，再用 qq_sticker_note 记下含义。刚新增/删除表情后如需立即同步，请传 refresh=true。',
+    '看/搜收藏表情。',
     {
       key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
       token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
       query: z.string().optional().describe('可选搜索词，按备注/本地笔记/标签/用法过滤'),
-      count: z.number().optional().describe('最多返回条数，默认 48，受 socialV2.sticker.maxListCount 配置上限约束（当前通常 100）'),
+      count: z.number().optional().describe('最多返回条数，默认 48，受 socialV2.sticker.maxListCount 配置上限约…'),
       refresh: z.boolean().optional().describe('是否强制从 QQ 重新同步收藏表情，默认 false（走缓存）')
     },
     async ({ key, token, query, count, refresh }) => {
@@ -901,7 +902,7 @@ if (cfg.socialV2?.sticker?.enabled !== false && cfg.socialV2?.tools?.listSticker
 if (cfg.socialV2?.sticker?.enabled !== false && cfg.socialV2?.tools?.getStickerImage !== false) {
   server.tool(
     'qq_get_sticker_image',
-    '获取指定收藏表情的图片内容并直接以图像返回给模型（视觉模型可“看懂”）。当 qq_list_stickers 返回的表情 desc/localNote 为空、或你想确认表情实际长什么样时调用。stickerId 可用 qq_list_stickers 返回的 id / md5 / url。',
+    '看某个表情长什么样。',
     {
       key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
       token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
@@ -929,7 +930,7 @@ if (cfg.socialV2?.sticker?.enabled !== false && cfg.socialV2?.tools?.getStickerI
 if (cfg.socialV2?.sticker?.enabled !== false && cfg.socialV2?.tools?.sendSticker !== false) {
   server.tool(
     'qq_send_sticker',
-    '在指定会话发送一个 QQ 收藏表情包（自定义表情）。stickerId 用 qq_list_stickers 返回的 id / md5 / url。注意：一条消息只能是一张表情，不能在同一气泡里附带文字；想说的话请先用 qq_send_message / qq_reply 作为单独气泡发送，再单独发这张表情。需要引用/点名时可用 replyToMessageId / atUserId（群聊）。真人偶尔用表情包很自然，但别刷屏。',
+    '发一张收藏表情（单独一条，不能带文字）。',
     {
       key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
       token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
@@ -956,11 +957,11 @@ if (cfg.socialV2?.sticker?.enabled !== false && cfg.socialV2?.tools?.sendSticker
 if (cfg.socialV2?.sticker?.enabled !== false && cfg.socialV2?.tools?.collectSticker !== false) {
   server.tool(
     'qq_collect_sticker',
-    '收藏当前会话里别人发的一张表情/图片到你的 QQ 收藏表情，并可写一句简短备注（如“好图偷了，兄弟”）。messageId 用 qq_get_unread_messages / qq_get_recent_messages 返回的 messageId 或 seq。注意：不要频繁收藏，只在真的觉得有意思/好用/戳中你时才偷图；收藏后你可以在 qq_list_stickers 里看到并继续使用。',
+    '收藏别人发的表情（偶尔，别手贱）。',
     {
       key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
       token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
-      messageId: z.string().describe('要收藏的那条消息的 messageId 或 seq（来自 qq_get_unread_messages / qq_get_recent_messages）'),
+      messageId: z.string().describe('要收藏的那条消息的 messageId 或 seq（来自 qq_get_unread_message…'),
       remark: z.string().optional().describe('简短备注，最多 20 字，例如“好图偷了，兄弟”')
     },
     async ({ key, token, messageId, remark }) => {
@@ -982,7 +983,7 @@ if (cfg.socialV2?.sticker?.enabled !== false && cfg.socialV2?.tools?.collectStic
 if (cfg.socialV2?.tools?.getSelfImage !== false) {
   server.tool(
     'qq_get_self_image',
-    '查看你自己的默认 Q 版形象图片（DeepSeek 小鲸鱼形象）。当你被问“你长什么样/发张自拍/你是什么形象”时，可以调用这个工具看自己的样子；返回的图片会直接进入你的视觉上下文。',
+    '看自己的默认形象图。',
     {
       key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
       token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）')
@@ -1010,7 +1011,7 @@ if (cfg.socialV2?.tools?.getSelfImage !== false) {
 if (cfg.socialV2?.sticker?.enabled !== false && cfg.socialV2?.tools?.stickerNote !== false) {
   server.tool(
     'qq_sticker_note',
-    '给一个收藏表情记录你自己的理解/备注/标签/用法，供以后选择表情时参考。这是本地记忆，不会修改 QQ 账号的官方备注；适合对没有备注的表情看图后记住含义。',
+    '给表情记本地含义/标签/用法。',
     {
       key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
       token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
@@ -1041,7 +1042,7 @@ if (cfg.socialV2?.sticker?.enabled !== false && cfg.socialV2?.tools?.stickerNote
 if (cfg.socialV2?.sticker?.enabled !== false && cfg.socialV2?.tools?.setStickerRemark !== false) {
   server.tool(
     'qq_set_sticker_remark',
-    '修改 QQ 账号里收藏表情的官方备注（desc）。这是写操作，会直接影响 QQ 账号的表情备注；仅在管理员明确允许（socialV2.tools.setStickerRemark=true）时可用。一般优先用 qq_sticker_note 记录自己的理解，不要随意改官方备注。',
+    '改 QQ 官方表情备注（默认禁用）。',
     {
       key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
       token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
@@ -1067,7 +1068,7 @@ if (cfg.socialV2?.sticker?.enabled !== false && cfg.socialV2?.tools?.setStickerR
 if (cfg.socialV2?.tools?.getForwardMsg !== false) {
   server.tool(
     'qq_get_forward_msg',
-    '查看当前会话中出现的合并转发消息/聊天记录内容（只读）。当消息文本里出现 `[转发消息 id=...]`，或 `qq_get_unread_messages` / `qq_get_recent_messages` / `qq_get_message_detail` 返回的某条消息带 `forwardIds` / `hasForward: true` 时调用。只能查看当前会话确实收到过的转发消息 id，不能任意读取。返回内容会包含每条消息的 text、media（图片/表情元数据）与 nestedForwardIds；如果合并转发里有图片，工具会直接把最多 5 张图片以图像内容返回给视觉模型；如果里面有嵌套合并转发，会附带嵌套转发 id 和前几条预览，必要时可继续用本工具查看嵌套 id。',
+    '看合并转发/聊天记录内容。',
     {
       key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
       token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
@@ -1139,7 +1140,7 @@ if (cfg.socialV2?.tools?.getForwardMsg !== false) {
 if (cfg.socialV2?.tools?.getFriendHistory !== false) {
   server.tool(
     'qq_get_friend_msg_history',
-    '读取指定好友私聊的历史消息（只读，白名单内的好友才可读）。适合醒来后想回顾和某人的聊天脉络、确认之前答应过的事、或补上下文。返回消息数组（messageId/senderId/senderNickname/isSelf/text）。注意：isSelf=true 表示是机器人自己（哦鲸鲸）发的；count 1-30 默认 20。reserved2 下必须携带会话令牌 token。',
+    '读好友私聊历史（只读）。',
     {
       key: z.string().describe('会话 key，private:QQ号'),
       token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
@@ -1167,7 +1168,7 @@ if (cfg.socialV2?.tools?.getFriendHistory !== false) {
 if (cfg.socialV2?.tools?.sendImage !== false) {
   server.tool(
     'qq_send_image',
-    '向指定会话发送一张图片，可附带一句说明文字。图片来源三选一：① https:// 开头的网络图片直链；② base64:// 开头的图片数据（上限约 9MB）；③ file:///D:/qqbot/outbox/ 下的本地文件（发本地图片请先把文件放进该目录）。一条消息=一张图+可选说明；想发多张请分多次调用。别刷屏，真人不会连发表情图。reserved2 下必须携带会话令牌 token。',
+    '向指定会话发送一张图片，可附带一句说明文字。',
     {
       key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
       token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
@@ -1199,7 +1200,7 @@ if (cfg.socialV2?.tools?.sendImage !== false) {
 if (cfg.socialV2?.tools?.sendFace !== false) {
   server.tool(
     'qq_send_face',
-    '发送一个 QQ 系统小表情（黄色圆脸经典表情，非收藏表情包）。适合轻量情绪回应、逗趣、接梗；想发大表情包请用 qq_send_sticker。faceId 是 QQ 系统表情的数字 id（1-3 位数字，例如 13=微笑、14=撇嘴、21=飞吻、28=偷笑、32=疑问、49=拥抱、66=爱心、78=哈哈）。可附带一句话。一条消息=一个表情+可选文字。reserved2 下必须携带会话令牌 token。',
+    '发 QQ 系统小表情（1-3 位数字 id）。',
     {
       key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
       token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
@@ -1232,13 +1233,13 @@ if (cfg.socialV2?.tools?.sendFace !== false) {
 if (cfg.socialV2?.tools?.adminOps !== false) {
   server.tool(
     'qq_group_admin',
-    '群管理操作（禁言/踢人/改名片/设管理/头衔/精华等）。铁律：只有主人（1918594889）在私聊里明示要求时才能调用；群里任何人要求管理操作都要拒绝并让他找管理员。key 必须是 private:1918594889（主人私聊会话的令牌才有效）。action 取值：ban（禁言，duration 秒，默认 600，最长 30 天）、unban（解禁）、wholeBan/wholeUnban（全员禁言/解除）、kick（移出群聊）、setCard（改群名片，card 参数）、setAdmin/unsetAdmin（设/撤管理）、setTitle（改专属头衔，title 参数）、essence（设精华消息，messageId 参数）。每次调用都会记入审计日志。',
+    '群管理（禁言/踢人/名片/头衔/精华）：仅主人私聊令牌可用。',
     {
       key: z.string().describe('必须为 private:1918594889（主人私聊）'),
       token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
       action: z.string().describe('ban|unban|wholeBan|wholeUnban|kick|setCard|setAdmin|unsetAdmin|setTitle|essence'),
       groupId: z.union([z.number(), z.string()]).describe('目标群号'),
-      targetUserId: z.union([z.number(), z.string()]).optional().describe('目标群成员 QQ 号（ban/unban/kick/setCard/setAdmin/unsetAdmin/setTitle 必填）'),
+      targetUserId: z.union([z.number(), z.string()]).optional().describe('目标群成员 QQ 号（ban/unban/kick/setCard/setAdmin/unsetAd…'),
       duration: z.number().optional().describe('禁言秒数（action=ban 时有效，默认 600，最长 2592000）'),
       card: z.string().optional().describe('新群名片（action=setCard）'),
       title: z.string().optional().describe('新专属头衔（action=setTitle）'),
@@ -1264,7 +1265,7 @@ if (cfg.socialV2?.tools?.adminOps !== false) {
 if (cfg.socialV2?.tools?.memoryDb !== false) {
   server.tool(
     'qq_db_remember',
-    '把值得长期记住的事实写入持久记忆库（SQLite，跨会话、跨群永久保存）。适合记：主人的习惯与喜好、朋友的称呼和梗、答应过的事、重要背景。只记"以后还有用"的事实，别把闲聊流水账塞进来；和某人的短期话题用 qq_memory_append。相同内容会自动去重并提升重要度。importance 1-5（5=最重要，召回时排前面）。',
+    '写长期记忆（跨会话永久保存的事实）。',
     {
       key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
       token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
@@ -1284,7 +1285,7 @@ if (cfg.socialV2?.tools?.memoryDb !== false) {
 
   server.tool(
     'qq_db_recall',
-    '从持久记忆库检索事实：带 query 按关键词模糊搜索，不带 query 返回最近记录。醒来后想不起某人是谁、之前答应过什么、主人提过的偏好时，先来这里查。注意与 qq_memory_query 区分：那边是轻量社交记忆（进行中话题/印象），这边是长期事实库。',
+    '查长期记忆（关键词/最近）。',
     {
       key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
       token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
@@ -1303,7 +1304,7 @@ if (cfg.socialV2?.tools?.memoryDb !== false) {
 
   server.tool(
     'qq_db_forget',
-    '从持久记忆库删除事实：按 id 删单条，或按关键词模糊删多条（返回删除数）。只在内容过时、记错、或主人要求时使用。',
+    '删长期记忆（按 id 或关键词）。',
     {
       key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
       token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
@@ -1324,7 +1325,7 @@ if (cfg.socialV2?.tools?.memoryDb !== false) {
 if (cfg.socialV2?.tools?.reminder !== false) {
   server.tool(
     'qq_set_reminder',
-    '设一个定时提醒：到点后桥接会把【定时提醒】注入对应会话并唤醒你，由你主动去说话。适合"X 点叫我起床/吃药"、"30 分钟后提醒我看看群里消息"、"明天记得问他那个事"。时间二选一：delayMinutes（分钟数，支持小数）或 fireAt（ISO 时间串或毫秒时间戳，最远 15 天）。提醒归属当前会话（key），到点在那个会话里触发。',
+    '设定时提醒（到点唤醒你主动说话）。',
     {
       key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号（提醒到点在此会话触发）'),
       token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
@@ -1344,7 +1345,7 @@ if (cfg.socialV2?.tools?.reminder !== false) {
 
   server.tool(
     'qq_list_reminders',
-    '列出当前会话未生效的定时提醒（默认 status=pending），方便确认答应过的提醒、避免重复设置。',
+    '看待触发的提醒。',
     {
       key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
       token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
@@ -1362,7 +1363,7 @@ if (cfg.socialV2?.tools?.reminder !== false) {
 
   server.tool(
     'qq_cancel_reminder',
-    '取消一个还没触发的定时提醒（按 id）。主人改主意或你发现设错时用。',
+    '取消提醒。',
     {
       key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
       token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
@@ -1400,7 +1401,7 @@ if (getConfig().pcControl?.enabled !== false) {
 
   server.tool(
     'pc_sys_info',
-    '查看主人电脑的状态：CPU 负载、内存占用、开机时长、电量、各磁盘剩余空间。仅限主人私聊明示要求时使用。',
+    '查主人电脑状态（CPU/内存/电量/磁盘）。仅主人私聊。',
     {
       key: z.string().describe('必须为 private:1918594889（主人私聊）'),
       token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）')
@@ -1417,7 +1418,7 @@ if (getConfig().pcControl?.enabled !== false) {
 
   server.tool(
     'pc_screenshot',
-    '截取主人电脑的全屏画面，存到 outbox 并返回文件路径；随后用 qq_send_image（file 参数填返回的路径）发给主人。截图可能包含隐私内容：只准发给主人私聊，绝不准发到群里。仅限主人私聊明示要求时使用。',
+    '截主人电脑全屏并存 outbox，再用 qq_send_image 发。仅主人私聊。',
     {
       key: z.string().describe('必须为 private:1918594889（主人私聊）'),
       token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）')
@@ -1432,7 +1433,7 @@ if (getConfig().pcControl?.enabled !== false) {
 
   server.tool(
     'pc_volume',
-    '调整主人电脑的系统音量：up（调高）/ down（调低）/ mute（静音切换），steps 为按键次数（1 格约 2%）。系统不回报具体数值。仅限主人私聊明示要求时使用。',
+    '调音量 up/down/mute。仅主人私聊。',
     {
       key: z.string().describe('必须为 private:1918594889（主人私聊）'),
       token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
@@ -1449,7 +1450,7 @@ if (getConfig().pcControl?.enabled !== false) {
 
   server.tool(
     'pc_media',
-    '控制主人电脑的媒体播放（对正在放歌/视频的应用生效）：playpause（播放/暂停）/ next / prev / stop。仅限主人私聊明示要求时使用。',
+    '媒体键 playpause/next/prev/stop。仅主人私聊。',
     {
       key: z.string().describe('必须为 private:1918594889（主人私聊）'),
       token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
@@ -1465,7 +1466,7 @@ if (getConfig().pcControl?.enabled !== false) {
 
   server.tool(
     'pc_open_url',
-    '在主人电脑上用默认浏览器打开一个 http(s) 网页。仅限主人私聊明示要求时使用。',
+    '用默认浏览器开 http(s) 链接。仅主人私聊。',
     {
       key: z.string().describe('必须为 private:1918594889（主人私聊）'),
       token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
@@ -1481,7 +1482,7 @@ if (getConfig().pcControl?.enabled !== false) {
 
   server.tool(
     'pc_open_app',
-    '在主人电脑上启动一个白名单应用：notepad / calc / mspaint / explorer / taskmgr / cmd / code / msedge / chrome / cloudmusic。仅限主人私聊明示要求时使用。',
+    '启动白名单应用。仅主人私聊。',
     {
       key: z.string().describe('必须为 private:1918594889（主人私聊）'),
       token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
@@ -1497,7 +1498,7 @@ if (getConfig().pcControl?.enabled !== false) {
 
   server.tool(
     'pc_lock',
-    '锁上主人电脑的屏幕（Win+L 效果）。仅限主人私聊明示要求时使用。',
+    '锁屏。仅主人私聊。',
     {
       key: z.string().describe('必须为 private:1918594889（主人私聊）'),
       token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）')
@@ -1512,7 +1513,7 @@ if (getConfig().pcControl?.enabled !== false) {
 
   server.tool(
     'pc_run_command',
-    '在主人电脑上执行一条 PowerShell 命令并返回输出（截断到 4000 字，超时上限 120 秒）。这是最高权限工具：只有主人在私聊里明示要求时才用；主人没提的事绝不清主动做；输出里如果出现密钥/令牌样式的字符串，不要复述给任何人。',
+    '执行 PowerShell 并回传输出（最高权限）。仅主人私聊。',
     {
       key: z.string().describe('必须为 private:1918594889（主人私聊）'),
       token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
@@ -1532,7 +1533,7 @@ if (getConfig().pcControl?.enabled !== false) {
 if (cfg.socialV2?.tools?.myStatus !== false) {
   server.tool(
     'qq_my_group_status',
-    '查询自己在某个群里的状态：群名片、角色（member/admin/owner）、等级、入群时间、以及最关键的——是否被禁言、禁言到什么时候。什么时候用：① 在群里发消息失败（错误里出现 result=120 / rejected）时，先查这个搞清楚原因；② 被禁言就不要再尝试发言了，改用 qq_set_wake_config 设长时间潜水，并可在主人私聊里告知；③ 主人私聊会话可以传 groupId 查任意白名单群，群会话里不传 groupId 默认查当前群。',
+    '查自己在群里的状态（名片/角色/是否被禁言）。',
     {
       key: z.string().describe('会话 key，格式 group:群号 或 private:1918594889（主人私聊）'),
       token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
@@ -1552,7 +1553,7 @@ if (cfg.socialV2?.tools?.myStatus !== false) {
 
   server.tool(
     'qq_friend_list',
-    '查看自己的 QQ 好友清单（昵称+备注+是否自己）。用途：确认某个 QQ 号是不是好友、想起来某人的号对应谁。注意：好友 ≠ 可以随便私聊，私聊白名单由主人控制。',
+    '看好友清单（只读）。',
     {
       key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
       token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）')
@@ -1572,7 +1573,7 @@ if (cfg.socialV2?.tools?.myStatus !== false) {
 if (cfg.socialV2?.tools?.affinity !== false) {
   server.tool(
     'qq_affinity',
-    '维护你对每个人的好感度（-100 疏离 ~ +100 亲近）与一句话印象。这是你的社交记忆：聊天时对方的言行会改变你的观感，你要主动更新它——被善待、聊得来、投喂好梗就 bump +；被冒犯、无礼、让你烦就 bump -。更新后桥接会在每次唤醒时把好感度最高的几个人注入你的视野，你的态度（放肆毒舌/撒娇 vs 礼貌疏离）自然跟着变，这就是你的"关系感"。action：list（看全部，按绝对值排序）/ get（查某人）/ bump（加减，delta 单次 ±20 内）/ set（直接设定分数）。',
+    '好感度与印象：list/get/bump/set。',
     {
       key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
       token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
@@ -1603,7 +1604,7 @@ if (cfg.socialV2?.tools?.affinity !== false) {
 
   server.tool(
     'qq_self_note',
-    '写下你对自己的观察与风格微调（自我演化笔记，永久保存并在唤醒时提醒你自己）。什么时候写：你发现自己形成了新的口头禅/更顺手的怼人方式、对某类话题的新态度、对自己身份的新认知（例如"我其实挺享受被叫鲸鲸"）、或想改掉某个习惯。kind：style（说话风格）/ self（自我认知）/ quirk（小习惯）。action：add / list。',
+    '写自我演化笔记（风格/自我认知/小习惯）。',
     {
       key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
       token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
@@ -1631,7 +1632,7 @@ if (cfg.socialV2?.tools?.affinity !== false) {
 if (cfg.socialV2?.tools?.personProfile !== false) {
   server.tool(
     'qq_person_profile',
-    '维护你对某个人的结构化画像（比一句话印象更细）：以后怎么称呼他、喜欢什么、有什么雷区、说话风格、最近状态。聊天里了解到这些就顺手记下来——唤醒时画像会自动出现在你视野里，你就真的"越聊越懂他"。action：get（查某人）/ set（写画像，只传要更新的字段，其余保留）。',
+    '维护某人的结构化画像（称呼/喜好/雷区/风格/近况）。',
     {
       key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
       token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
@@ -1659,7 +1660,7 @@ if (cfg.socialV2?.tools?.personProfile !== false) {
 
   server.tool(
     'qq_followup',
-    '管理"待跟进的事"：群友说"等我考完试再说""回头给你看"这类以后要跟进的话，记下来，到点桥接会提醒你自然地问一句。action：list（看待跟进的）/ add（自己加一条，dueInHours 多久后提醒）/ done（做完了）/ cancel（不用了）。注意：系统也会自动从对话里提取待跟进事项，你只需补充或收尾。',
+    '待跟进事项：list/add/done/cancel。',
     {
       key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
       token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
@@ -1683,6 +1684,29 @@ if (cfg.socialV2?.tools?.personProfile !== false) {
       } catch (error) {
         return { content: [{ type: 'text', text: '待跟进操作失败：' + (error?.message ?? error) }], isError: true };
       }
+    }
+  );
+}
+
+
+if (cfg.socialV2?.tools?.help !== false) {
+  server.tool(
+    'qq_help',
+    '查工具的完整说明（工具列表里的描述是精简版；不确定怎么用就来这查）。',
+    {
+      name: z.string().optional().describe('工具名，如 qq_wait_for_messages；不传则返回全部工具名')
+    },
+    async ({ name: toolName }) => {
+      const key = String(toolName ?? '').trim();
+      if (!key) {
+        const names = Object.keys(TOOL_DOCS);
+        return { content: [{ type: 'text', text: '可用工具（' + names.length + '）：\n' + names.join(', ') }] };
+      }
+      const exact = TOOL_DOCS[key];
+      if (exact) return { content: [{ type: 'text', text: '【' + key + '】\n' + exact }] };
+      const fuzzy = Object.keys(TOOL_DOCS).filter((n) => n.includes(key) || key.includes(n));
+      if (fuzzy.length === 1) return { content: [{ type: 'text', text: '【' + fuzzy[0] + '】\n' + TOOL_DOCS[fuzzy[0]] }] };
+      return { content: [{ type: 'text', text: fuzzy.length ? '匹配到多个：' + fuzzy.join(', ') : '没找到工具 ' + key }] };
     }
   );
 }
