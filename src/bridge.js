@@ -34,6 +34,14 @@ import {
 } from './slang-learner.js';
 import { buildSummaryPrompt, parseSummaryJson, toBigrams, queryToMatch, formatProfileLine } from './memory-engine.js';
 import {
+  loadExpressionStore,
+  saveExpressionStore,
+  upsertExpression,
+  buildExpressionContext,
+  buildExpressionPrompt,
+  parseExpressionJson
+} from './expression-learner.js';
+import {
   loadStickerStore,
   saveStickerStore,
   mergeStickerLibrary,
@@ -1061,6 +1069,8 @@ async function main() {
       slangWindows.set(key, win.slice(messages.length));
       saveSlangStore();
       log(`黑话提取：${key} 新增 ${added} 条，更新 ${updated} 条`);
+      // P6-5：同一批语料顺带学一次"说话方式"（复用学习会话，不额外开窗口）
+      queueSlangTask(() => runExpressionExtraction(key)).catch(() => {});
       if (researchCandidates.length && cfg.slang?.autoResearch !== false) {
         queueSlangTask(() => runSlangResearch(researchCandidates));
       }
@@ -1248,7 +1258,8 @@ async function main() {
       const block = buildSlangContext(slangEntries, cfg.slang?.injectMax ?? 8);
       if (block) parts.push(block);
     }
-    return parts.join('\n\n') + '\n\n' + promptText;
+    const joined = parts.join('\n\n') + '\n\n' + promptText;
+    return withExpressionContext(joined);
   }
 
   if (!cfg.allow.private.length && !cfg.allow.groups.length && cfg.allowAllWhenEmpty) {
@@ -4848,6 +4859,10 @@ async function main() {
               try { const o = JSON.parse(l); txt = `${o.time ? new Date(o.time).toLocaleTimeString('zh-CN') : ''} ${o.key ?? ''} ${o.tool ?? o.name ?? ''} ${o.type ?? ''} ${o.ok === false ? '✗' : o.ok === true ? '✓' : ''}`; } catch {}
               return `<tr><td>${esc(txt)}</td></tr>`;
             }).join('') + '</table>';
+          } else if (kind === 'expressions') {
+            const arr = (Array.isArray(expressionEntries) ? expressionEntries : []).slice().sort((a, c2) => (c2.score || 0) - (a.score || 0)).slice(0, 120);
+            html = '<table><tr><th>句式</th><th>用法</th><th>语气</th><th>例句</th><th>出现</th></tr>' + arr.map((e) =>
+              `<tr><td>${esc(e.pattern)}</td><td>${esc(e.usage)}</td><td>${esc(e.tone)}</td><td>${esc(String(e.example || '').slice(0, 50))}</td><td>${e.count || 1}</td></tr>`).join('') + '</table>';
           } else if (kind === 'slang') {
             const list = (Array.isArray(slangEntries) ? slangEntries : []).slice(-150).reverse();
             html = '<table><tr><th>词条</th><th>含义</th><th>用法</th><th>确认</th></tr>' + list.map((e) =>
@@ -7837,6 +7852,52 @@ async function main() {
     }
   }, 30000);
   if (reminderTimer.unref) reminderTimer.unref();
+
+  // ── P6-5：表达学习（句式/语气模板库，借鉴 MaiBot 的表达学习思路） ──
+  const EXPRESSION_FILE = path.join(STATE_DIR, 'expressions.json');
+  let expressionEntries = loadExpressionStore(EXPRESSION_FILE);
+  let expressionBusy = false;
+
+  async function runExpressionExtraction(key) {
+    if (cfg.expressions?.enabled === false) return;
+    if (!dshReady || expressionBusy || socialV2.paused) return;
+    const messages = slangWindows.get(key) ?? [];
+    const min = Math.max(3, Number(cfg.expressions?.minMessages) || 8);
+    if (messages.length < min) return;
+    expressionBusy = true;
+    try {
+      const sessionId = await ensureSlangLearnerSession();
+      const promptText = buildExpressionPrompt(messages);
+      const accepted = await api.sessions.prompt({ sessionId, mode: 'queue', content: [{ type: 'text', text: promptText }] });
+      if (accepted?.result && accepted.result.ok === false) { log('[expression] 提取被拒'); return; }
+      const output = await waitLearnerTurn(sessionId, Number(cfg.expressions?.timeoutMs) || 180000);
+      const items = parseExpressionJson(output);
+      if (!items.length) { log('[expression] ' + key + ' 本轮没有发现新句式'); return; }
+      let added = 0, updated = 0;
+      for (const it of items) {
+        const idx = Number(it.source_id) - 1;
+        const src = Number.isInteger(idx) && idx >= 0 && idx < messages.length ? messages[idx] : null;
+        const evidence = src ? [{ key, sender: src.sender, text: String(src.text ?? '').slice(0, 80), time: src.time }] : [];
+        const r = upsertExpression(expressionEntries, it.pattern, { usage: it.usage, tone: it.tone, example: it.example || src?.text || '', evidence });
+        if (r.created) added++; else updated++;
+      }
+      saveExpressionStore(EXPRESSION_FILE, expressionEntries);
+      log('[expression] ' + key + ' 句式库：新增 ' + added + '，更新 ' + updated + '（共 ' + expressionEntries.length + '）');
+    } catch (error) {
+      log('[expression] 提取失败 ' + key + ': ' + (error?.message ?? error));
+    } finally {
+      expressionBusy = false;
+    }
+  }
+
+  function withExpressionContext(promptText) {
+    try {
+      if (cfg.expressions?.enabled === false) return promptText;
+      const block = buildExpressionContext(expressionEntries, Number(cfg.expressions?.injectMax) || 8);
+      if (!block) return promptText;
+      return block + '\n\n' + promptText;
+    } catch { return promptText; }
+  }
 
   // ── P6：记忆引擎（自动摘要 → 长期记忆/人物画像/待跟进）+ 自主性调度（复盘/关心） ──
   let memorySessionId = null;
