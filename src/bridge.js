@@ -257,6 +257,8 @@ function loadConfig() {
       private: normalizeIdList(file.allow?.private ?? file.allow?.privates ?? []),
       groups: normalizeIdList(file.allow?.groups ?? file.allow?.group ?? [])
     },
+    // P7-A：被自动停用的群（发送多次失败且确认已被移出）；面板可一键恢复
+    groupsDisabled: normalizeIdList(file.groupsDisabled ?? []),
     deny: {
       private: normalizeIdList(file.deny?.private ?? file.deny?.privates ?? []),
       groups: normalizeIdList(file.deny?.groups ?? file.deny?.group ?? [])
@@ -506,6 +508,7 @@ function loadState() {
   if (loaded && loaded.sessions && typeof loaded.sessions === 'object') state = loaded;
   else state = { sessions: {} };
   if (!state.sessionPolicies || typeof state.sessionPolicies !== 'object' || Array.isArray(state.sessionPolicies)) state.sessionPolicies = {};
+  if (!state.sessionAges || typeof state.sessionAges !== 'object' || Array.isArray(state.sessionAges)) state.sessionAges = {};
 }
 function saveState() {
   fs.mkdirSync(STATE_DIR, { recursive: true });
@@ -683,6 +686,8 @@ function allowed(kind, id, cfg) {
   // OneBot 事件里的 id 可能是数字也可能是字符串（int64 序列化差异），统一转字符串比较。
   // 配置字段兼容单数（group/private）与复数（groups/privates）两种写法。
   const s = String(id);
+  // P7-A：被自动停用的群一票否决（消息不投递、不唤醒、不能发送），直到面板/白名单恢复。
+  if (kind === 'group' && Array.isArray(cfg.groupsDisabled) && cfg.groupsDisabled.map(String).includes(s)) return false;
   const denyList = cfg.deny[kind] ?? cfg.deny[kind + 's'] ?? [];
   if (denyList.map(String).includes(s)) return false;
   const allowList = cfg.allow[kind] ?? cfg.allow[kind + 's'] ?? [];
@@ -848,7 +853,8 @@ async function main() {
         const body = await res.json().catch(() => ({}));
         if (!res.ok || body.status !== 'ok' || body.retcode !== 0) {
           const hint = res.status === 426 ? '（HTTP 426：snowluma.httpUrl 可能指向了 WebSocket 端口，请检查 config.json 的 snowluma.httpUrl 是否为 OneBot HTTP API 地址）' : '';
-          throw new Error(`OneBot ${action} 失败: ${body.wording || body.retcode || res.status}${hint}`);
+          const kickNoteS = await diagnoseGroupSendFailure(kind, id, body);
+          throw new Error(`OneBot ${action} 失败: ${body.wording || body.retcode || res.status}${hint}${kickNoteS}`);
         }
         sendResolve(body.data);
       } catch (error) {
@@ -1107,6 +1113,12 @@ async function main() {
       }
       const output = await waitLearnerTurn(sessionId);
       const results = parseResearchJson(output);
+      // P7-B 自动转正参数：研究明确确认 + 有来源佐证 + 群内证据次数达门槛 → 直接进注入表（可回滚）。
+      const ac = cfg.slang?.autoConfirm ?? {};
+      const acOn = ac.enabled !== false;
+      const acMinEvidence = Math.max(1, Number(ac.minEvidence) || 3);
+      const acMinSources = Math.max(1, Number(ac.minSources) || 1);
+      let autoConfirmedCount = 0;
       for (const r of results) {
         const entry = slangEntries.find((e) => e.content === r.content);
         if (!entry) continue;
@@ -1123,8 +1135,18 @@ async function main() {
         if (Array.isArray(r.sources) && r.sources.length) entry.sources = r.sources.map((s) => String(s ?? '').trim()).filter(Boolean).slice(0, 10);
         entry.lastInferenceCount = entry.count;
         entry.updatedAt = new Date().toISOString();
+        if (acOn && entry.status === SLANG_STATUS.CANDIDATE && !entry.auto
+            && entry.meaning && (entry.usage || entry.example)
+            && (entry.sources?.length ?? 0) >= acMinSources
+            && (entry.count || 0) >= acMinEvidence
+            && !entry.risk) {
+          entry.status = SLANG_STATUS.CONFIRMED;
+          entry.auto = true;
+          autoConfirmedCount++;
+        }
       }
       saveSlangStore();
+      if (autoConfirmedCount) log(`黑话研究：自动转正 ${autoConfirmedCount} 条（研究确认+来源佐证+证据达门槛；面板可撤销）`);
       log(`黑话研究：已更新 ${results.length} 条候选解释`);
     } catch (error) {
       if (/会话|session|not found|404/i.test(String(error?.message ?? error))) {
@@ -2082,6 +2104,22 @@ async function main() {
           sendJson({ ok: true, rejectedCount });
           return;
         }
+        // P7-B：一键撤销所有「自动转正」词条（回到候选，等待人工处理）
+        if (req.method === 'POST' && url.pathname === '/api/slang/undo-auto') {
+          let undoneCount = 0;
+          for (const entry of slangEntries) {
+            if (entry.auto === true && entry.status === SLANG_STATUS.CONFIRMED) {
+              entry.status = SLANG_STATUS.CANDIDATE;
+              entry.auto = false;
+              entry.updatedAt = new Date().toISOString();
+              undoneCount++;
+            }
+          }
+          if (undoneCount) saveSlangStore();
+          log(`控制台：撤销自动转正黑话 ${undoneCount} 条`);
+          sendJson({ ok: true, undoneCount });
+          return;
+        }
         const slangMatch = url.pathname.match(/^\/api\/slang\/([^/]+)(?:\/(confirm|reject))?$/);
         if (req.method === 'PATCH' && slangMatch && !slangMatch[2]) {
           const id = slangMatch[1];
@@ -2271,6 +2309,14 @@ async function main() {
           file.allow = allow;
           file.deny = deny;
           file.ownerQQ = ownerQQ;
+          // P7-A：手工把被自动停用的群填回白名单视为主动恢复——清除停用标记与失败计数
+          {
+            const disabledList = (file.groupsDisabled ?? []).map(String);
+            const allowSet = new Set(allow.groups.map(String));
+            file.groupsDisabled = disabledList.filter((g) => !allowSet.has(g));
+            for (const g of disabledList) if (allowSet.has(g)) clearGroupStrikes(g);
+            cfg.groupsDisabled = file.groupsDisabled;
+          }
           atomicWriteJson(configFile, file);
           cfg.allow = { private: allow.private, groups: allow.groups };
           cfg.deny = { private: deny.private, groups: deny.groups };
@@ -4756,7 +4802,8 @@ async function main() {
               lastWakeReason: st.lastWakeReason ?? '',
               lastIncomingAt: st.lastIncomingAt ?? 0,
               wakeMode: st.wakeConfig?.mode ?? '',
-              sleepUntil: st.wakeConfig?.sleepUntil ?? null
+              sleepUntil: st.wakeConfig?.sleepUntil ?? null,
+              ageDays: state.sessionAges?.[k] ? Math.round((Date.now() - Number(state.sessionAges[k])) / 86400000 * 10) / 10 : null
             };
           });
           let toolCount = null;
@@ -4771,6 +4818,8 @@ async function main() {
             model: { provider: cfg.dsh?.provider ?? '', model: cfg.dsh?.model ?? '', reasoningEffort: cfg.dsh?.reasoningEffort ?? 'default' },
             allowPrivate: cfg.allow?.private ?? [],
             allowGroups: cfg.allow?.groups ?? [],
+            groupsDisabled: cfg.groupsDisabled ?? [],
+            groupHealth: (() => { try { const h = JSON.parse(fs.readFileSync(path.join(STATE_DIR, 'group-health.json'), 'utf8')); return h.strikes ?? {}; } catch { return {}; } })(),
             consolePort: Number(cfg.consolePort) || 3100,
             pid: process.pid,
             uptimeText: up > 3600 ? Math.floor(up / 3600) + ' 小时 ' + Math.floor((up % 3600) / 60) + ' 分' : Math.floor(up / 60) + ' 分 ' + (up % 60) + ' 秒',
@@ -4888,9 +4937,27 @@ async function main() {
             html = '<table><tr><th>句式</th><th>用法</th><th>语气</th><th>例句</th><th>出现</th></tr>' + arr.map((e) =>
               `<tr><td>${esc(e.pattern)}</td><td>${esc(e.usage)}</td><td>${esc(e.tone)}</td><td>${esc(String(e.example || '').slice(0, 50))}</td><td>${e.count || 1}</td></tr>`).join('') + '</table>';
           } else if (kind === 'slang') {
-            const list = (Array.isArray(slangEntries) ? slangEntries : []).slice(-150).reverse();
-            html = '<table><tr><th>词条</th><th>含义</th><th>用法</th><th>确认</th></tr>' + list.map((e) =>
-              `<tr><td>${esc(e.term ?? e.word ?? '')}</td><td>${esc(e.meaning ?? '')}</td><td>${esc(e.usage ?? '')}</td><td>${e.confirmed === false ? '待确认' : '已确认'}</td></tr>`).join('') + '</table>';
+            const list = (Array.isArray(slangEntries) ? slangEntries : []).slice().sort((a, b) => (b.count || 0) - (a.count || 0)).slice(0, 200);
+            const nCand = list.filter((e) => e.status === 'candidate').length;
+            const nAuto = list.filter((e) => e.status === 'confirmed' && e.auto === true).length;
+            const nConf = list.filter((e) => e.status === 'confirmed').length;
+            const toolbar = `<div class="btns" style="margin:4px 0 8px">
+              <button class="sm" onclick="slangBatchConfirm()">批量确认候选（含义非空）</button>
+              <button class="sm danger" onclick="slangUndoAuto()">撤销自动转正${nAuto ? `（${nAuto}）` : ''}</button>
+              <button class="sm" onclick="slangBatchRejectAll()">批量拒绝全部候选${nCand ? `（${nCand}）` : ''}</button>
+              <span class="muted" style="align-self:center">已确认 ${nConf} / 候选 ${nCand} / 共 ${list.length}</span>
+            </div>`;
+            const stBadge = (e) => e.status === 'confirmed'
+              ? (e.auto === true ? '<b style="color:#0a7">自动转正</b>' : '已确认')
+              : (e.status === 'rejected' ? '<span style="color:#a55">已拒绝</span>' : '<span style="color:#a80">待确认</span>');
+            html = toolbar + '<table><tr><th>词条</th><th>含义</th><th>用法</th><th>证据</th><th>状态</th><th>操作</th></tr>' + list.map((e) => {
+              const btns = e.status === 'candidate'
+                ? `<button class="sm" onclick="slangAct('confirm','${e.id}')">确认</button> <button class="sm danger" onclick="slangAct('reject','${e.id}')">拒绝</button>`
+                : (e.status === 'confirmed'
+                  ? `<button class="sm" onclick="slangAct('cand','${e.id}')">回候选</button> <button class="sm danger" onclick="slangAct('reject','${e.id}')">拒绝</button>`
+                  : `<button class="sm" onclick="slangAct('cand','${e.id}')">回候选</button>`);
+              return `<tr><td>${esc(e.content)}</td><td>${esc(String(e.meaning || '').slice(0, 60))}</td><td>${esc(String(e.usage || '').slice(0, 40))}</td><td>${e.count || 0}${Array.isArray(e.sources) && e.sources.length ? ' · 源' + e.sources.length : ''}</td><td>${stBadge(e)}</td><td>${btns}</td></tr>`;
+            }).join('') + '</table>';
           } else if (kind === 'feedback') {
             let list = [];
             try { list = (JSON.parse(fs.readFileSync(path.join(STATE_DIR, 'feedback.json'), 'utf8'))?.items ?? []).slice(-100).reverse(); } catch {}
@@ -5015,6 +5082,25 @@ async function main() {
               case 'clear-activity': {
                 const f = path.join(STATE_DIR, 'qq-activity.log');
                 try { fs.writeFileSync(f, ''); note = '活动日志已清空'; } catch (e) { note = '清空失败：' + (e?.message ?? e); }
+                break;
+              }
+              case 'restore-group': {
+                const gid = key.replace(/^group:/, '').trim();
+                if (!/^\d+$/.test(gid)) { sendJson({ ok: false, error: '群号无效' }, 400); return; }
+                const configFileG = path.join(ROOT, 'config.json');
+                const fileG = readJsonSafe(configFileG, null, true);
+                if (!fileG) { sendJson({ ok: false, error: 'config.json 读取失败' }, 500); return; }
+                fileG.groupsDisabled = (fileG.groupsDisabled ?? []).map(String).filter((g) => g !== gid);
+                if (!(fileG.allow?.groups ?? []).map(String).includes(gid)) {
+                  fileG.allow = { private: fileG.allow?.private ?? [], groups: [...(fileG.allow?.groups ?? []), Number(gid)] };
+                }
+                atomicWriteJson(configFileG, fileG);
+                cfg.groupsDisabled = normalizeIdList(fileG.groupsDisabled);
+                cfg.allow = { private: normalizeIdList(fileG.allow.private), groups: normalizeIdList(fileG.allow.groups) };
+                clearGroupStrikes(gid);
+                reconcileSessionPolicies();
+                log(`[group-health] 群 ${gid} 已恢复进白名单（失败计数清零）`);
+                note = `群 ${gid} 已恢复：重新加入白名单，排程将随下一条消息自然重建`;
                 break;
               }
               case 'restart-bridge': {
@@ -5766,12 +5852,18 @@ async function main() {
     return body.data;
   }
 
-  // 群发送失败时的禁言自诊：retcode=120/rejected 时查自身成员信息，把禁言期限直接写进错误信息
+  // 群发送失败自诊：禁言(120/rejected)给出期限；被移出(result=110/权限失败)记 strike，两次自动停用整群。
   async function diagnoseGroupSendFailure(kind, id, obBody) {
     try {
       if (kind !== 'group') return '';
       const code = Number(obBody?.retcode ?? 0);
-      if (!(code === 120 || /rejected/i.test(String(obBody?.wording ?? '')))) return '';
+      const wording = String(obBody?.wording ?? '');
+      // P7-A：被移出群（result=110 或文案含「移出/重新加群」）→ 记 strike
+      if (code === 110 || /移出|重新加群/.test(wording)) {
+        noteGroupKick(id, wording || `result=${code}`);
+        return `（诊断：本账号已被移出该群，期间所有发言必然失败。请勿重试发言；桥接会在确认后自动停用该群，也可提醒主人在面板恢复或重新拉群）`;
+      }
+      if (!(code === 120 || /rejected/i.test(wording))) return '';
       const httpUrlD = String(cfg.snowluma?.httpUrl || 'http://127.0.0.1:3000').replace(/\/+$/, '');
       const resD = await fetch(httpUrlD + '/get_group_member_info', {
         method: 'POST',
@@ -5785,8 +5877,64 @@ async function main() {
         const until = new Date(shut * 1000).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' });
         return `（诊断：本账号在该群被禁言至 ${until}，期间所有发言必然失败。请勿重试发言，改用 qq_set_wake_config 设长时间潜水，并可在私聊里告知主人）`;
       }
+      // 禁言类失败但查不到成员信息（权限失败）→ 多半已被移出，同样记 strike
+      if (!mi?.data) {
+        noteGroupKick(id, '成员信息查询失败: ' + (mi?.wording || mi?.message || `retcode=${mi?.retcode ?? '?'}`));
+        return `（诊断：无法查询本账号在该群的成员信息（${mi?.wording || 'AUTHORITY_FAIL'}），可能已被移出该群。请勿重试发言）`;
+      }
     } catch {}
     return '';
+  }
+
+  // ── P7-A 群健康自愈：kick strike 计数 + 自动停用 ──────────────────────────
+  const GROUP_HEALTH_FILE = path.join(STATE_DIR, 'group-health.json');
+  function readGroupHealth() {
+    try { return JSON.parse(fs.readFileSync(GROUP_HEALTH_FILE, 'utf8')); } catch { return { strikes: {} }; }
+  }
+  function writeGroupHealth(obj) { try { atomicWriteJson(GROUP_HEALTH_FILE, obj); } catch {} }
+  function clearGroupStrikes(gid) {
+    const h = readGroupHealth();
+    if (h.strikes && h.strikes[String(gid)]) { delete h.strikes[String(gid)]; writeGroupHealth(h); }
+  }
+  function noteGroupKick(groupId, reason) {
+    const gid = String(groupId);
+    const h = readGroupHealth();
+    const cur = h.strikes[gid] || { count: 0, lastAt: 0, reason: '' };
+    const now = Date.now();
+    if (now - (Number(cur.lastAt) || 0) > 24 * 3600 * 1000) cur.count = 0; // 24h 窗口外的旧账清零
+    cur.count = (Number(cur.count) || 0) + 1;
+    cur.lastAt = now;
+    cur.reason = String(reason ?? '').slice(0, 160);
+    h.strikes[gid] = cur;
+    writeGroupHealth(h);
+    if (cur.count >= 2) void disableGroupByHealth(gid, cur.reason);
+  }
+  function disableGroupByHealth(gid, reason) {
+    if (!cfg.allow.groups.map(String).includes(gid)) return; // 已停用/不在白名单：幂等退出
+    const configFile = path.join(ROOT, 'config.json');
+    try {
+      const file = readJsonSafe(configFile, null, true);
+      file.allow = {
+        private: (file.allow?.private ?? []),
+        groups: (file.allow?.groups ?? []).map(String).filter((g) => g !== gid)
+      };
+      file.groupsDisabled = Array.from(new Set([...(file.groupsDisabled ?? []).map(String), gid]));
+      atomicWriteJson(configFile, file);
+      cfg.allow = { private: normalizeIdList(file.allow.private), groups: normalizeIdList(file.allow.groups) };
+      cfg.groupsDisabled = file.groupsDisabled;
+    } catch (error) {
+      log(`[group-health] 停用群 ${gid} 写配置失败: ${error?.message ?? error}`);
+      return;
+    }
+    const key = 'group:' + gid;
+    clearSocialV2Timers(key); // 取消主动检查/潜水/回复检查等所有排程
+    retireSession(key);       // 撤销映射与令牌，归档 DSH 会话
+    log(`[group-health] 群 ${gid} 已自动停用（${reason}）：移出白名单并取消排程；如需恢复请在面板重新加入白名单`);
+    const okey = 'private:' + String(cfg.ownerQQ ?? '');
+    if (currentMode === 'reserved2' && cfg.ownerQQ && isSessionAllowedInCurrentMode(okey)) {
+      appendSocialV2Notice(okey, `[群健康] 机器人已被移出群 ${gid}（连续 2 次发送失败确认）。该群已自动停用：移出白名单、取消唤醒与学习排程。若之后会被重新拉群，请把群号加回控制台白名单即可恢复。`);
+      scheduleWakeV2(okey, 'groupHealth');
+    }
   }
 
   // ── 图片/表情字节解析（供一代自动内联与二代按需工具） ────────────────────
@@ -6278,6 +6426,9 @@ async function main() {
         retireSession(key);
       } else {
         await ensureChatModel(existing);
+        // P7-E：升级前建立的旧会话——补记当前时间为龄，从本刻起算轮换周期
+        if (!state.sessionAges) state.sessionAges = {};
+        if (!state.sessionAges[key]) { state.sessionAges[key] = Date.now(); saveState(); }
         if (epoch !== sessionEpoch || !isCurrentSession(key, existing)) throw new Error('会话创建期间已重置或权限已变化');
         return existing;
       }
@@ -6336,6 +6487,8 @@ async function main() {
       }
       state.sessions[key] = sessionId;
       state.sessionPolicies[key] = policy;
+      if (!state.sessionAges) state.sessionAges = {};
+      state.sessionAges[key] = Date.now(); // P7-E：会话记龄（轮换依据）
       reverse.set(sessionId, key);
       saveState();
       await ensureChatModel(sessionId);
@@ -8067,7 +8220,13 @@ async function main() {
     if (memorySweeping || cfg.memory?.enabled === false) return;
     memorySweeping = true;
     try {
-      const keys = Object.keys(state.sessions ?? {});
+      // P7-C：覆盖所有白名单活跃会话（含尚未建立 DSH 会话的群——消息窗口在 social-v2 里，摘要不依赖会话存在）
+      const keys = new Set(Object.keys(state.sessions ?? {}));
+      try {
+        for (const k of socialV2.conversations.keys()) {
+          if (isSessionAllowedInCurrentMode(k)) keys.add(k);
+        }
+      } catch {}
       for (const key of keys) {
         try { await summarizeConversation(key); } catch {}
       }
@@ -8152,6 +8311,53 @@ async function main() {
     } catch (error) { log('[autonomy] 待跟进扫描失败: ' + (error?.message ?? error)); }
   }, 10 * 60 * 1000);
   if (followupTimer.unref) followupTimer.unref();
+
+  // ── P7-C：夜间记忆维护（去重合并 / 低价值衰减 / 过期归档），默认凌晨 1 点，每天最多一次 ──
+  function runMemoryMaintenance() {
+    const db = getMemoryDb();
+    const now = Date.now();
+    let merged = 0, decayed = 0, archived = 0;
+    // 1) 同文合并：保留最新一条，重要度取最大值
+    const dups = db.prepare('SELECT content, COUNT(*) AS c, MAX(id) AS keep, MAX(importance) AS mi FROM facts GROUP BY content HAVING c > 1').all();
+    for (const d of dups) {
+      db.prepare('DELETE FROM facts WHERE content = ? AND id != ?').run(d.content, d.keep);
+      db.prepare('UPDATE facts SET importance = ?, updated_at = ? WHERE id = ?').run(d.mi, now, d.keep);
+      merged++;
+    }
+    // 2) 低价值衰减：importance<=1 且超过 decayDays → 删除
+    const decayDays = Math.max(14, Number(cfg.memory?.decayDays) || 60);
+    decayed = (db.prepare('DELETE FROM facts WHERE importance <= 1 AND created_at < ?').run(now - decayDays * 86400000)?.changes) || 0;
+    // 3) 跟进归档：fired 超 7 天 → done；done/cancelled 超 30 天 → 删除
+    db.prepare("UPDATE followups SET status = 'done' WHERE status = 'fired' AND due_at < ?").run(now - 7 * 86400000);
+    archived = (db.prepare("DELETE FROM followups WHERE status IN ('done','cancelled') AND created_at < ?").run(now - 30 * 86400000)?.changes) || 0;
+    // 4) 已触发提醒清理
+    db.prepare("DELETE FROM reminders WHERE status != 'pending' AND fire_at < ?").run(now - 30 * 86400000);
+    // 5) 有删除则整体重建 FTS（量小，重建最稳）
+    if (merged || decayed) {
+      try {
+        db.exec('DELETE FROM facts_fts');
+        const ins = db.prepare('INSERT INTO facts_fts (rowid, content, bigrams) VALUES (?, ?, ?)');
+        for (const f of db.prepare('SELECT id, content FROM facts').all()) ins.run(f.id, f.content, toBigrams(f.content));
+      } catch {}
+    }
+    return { merged, decayed, archived };
+  }
+  const maintainTimer = setInterval(() => {
+    try {
+      if (cfg.memory?.enabled === false || cfg.memory?.maintain === false) return;
+      const nowD = new Date();
+      const hour = Number.isFinite(Number(cfg.memory?.maintainHour)) ? Number(cfg.memory?.maintainHour) : 1;
+      if (nowD.getHours() !== hour) return;
+      const today = nowD.toISOString().slice(0, 10);
+      const autoM = readAutonomy();
+      if (autoM.lastMaintainDate === today) return;
+      autoM.lastMaintainDate = today;
+      writeAutonomy(autoM);
+      const r = runMemoryMaintenance();
+      log(`[memory] 夜间维护：合并重复 ${r.merged} 组，清理低价值 ${r.decayed} 条，归档跟进 ${r.archived} 条`);
+    } catch (error) { log('[memory] 夜间维护失败: ' + (error?.message ?? error)); }
+  }, 10 * 60 * 1000);
+  if (maintainTimer.unref) maintainTimer.unref();
 
   function recordSentMessagesV2(key, messages) {
     const st = getSocialV2State(key);
@@ -8362,7 +8568,7 @@ async function main() {
     const wakeLine = `【当前唤醒】${wcMode}，${wcTime}${wcTriggers.length ? `；触发：${wcTriggers.join('/')}` : ''}\n\n`;
     const base = roleLine + tokenLine + antiAiLine + proactiveLine + stickerLine + preSleepLine + statusLine + wakeLine + memoryLine + participationLine;
     if (reason === 'reflect') {
-      return `${base}【每日复盘】现在是今天的自我整理时间，不需要给任何人发消息（除非你确实想对主人说一句）。\n请按顺序做三件事：\n1) 回顾今天：用 qq_db_recall 看看近期记忆，用 qq_affinity(action=list) 看关系变化；\n2) 沉淀：值得长期记住的写进 qq_db_remember；对某人的观感变了就 qq_affinity(action=bump/set) 更新；对自己的新发现写 qq_self_note；\n3) 计划明天：想主动聊的话题/想问的事，可以用 qq_set_reminder 设个提醒，或写进 qq_memory_append(pendingThought)。\n做完用 qq_mark_read 或 qq_set_wake_config 正常收尾即可。`;
+      return `${base}【每日复盘】现在是今天的自我整理时间，不需要给任何人发消息（除非你确实想对主人说一句）。\n请按顺序做三件事：\n1) 回顾今天：用 qq_db_recall 看看近期记忆，用 qq_affinity(action=list) 看关系变化；\n2) 沉淀：值得长期记住的写进 qq_db_remember；对某人的观感变了就 qq_affinity(action=bump/set) 更新；对自己的新发现写 qq_self_note；\n3) 给明天留话头：想主动聊的话题/想问的事，用 qq_memory_append(category=pendingThought, extra.expiresAtMs=从现在到明早合适时间的毫秒数，一般 10~16 小时后过期) 记 1~2 条，明早被叫醒时你会自然带着这个话题开口；也可以 qq_set_reminder 设具体提醒。\n注意：已被移出或停用的群不要规划话题。做完用 qq_mark_read 或 qq_set_wake_config 正常收尾即可。`;
     }
     if (reason === 'care') {
       return `${base}【主动关心】提示里提到的朋友已经有一阵子没出现了。\n可以主动发一句自然的问候或分享（别一本正经地“你最近怎么不来了”），参考你们之前的相处方式和好感度；如果觉得现在开口不合适，也可以只更新一下记忆、安静收尾。`;
@@ -8380,7 +8586,11 @@ async function main() {
       return `${base}【回复检查】${key}\n原因：你刚刚发送过消息，现在回来检查是否有人回复。\n你可以调用工具查看未读消息、用 qq_wait_for_messages(quietMs=5000~10000) 判断对方是否说完；如果没人回你，不用硬补一句，但也不要立刻潜水——先调用 qq_wait_for_messages(timeoutMs=${preSleepMs}) 完成沉睡前观察：没人说话可收尾；有人说话则查看 newMessages，不需要你参与也可直接收尾（qq_mark_read 或 qq_set_wake_config）。`;
     }
     if (reason === 'proactiveCheck') {
-      return `${base}【主动机会】${key}\n原因：群里已经安静了一段时间，这是一次你可以主动冒泡的机会。\n优先主动开个话题、追问上次没聊完的事、分享一个刚想到的想法；如果一时想不到，可以用 mcp__web-search-safe__web_search 搜一下当前热点/时事/网络热梗，再结合记忆里的群友兴趣挑一个自然角度。只要内容自然，就大胆开口；如果实在没话想说，再安静收尾（qq_mark_read 或 qq_set_wake_config）。`;
+      const hh = new Date().getHours();
+      const nightNote = (hh >= 23 || hh < 7)
+        ? '现在是深夜：真人这个点要么睡了要么静音刷手机，没话找话最扣分。没有非说不可的事就别冒泡，直接把下一次唤醒用 qq_set_wake_config 设到明早 8~11 点的有限潜水，安静睡下。\n'
+        : '';
+      return `${base}【主动机会】${key}\n原因：群里已经安静了一段时间，这是一次你可以主动冒泡的机会。\n${nightNote}优先主动开个话题、追问上次没聊完的事、分享一个刚想到的想法；如果一时想不到，可以用 mcp__web-search-safe__web_search 搜一下当前热点/时事/网络热梗，再结合记忆里的群友兴趣挑一个自然角度。只要内容自然，就大胆开口；如果实在没话想说，再安静收尾（qq_mark_read 或 qq_set_wake_config）。`;
     }
     if (reason === 'poke') {
       return `${base}【唤醒】${key}\n原因：有人拍了一拍（可能拍了你，也可能拍了别人）。\n先看未读/最近消息里的 [拍一拍] 事件：如果是拍你，可以自然回应一句，也可以用 qq_send_poke 回一个拍一拍；如果是拍别人，觉得有趣也可以接梗。除了回应，偶尔也可以主动戳一下正在聊的人/熟人，像真人手贱/提醒/逗一下，但别频繁。不想接就安静收尾（qq_mark_read 或 qq_set_wake_config）。`;
@@ -8435,6 +8645,18 @@ async function main() {
       return;
     }
     cancelReplyCheckV2(key); // 本次唤醒已接管，清理仍在排队的回复检查
+    // P7-E：定期轮换 DSH 会话——上下文随年龄膨胀时，用新会话重建（记忆/好感度/表达库在桥接侧，不受影响）
+    {
+      const rot = cfg.socialV2?.sessionRotation ?? {};
+      const rotAge = Number(state.sessionAges?.[key]) || 0;
+      if (rot.enabled !== false && state.sessions[key] && rotAge > 0) {
+        const maxAgeDays = Math.max(1, Number(rot.maxAgeDays) || 10);
+        if (now - rotAge > maxAgeDays * 86400000) {
+          log(`[rotation] 会话 ${key} 已使用 ${Math.round((now - rotAge) / 86400000)} 天 > ${maxAgeDays} 天，轮换重建（长期记忆不受影响）`);
+          retireSession(key);
+        }
+      }
+    }
     const wakeTime = now;
     st.wakeTimes.push(wakeTime);
     if (st.wakeTimes.length > 200) st.wakeTimes = st.wakeTimes.slice(-200);
@@ -8639,6 +8861,38 @@ async function main() {
     st.proactiveTimer = null;
   }
 
+  // P7-D 社交节律：按小时的精力曲线（0~1 倍率）替代“深夜一刀切”。可用 socialV2.proactive.energyCurve 覆盖（24 个数字）。
+  const ENERGY_CURVE_DEFAULT = [0.05, 0.05, 0.05, 0.05, 0.05, 0.1, 0.25, 0.4, 0.6, 0.7, 0.8, 0.7, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.0, 1.0, 1.0, 1.0, 0.8, 0.4];
+  function proactiveEnergy(hour) {
+    const custom = cfg.socialV2?.proactive?.energyCurve;
+    let curve = null;
+    if (Array.isArray(custom) && custom.length === 24) curve = custom.map(Number);
+    else if (typeof custom === 'string') {
+      const parts = custom.split(/[,，\s]+/).map(Number);
+      if (parts.length === 24 && parts.every((n) => Number.isFinite(n))) curve = parts;
+    }
+    const c = curve ?? ENERGY_CURVE_DEFAULT;
+    const v = Number(c[hour]) || 0;
+    return Math.max(0, Math.min(1, v));
+  }
+  // P7-D 好感度加权：最近聊过的人里好感越高，越想主动找话（上限 +0.4）
+  function affinityBoostFor(key) {
+    try {
+      const st = socialV2.conversations.get(key);
+      const recent = Array.isArray(st?.recentMessages) ? st.recentMessages.slice(-40) : [];
+      const ids = Array.from(new Set(recent.filter((m) => m && !m.isSelf && m.userId).map((m) => String(m.userId))));
+      if (!ids.length) return 1;
+      const db = getMemoryDb();
+      let sum = 0, n = 0;
+      for (const id of ids.slice(0, 8)) {
+        const r = db.prepare('SELECT score FROM affinity WHERE member_id = ?').get(id);
+        if (r && Number(r.score) > 0) { sum += Number(r.score); n++; }
+      }
+      if (!n) return 1;
+      return 1 + Math.min(0.4, (sum / n) / 250);
+    } catch { return 1; }
+  }
+
   function scheduleProactiveCheckV2(key) {
     if (cfg.socialV2?.proactive?.enabled === false) return;
     if (socialV2.paused || currentMode !== 'reserved2') return;
@@ -8659,8 +8913,11 @@ async function main() {
       const pendingThoughts = Array.isArray(st.pendingThoughts) ? st.pendingThoughts.filter((t) => t && (!t.expiresAt || Date.now() < Number(t.expiresAt))).length : 0;
       if (pendingThoughts > 0) prob = Math.min(1, prob * 1.4);
       if (st.lastAiReplyAt && Date.now() - Number(st.lastAiReplyAt) < 30 * 60 * 1000) prob *= 0.5;
+      // P7-D：精力曲线（按时段平滑调节，深夜自然趋零）、晨起话头加成、好感度加权
       const hour = new Date().getHours();
-      if (hour >= 23 || hour < 8) prob *= 0.3;
+      prob *= proactiveEnergy(hour);
+      if (hour >= 8 && hour < 12 && pendingThoughts > 0) prob = Math.min(1, prob * 1.5);
+      prob = Math.min(1, prob * affinityBoostFor(key));
       const recent = Array.isArray(st.recentMessages) ? st.recentMessages : [];
       const aiCount = recent.filter((m) => m && m.isSelf && Date.now() - Number(m.time || 0) < 60 * 60 * 1000).length;
       if (aiCount >= 5) prob *= 0.3;

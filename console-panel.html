@@ -147,6 +147,9 @@
     <div class="row"><span class="lbl">群聊白名单<span class="hint">她只在这些群里说话</span></span>
       <input type="text" id="allowGroups" style="flex:1;max-width:420px">
     </div>
+    <div class="row" id="disabledGroupsRow" style="display:none"><span class="lbl">已自动停用的群<span class="hint">被移出/发送失败自动停用，重新拉群后点恢复</span></span>
+      <span id="disabledGroups" style="flex:1"></span>
+    </div>
     <div class="row"><span class="lbl">PC 控制开关<span class="hint">截屏/音量/媒体/命令（仅主人私聊可用）</span></span>
       <label class="switch"><input type="checkbox" id="pcEnabled"><span></span></label>
     </div>
@@ -256,6 +259,51 @@ function confirmStopSnow() {
   act('stop-snowluma');
 }
 
+// ── P7-A：被自动停用的群（如被移出）：展示 + 一键恢复 ──
+async function restoreGroup(gid) {
+  await act('restore-group', { key: gid });
+}
+// ── P7-B：黑话单条/批量操作 ──
+async function slangAct(kind, id) {
+  try {
+    if (kind === 'confirm') await api('/api/slang/' + id + '/confirm', { method: 'POST', body: JSON.stringify({}) });
+    else if (kind === 'reject') await api('/api/slang/' + id + '/reject', { method: 'POST', body: JSON.stringify({}) });
+    else await api('/api/slang/' + id, { method: 'PATCH', body: JSON.stringify({ status: 'candidate' }) });
+    toast(kind === 'confirm' ? '已确认' : kind === 'reject' ? '已拒绝' : '已退回候选');
+    showTab('slang');
+  } catch (e) { toast('失败：' + e.message, true); }
+}
+async function slangBatchConfirm() {
+  try {
+    const r = await api('/api/slang?status=candidate');
+    const ids = (r.entries ?? []).filter((e) => String(e.meaning || '').trim()).map((e) => e.id);
+    if (!ids.length) { toast('没有“含义已研究出”的候选可批量确认'); return; }
+    if (!confirm(`将确认 ${ids.length} 条候选（含义非空，含来源佐证更佳）。确认后会注入她的视野。`)) return;
+    const b = await api('/api/slang/batch-confirm', { method: 'POST', body: JSON.stringify({ ids }) });
+    toast(`已确认 ${b.confirmedCount} 条，跳过 ${b.skippedCount ?? 0} 条`);
+    showTab('slang');
+  } catch (e) { toast('失败：' + e.message, true); }
+}
+async function slangBatchRejectAll() {
+  try {
+    const r = await api('/api/slang?status=candidate');
+    const ids = (r.entries ?? []).map((e) => e.id);
+    if (!ids.length) { toast('没有候选可拒绝'); return; }
+    if (!confirm(`将拒绝全部 ${ids.length} 条候选（保留记录可改回，不是删除）。`)) return;
+    const b = await api('/api/slang/batch-reject', { method: 'POST', body: JSON.stringify({ ids }) });
+    toast(`已拒绝 ${b.rejectedCount} 条`);
+    showTab('slang');
+  } catch (e) { toast('失败：' + e.message, true); }
+}
+async function slangUndoAuto() {
+  try {
+    if (!confirm('撤销全部「自动转正」词条（回到候选，等待人工处理）？人工确认过的不受影响。')) return;
+    const b = await api('/api/slang/undo-auto', { method: 'POST', body: JSON.stringify({}) });
+    toast(`已撤销 ${b.undoneCount} 条自动转正`);
+    showTab('slang');
+  } catch (e) { toast('失败：' + e.message, true); }
+}
+
 const TOGGLES_A = [
   ['socialV2.enabled', '二代仿真总开关', '关掉她就不说话（工具全拒）'],
   ['pcControl.enabled', 'PC 控制工具', '截屏/音量/媒体/开应用/跑命令'],
@@ -328,6 +376,17 @@ async function refresh(allowRetry = true) {
     $('subTitle').textContent = (o.qq?.userId ? 'QQ ' + o.qq.userId + ' ' + (o.qq.nickname || '') + ' · ' : '') + 'SnowLuma → qq-bridge → DSH';
     $('allowPrivate').value = (o.allowPrivate || []).join(', ');
     $('allowGroups').value = (o.allowGroups || []).join(', ');
+    // P7-A：已自动停用的群 + 一键恢复
+    {
+      const dg = o.groupsDisabled || [];
+      const gh = o.groupHealth || {};
+      $('disabledGroupsRow').style.display = dg.length ? '' : 'none';
+      if (dg.length) $('disabledGroups').innerHTML = dg.map((g) => {
+        const s = gh[String(g)];
+        const why = s && s.reason ? `<span class="hint">${s.reason} · ${new Date(s.lastAt).toLocaleString('zh-CN')}</span>` : '';
+        return `<span style="margin-right:14px">🚫 ${g} ${why} <button class="sm" onclick="restoreGroup('${g}')">恢复</button></span>`;
+      }).join('');
+    }
     $('pcEnabled').checked = o.toggles.pcControl?.enabled !== false;
     $('mProvider').value = o.model.provider; $('mModel').value = o.model.model;
     $('mEffort').value = o.model.reasoningEffort || 'default';

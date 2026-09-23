@@ -49,6 +49,8 @@ export function normalizeSlangEntry(raw) {
     status,
     source: entry.source === 'manual' ? 'manual' : 'ai',
     count: Math.max(0, Number(entry.count) || 0),
+    // P7-B：标记该词条是否由“研究+证据”自动转正（面板可一键撤销回到候选）
+    auto: entry.auto === true,
     evidence: Array.isArray(entry.evidence) ? entry.evidence.slice(-20) : [],
     lastInferenceCount: Math.max(0, Number(entry.lastInferenceCount) || 0),
     createdAt: String(entry.createdAt || nowIso()),
