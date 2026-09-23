@@ -1,0 +1,229 @@
+  // ── P6：记忆引擎（自动摘要 → 长期记忆/人物画像/待跟进）+ 自主性调度（复盘/关心） ──
+  let memorySessionId = null;
+  const MEMORY_SESSION_FILE = path.join(STATE_DIR, 'memory-agent.json');
+  const autonomyFile = path.join(STATE_DIR, 'autonomy.json');
+  const readAutonomy = () => readJsonSafe(autonomyFile, {}, true) ?? {};
+  const writeAutonomy = (obj) => { try { fs.writeFileSync(autonomyFile, JSON.stringify(obj, null, 2)); } catch {} };
+
+  // facts 与 FTS 索引同步（中文用二元切分，见 memory-engine.js）
+  function insertFactRow(db, { content, category, sourceKey, importance }) {
+    const now = Date.now();
+    const dup = db.prepare('SELECT id FROM facts WHERE content = ?').get(content);
+    if (dup) {
+      db.prepare('UPDATE facts SET importance = MAX(importance, ?), updated_at = ? WHERE id = ?').run(importance, now, dup.id);
+      return { id: dup.id, deduped: true };
+    }
+    const r = db.prepare('INSERT INTO facts (content, category, source_key, importance, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)')
+      .run(content, category, sourceKey, importance, now, now);
+    const id = Number(r.lastInsertRowid);
+    try { db.prepare('INSERT INTO facts_fts (rowid, content, bigrams) VALUES (?, ?, ?)').run(id, content, toBigrams(content)); } catch {}
+    return { id, deduped: false };
+  }
+
+  async function ensureMemorySession() {
+    const preset = resolvePresetName(cfg.agentPreset, { strict: true });
+    if (!preset) throw new Error('记忆整理缺少已验证的安全 preset，拒绝创建会话');
+    const saved = readJsonSafe(MEMORY_SESSION_FILE, null, true);
+    if (saved?.preset !== preset) {
+      memorySessionId = null;
+      try { fs.rmSync(MEMORY_SESSION_FILE, { force: true }); } catch {}
+    }
+    if (memorySessionId) {
+      learnerSessions.add(memorySessionId);
+      api.events.follow(memorySessionId);
+      return memorySessionId;
+    }
+    if (saved?.sessionId && saved.preset === preset) {
+      memorySessionId = String(saved.sessionId);
+      learnerSessions.add(memorySessionId);
+      api.events.follow(memorySessionId);
+      await ensureChatModel(memorySessionId);
+      return memorySessionId;
+    }
+    const dir = path.join(STATE_DIR, 'memory-agent');
+    fs.mkdirSync(dir, { recursive: true });
+    const wsValue = unwrap(await api.workspace.create({ path: dir }), 'memory workspace.create');
+    try { await api.workspace.rename({ workspaceId: wsValue.workspace.workspaceId, title: 'QQ 记忆整理' }); } catch {}
+    const value = unwrap(await api.sessions.create({ workspaceId: wsValue.workspace.workspaceId, agentPreset: preset }), 'memory session.create');
+    memorySessionId = String(value.sessionId);
+    learnerSessions.add(memorySessionId);
+    api.events.follow(memorySessionId);
+    await ensureChatModel(memorySessionId);
+    try { fs.writeFileSync(MEMORY_SESSION_FILE, JSON.stringify({ sessionId: memorySessionId, preset }, null, 2)); } catch {}
+    log('记忆整理会话已创建: ' + memorySessionId);
+    return memorySessionId;
+  }
+
+  function peopleSnapshot(db, key) {
+    try {
+      return db.prepare('SELECT member_id AS memberId, name, score, notes AS note, profile FROM affinity ORDER BY ABS(score) DESC LIMIT 8').all();
+    } catch { return []; }
+  }
+
+  // 单会话摘要：把「上次摘要之后的新消息」压缩成 facts / 人物画像 / 待跟进
+  async function summarizeConversation(key) {
+    if (cfg.memory?.enabled === false) return false;
+    if (!dshReady || socialV2.paused) return false;
+    const st = getSocialV2State(key);
+    if (!st) return false;
+    const all = Array.isArray(st.recentMessages) ? st.recentMessages : [];
+    const watermark = Number(st.lastSummarizedSeq) || 0;
+    const fresh = all.filter((m) => (Number(m.seq) || 0) > watermark);
+    const min = Math.max(5, Number(cfg.memory?.minNewMessages) || 15);
+    if (fresh.length < min) return false;
+    const db = getMemoryDb();
+    const convLabel = key.startsWith('group:') ? ('群 ' + key.split(':')[1]) : ('私聊 ' + key.split(':')[1]);
+    const promptText = buildSummaryPrompt({ convLabel, messages: fresh.slice(-80), people: peopleSnapshot(db, key) });
+    let sessionId;
+    try { sessionId = await ensureMemorySession(); } catch (error) { log('记忆会话创建失败: ' + (error?.message ?? error)); return false; }
+    try {
+      const accepted = await api.sessions.prompt({ sessionId, mode: 'queue', content: [{ type: 'text', text: promptText }] });
+      if (accepted?.result && accepted.result.ok === false) { log('记忆摘要被拒: ' + JSON.stringify(accepted.result.error ?? {})); return false; }
+      const output = await waitLearnerTurn(sessionId, Number(cfg.memory?.timeoutMs) || 180000);
+      const parsed = parseSummaryJson(output);
+      let factsAdded = 0;
+      for (const f of parsed.facts) {
+        const r = insertFactRow(db, { content: f.content, category: f.category || 'event', sourceKey: key, importance: f.importance });
+        if (!r.deduped) factsAdded++;
+      }
+      let peopleUpdated = 0;
+      for (const p of parsed.people) {
+        let row = null;
+        if (p.memberId) row = db.prepare('SELECT member_id AS memberId, name, score, notes, profile FROM affinity WHERE member_id = ?').get(p.memberId);
+        if (!row && p.name) row = db.prepare('SELECT member_id AS memberId, name, score, notes, profile FROM affinity WHERE name = ?').get(p.name);
+        const now = Date.now();
+        if (!row) {
+          if (!p.memberId) continue;
+          const prof = JSON.stringify({ callName: p.callName, likes: p.likes, dislikes: p.dislikes, style: p.style, status: p.status });
+          db.prepare('INSERT INTO affinity (member_id, name, score, notes, profile, updated_at) VALUES (?, ?, ?, ?, ?, ?)')
+            .run(p.memberId, p.name || '', Math.max(-100, Math.min(100, p.scoreDelta || 0)), p.note || '', prof, now);
+          peopleUpdated++;
+          continue;
+        }
+        let oldProf = {};
+        try { oldProf = JSON.parse(row.profile || '{}') || {}; } catch { oldProf = {}; }
+        const merged = {
+          callName: p.callName || oldProf.callName || '',
+          likes: p.likes || oldProf.likes || '',
+          dislikes: p.dislikes || oldProf.dislikes || '',
+          style: p.style || oldProf.style || '',
+          status: p.status || oldProf.status || ''
+        };
+        const score = Math.max(-100, Math.min(100, Number(row.score || 0) + (Number(p.scoreDelta) || 0)));
+        db.prepare('UPDATE affinity SET name = COALESCE(NULLIF(?, ""), name), score = ?, notes = COALESCE(NULLIF(?, ""), notes), profile = ?, updated_at = ? WHERE member_id = ?')
+          .run(p.name || '', score, p.note || '', JSON.stringify(merged), now, row.memberId);
+        peopleUpdated++;
+      }
+      let followupsAdded = 0;
+      for (const f of parsed.followups) {
+        const dup = db.prepare("SELECT id FROM followups WHERE conv_key = ? AND topic = ? AND status = 'pending'").get(key, f.topic);
+        if (dup) continue;
+        db.prepare('INSERT INTO followups (conv_key, member_id, name, topic, due_at, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)')
+          .run(key, '', f.name || '', f.topic, Date.now() + f.dueInHours * 3600 * 1000, 'pending', Date.now());
+        followupsAdded++;
+      }
+      st.lastSummarizedSeq = Number(all[all.length - 1]?.seq) || watermark;
+      saveSocialV2State();
+      log(`[memory] 摘要 ${key}：新消息 ${fresh.length} 条 → 事实 +${factsAdded}，人物 ${peopleUpdated}，待跟进 +${followupsAdded}`);
+      return true;
+    } catch (error) {
+      if (/会话|session|not found|404/i.test(String(error?.message ?? error))) {
+        memorySessionId = null;
+        try { fs.rmSync(MEMORY_SESSION_FILE, { force: true }); } catch {}
+      }
+      log(`[memory] 摘要失败 ${key}: ${error?.message ?? error}`);
+      return false;
+    }
+  }
+
+  let memorySweeping = false;
+  async function memorySweep() {
+    if (memorySweeping || cfg.memory?.enabled === false) return;
+    memorySweeping = true;
+    try {
+      const keys = Object.keys(state.sessions ?? {});
+      for (const key of keys) {
+        try { await summarizeConversation(key); } catch {}
+      }
+    } finally { memorySweeping = false; }
+  }
+  const memoryTimer = setInterval(memorySweep, Math.max(5 * 60 * 1000, Number(cfg.memory?.intervalMs) || 20 * 60 * 1000));
+  if (memoryTimer.unref) memoryTimer.unref();
+
+  // ── 自主性：每日复盘 ──
+  const reflectTimer = setInterval(async () => {
+    try {
+      if (cfg.autonomy?.enabled === false || !dshReady || socialV2.paused) return;
+      const hour = Number(cfg.autonomy?.reflectHour);
+      const targetHour = Number.isFinite(hour) ? hour : 23;
+      const now = new Date();
+      if (now.getHours() !== targetHour) return;
+      const today = now.toISOString().slice(0, 10);
+      const auto = readAutonomy();
+      if (auto.lastReflectDate === today) return;
+      const key = 'private:' + String(cfg.ownerQQ ?? '');
+      if (!isSessionAllowedInCurrentMode(key)) return;
+      auto.lastReflectDate = today;
+      writeAutonomy(auto);
+      appendSocialV2Notice(key, '[每日复盘] 今天到这儿了，花一分钟整理一下自己吧。');
+      scheduleWakeV2(key, 'reflect');
+      log('[autonomy] 已安排每日复盘唤醒');
+    } catch (error) { log('[autonomy] 复盘调度失败: ' + (error?.message ?? error)); }
+  }, 10 * 60 * 1000);
+  if (reflectTimer.unref) reflectTimer.unref();
+
+  // ── 自主性：高好感度久未联系 → 主动关心 ──
+  const careTimer = setInterval(async () => {
+    try {
+      if (cfg.autonomy?.enabled === false || !dshReady || socialV2.paused) return;
+      const minScore = Number(cfg.autonomy?.careScore) || 60;
+      const afterDays = Number(cfg.autonomy?.careAfterDays) || 3;
+      const cooldownDays = Number(cfg.autonomy?.careCooldownDays) || 3;
+      const db = getMemoryDb();
+      const auto = readAutonomy();
+      const cared = auto.careAt ?? {};
+      const now = Date.now();
+      const people = db.prepare('SELECT member_id AS memberId, name, score FROM affinity WHERE score >= ? ORDER BY score DESC LIMIT 10').all(minScore);
+      for (const p of people) {
+        const key = String(p.memberId) === String(cfg.ownerQQ ?? '') ? ('private:' + p.memberId) : null;
+        const targets = key ? [key] : Object.keys(state.sessions ?? {}).filter((k) => k.startsWith('group:'));
+        for (const tk of targets) {
+          const st = getSocialV2State(tk);
+          if (!st || !isSessionAllowedInCurrentMode(tk)) continue;
+          const lastFrom = [...(st.recentMessages ?? [])].reverse().find((m) => String(m.userId ?? '') === String(p.memberId));
+          if (!lastFrom) continue;
+          const idleDays = (now - (Number(lastFrom.time) || now)) / 86400000;
+          if (idleDays < afterDays) continue;
+          const ck = tk + '|' + p.memberId;
+          if (cared[ck] && now - cared[ck] < cooldownDays * 86400000) continue;
+          cared[ck] = now;
+          auto.careAt = cared;
+          writeAutonomy(auto);
+          appendSocialV2Notice(tk, `[主动关心] ${p.name} 已经 ${Math.round(idleDays)} 天没出现了（好感度 ${p.score}）。`);
+          scheduleWakeV2(tk, 'care');
+          log(`[autonomy] 主动关心唤醒：${tk} ← ${p.name}（${Math.round(idleDays)} 天未出现）`);
+          break;
+        }
+      }
+    } catch (error) { log('[autonomy] 关心调度失败: ' + (error?.message ?? error)); }
+  }, 30 * 60 * 1000);
+  if (careTimer.unref) careTimer.unref();
+
+  // ── 自主性：待跟进事项到期 ──
+  const followupTimer = setInterval(() => {
+    try {
+      if (cfg.autonomy?.enabled === false) return;
+      const db = getMemoryDb();
+      const now = Date.now();
+      const rows = db.prepare("SELECT id, conv_key, name, topic FROM followups WHERE status = 'pending' AND (due_at IS NULL OR due_at <= ?) ORDER BY due_at ASC LIMIT 10").all(now);
+      for (const r of rows) {
+        db.prepare("UPDATE followups SET status = 'fired' WHERE id = ?").run(r.id);
+        if (!isSessionAllowedInCurrentMode(r.conv_key)) continue;
+        appendSocialV2Notice(r.conv_key, `[待跟进] ${r.name ? r.name + '：' : ''}${r.topic}`);
+        if (currentMode === 'reserved2' && !socialV2.paused) scheduleWakeV2(r.conv_key, 'followup');
+        log(`[autonomy] 待跟进触发 #${r.id} → ${r.conv_key}：${r.topic.slice(0, 40)}`);
+      }
+    } catch (error) { log('[autonomy] 待跟进扫描失败: ' + (error?.message ?? error)); }
+  }, 10 * 60 * 1000);
+  if (followupTimer.unref) followupTimer.unref();
+

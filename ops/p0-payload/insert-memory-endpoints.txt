@@ -1,0 +1,109 @@
+        // ── 人物画像端点（P6：结构化画像，比一句话印象更懂人） ─────────────
+        if (req.method === 'POST' && url.pathname === '/api/socialV2/person-profile') {
+          const body = await readBody();
+          const token = String(body.token ?? '').trim();
+          const key = String(body.key ?? '').trim();
+          if (currentMode !== 'reserved2') { sendJson({ ok: false, error: '该接口仅 reserved2 模式可用' }, 403); return; }
+          if (!key || !agentTokenOk(key, token)) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
+          const db = getMemoryDb();
+          const action = String(body.action ?? 'get').trim();
+          const memberId = String(body.memberId ?? '').trim();
+          if (!/^\d{5,12}$/.test(memberId)) { sendJson({ ok: false, error: 'memberId 必须是 5-12 位 QQ 号' }, 400); return; }
+          if (action === 'get') {
+            const row = db.prepare('SELECT member_id AS memberId, name, score, notes, profile FROM affinity WHERE member_id = ?').get(memberId);
+            let prof = {};
+            try { prof = JSON.parse(row?.profile || '{}') || {}; } catch {}
+            sendJson({ ok: true, memberId, name: row?.name ?? '', score: row?.score ?? 0, notes: row?.notes ?? '', profile: prof });
+            return;
+          }
+          if (action === 'set') {
+            const row = db.prepare('SELECT name, score, notes, profile FROM affinity WHERE member_id = ?').get(memberId);
+            let prof = {};
+            try { prof = JSON.parse(row?.profile || '{}') || {}; } catch {}
+            for (const f of ['callName', 'likes', 'dislikes', 'style', 'status']) {
+              if (body[f] !== undefined) prof[f] = String(body[f] ?? '').trim().slice(0, 80);
+            }
+            const now = Date.now();
+            if (!row) {
+              db.prepare('INSERT INTO affinity (member_id, name, score, notes, profile, updated_at) VALUES (?, ?, ?, ?, ?, ?)')
+                .run(memberId, String(body.name ?? '').slice(0, 30), 0, String(body.note ?? '').slice(0, 120), JSON.stringify(prof), now);
+            } else {
+              db.prepare('UPDATE affinity SET profile = ?, notes = COALESCE(NULLIF(?, ""), notes), name = COALESCE(NULLIF(?, ""), name), updated_at = ? WHERE member_id = ?')
+                .run(JSON.stringify(prof), String(body.note ?? '').trim(), String(body.name ?? '').trim(), now, memberId);
+            }
+            log(`[memory] 人物画像更新 ${memberId}: ${Object.entries(prof).filter(([, v]) => v).map(([k, v]) => k + '=' + v).join(' ')}`);
+            sendJson({ ok: true, memberId, profile: prof });
+            return;
+          }
+          sendJson({ ok: false, error: 'action 仅支持 get/set' }, 400);
+          return;
+        }
+
+        // ── 待跟进事项端点（P6：从对话里自动提取 + 手动增删） ─────────────
+        if (req.method === 'POST' && url.pathname === '/api/socialV2/followup') {
+          const body = await readBody();
+          const token = String(body.token ?? '').trim();
+          const key = String(body.key ?? '').trim();
+          if (currentMode !== 'reserved2') { sendJson({ ok: false, error: '该接口仅 reserved2 模式可用' }, 403); return; }
+          if (!key || !agentTokenOk(key, token)) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
+          const db = getMemoryDb();
+          const action = String(body.action ?? 'list').trim();
+          if (action === 'list') {
+            const status = String(body.status ?? 'pending').trim();
+            const rows = status === 'all'
+              ? db.prepare('SELECT id, conv_key AS convKey, name, topic, due_at AS dueAt, status FROM followups ORDER BY id DESC LIMIT 50').all()
+              : db.prepare('SELECT id, conv_key AS convKey, name, topic, due_at AS dueAt, status FROM followups WHERE status = ? ORDER BY due_at ASC LIMIT 50').all(status);
+            sendJson({ ok: true, count: rows.length, followups: rows });
+            return;
+          }
+          if (action === 'add') {
+            const topic = String(body.topic ?? '').trim().slice(0, 200);
+            if (topic.length < 3) { sendJson({ ok: false, error: 'topic 太短' }, 400); return; }
+            const hours = Math.max(0.05, Math.min(168, Number(body.dueInHours) || 6));
+            const r = db.prepare('INSERT INTO followups (conv_key, member_id, name, topic, due_at, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)')
+              .run(key, String(body.memberId ?? ''), String(body.name ?? '').slice(0, 30), topic, Date.now() + hours * 3600 * 1000, 'pending', Date.now());
+            sendJson({ ok: true, id: Number(r.lastInsertRowid), dueInHours: hours });
+            return;
+          }
+          if (action === 'done' || action === 'cancel') {
+            const id = Number(body.id);
+            if (!Number.isFinite(id) || id <= 0) { sendJson({ ok: false, error: '需要正整数 id' }, 400); return; }
+            db.prepare('UPDATE followups SET status = ? WHERE id = ?').run(action === 'done' ? 'done' : 'cancelled', id);
+            sendJson({ ok: true, id, status: action === 'done' ? 'done' : 'cancelled' });
+            return;
+          }
+          sendJson({ ok: false, error: 'action 仅支持 list/add/done/cancel' }, 400);
+          return;
+        }
+
+        // ── 记忆索引重建（P6：facts → FTS5 中文二元索引） ────────────────
+        if (req.method === 'POST' && url.pathname === '/api/socialV2/memory/rebuild-index') {
+          try {
+            const db = getMemoryDb();
+            db.exec('DELETE FROM facts_fts');
+            const rows = db.prepare('SELECT id, content FROM facts').all();
+            const ins = db.prepare('INSERT INTO facts_fts (rowid, content, bigrams) VALUES (?, ?, ?)');
+            for (const r of rows) ins.run(r.id, r.content, toBigrams(r.content));
+            sendJson({ ok: true, indexed: rows.length });
+          } catch (error) {
+            sendJson({ ok: false, error: String(error?.message ?? error) }, 500);
+          }
+          return;
+        }
+
+        // ── 立即触发一次记忆摘要（管理端/调试用） ────────────────────────
+        if (req.method === 'POST' && url.pathname === '/api/socialV2/memory/summarize-now') {
+          const body = await readBody();
+          const key = String(body.key ?? '').trim();
+          if (!key) { sendJson({ ok: false, error: '需要 key' }, 400); return; }
+          try {
+            const st = getSocialV2State(key);
+            if (st) st.lastSummarizedSeq = 0; // 强制重算
+            const ok = await summarizeConversation(key);
+            sendJson({ ok: true, summarized: ok });
+          } catch (error) {
+            sendJson({ ok: false, error: String(error?.message ?? error) }, 500);
+          }
+          return;
+        }
+
