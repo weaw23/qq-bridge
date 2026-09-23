@@ -1627,4 +1627,64 @@ if (cfg.socialV2?.tools?.affinity !== false) {
   );
 }
 
+
+if (cfg.socialV2?.tools?.personProfile !== false) {
+  server.tool(
+    'qq_person_profile',
+    '维护你对某个人的结构化画像（比一句话印象更细）：以后怎么称呼他、喜欢什么、有什么雷区、说话风格、最近状态。聊天里了解到这些就顺手记下来——唤醒时画像会自动出现在你视野里，你就真的"越聊越懂他"。action：get（查某人）/ set（写画像，只传要更新的字段，其余保留）。',
+    {
+      key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
+      token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
+      action: z.string().describe('get | set'),
+      memberId: z.union([z.number(), z.string()]).describe('对方的 QQ 号（必填）'),
+      name: z.string().optional().describe('对方当前称呼/群名片（可选）'),
+      callName: z.string().optional().describe('你以后怎么称呼他（如"柚子主人""枭鸟哥哥"）'),
+      likes: z.string().optional().describe('喜欢什么（话题/食物/游戏/被怎么对待）'),
+      dislikes: z.string().optional().describe('雷区：不喜欢什么、讨厌被怎么对待'),
+      style: z.string().optional().describe('说话风格（话少直接/爱发梗/爱吐槽…）'),
+      status: z.string().optional().describe('最近状态（在忙什么、心情如何）'),
+      note: z.string().optional().describe('一句话总印象（会覆盖旧备注）')
+    },
+    async ({ key, token, action, memberId, name, callName, likes, dislikes, style, status, note }) => {
+      try {
+        const body = { key, token, action, memberId: String(memberId) };
+        for (const [k, v] of Object.entries({ name, callName, likes, dislikes, style, status, note })) if (v != null) body[k] = v;
+        const data = await agentApi('/api/socialV2/person-profile', { method: 'POST', body: JSON.stringify(body), headers: { 'x-agent-token': token }, timeoutMs: 60000 });
+        return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
+      } catch (error) {
+        return { content: [{ type: 'text', text: '画像操作失败：' + (error?.message ?? error) }], isError: true };
+      }
+    }
+  );
+
+  server.tool(
+    'qq_followup',
+    '管理"待跟进的事"：群友说"等我考完试再说""回头给你看"这类以后要跟进的话，记下来，到点桥接会提醒你自然地问一句。action：list（看待跟进的）/ add（自己加一条，dueInHours 多久后提醒）/ done（做完了）/ cancel（不用了）。注意：系统也会自动从对话里提取待跟进事项，你只需补充或收尾。',
+    {
+      key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
+      token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
+      action: z.string().describe('list | add | done | cancel'),
+      topic: z.string().optional().describe('action=add 时：要跟进什么事（一句话）'),
+      name: z.string().optional().describe('action=add 时：谁的事（对方称呼）'),
+      dueInHours: z.number().optional().describe('action=add 时：几小时后提醒（默认 6，最小 0.05=3 分钟）'),
+      id: z.number().optional().describe('action=done/cancel 时：条目 id'),
+      status: z.string().optional().describe('action=list 时：pending（默认）/fired/done/cancelled/all')
+    },
+    async ({ key, token, action, topic, name, dueInHours, id, status }) => {
+      try {
+        const body = { key, token, action };
+        if (topic != null) body.topic = topic;
+        if (name != null) body.name = name;
+        if (dueInHours != null) body.dueInHours = dueInHours;
+        if (id != null) body.id = id;
+        if (status != null) body.status = status;
+        const data = await agentApi('/api/socialV2/followup', { method: 'POST', body: JSON.stringify(body), headers: { 'x-agent-token': token }, timeoutMs: 60000 });
+        return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
+      } catch (error) {
+        return { content: [{ type: 'text', text: '待跟进操作失败：' + (error?.message ?? error) }], isError: true };
+      }
+    }
+  );
+}
+
 await server.connect(new StdioServerTransport());

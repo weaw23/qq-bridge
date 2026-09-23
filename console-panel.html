@@ -286,7 +286,7 @@ async function setToggle(path, value) {
   catch (e) { toast('失败：' + e.message, true); refresh(); }
 }
 
-const TABS = [['affinity', '好感度'], ['facts', '长期记忆'], ['reminders', '定时提醒'], ['activity', '最近活动'], ['tool-log', '工具日志'], ['slang', '黑话库'], ['feedback', '她的反馈']];
+const TABS = [['affinity', '好感度'], ['facts', '长期记忆'], ['followups', '待跟进'], ['reminders', '定时提醒'], ['activity', '最近活动'], ['tool-log', '工具日志'], ['slang', '黑话库'], ['feedback', '她的反馈']];
 let curTab = 'affinity';
 function renderTabs() {
   $('tabs').innerHTML = TABS.map(([k, n]) => `<div class="tab ${k === curTab ? 'active' : ''}" onclick="showTab('${k}')">${n}</div>`).join('');
