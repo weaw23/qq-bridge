@@ -8204,7 +8204,7 @@ async function main() {
           .run(key, '', f.name || '', f.topic, Date.now() + f.dueInHours * 3600 * 1000, 'pending', Date.now());
         followupsAdded++;
       }
-      st.lastSummarizedSeq = Number(all[all.length - 1]?.seq) || watermark;
+      st.lastSummarizedSeq = all.reduce((mx, m) => Math.max(mx, Number(m.seq) || 0), watermark);
       saveSocialV2State();
       log(`[memory] 摘要 ${key}：新消息 ${fresh.length} 条 → 事实 +${factsAdded}，人物 ${peopleUpdated}，待跟进 +${followupsAdded}`);
       return true;
