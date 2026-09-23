@@ -1070,7 +1070,7 @@ async function main() {
       saveSlangStore();
       log(`黑话提取：${key} 新增 ${added} 条，更新 ${updated} 条`);
       // P6-5：同一批语料顺带学一次"说话方式"（复用学习会话，不额外开窗口）
-      queueSlangTask(() => runExpressionExtraction(key)).catch(() => {});
+      try { queueSlangTask(() => runExpressionExtraction(key, messages)); } catch (e) { log('[expression] 排队失败: ' + (e?.message ?? e)); }
       if (researchCandidates.length && cfg.slang?.autoResearch !== false) {
         queueSlangTask(() => runSlangResearch(researchCandidates));
       }
@@ -7882,10 +7882,11 @@ async function main() {
   let expressionEntries = loadExpressionStore(EXPRESSION_FILE);
   let expressionBusy = false;
 
-  async function runExpressionExtraction(key) {
+  async function runExpressionExtraction(key, messagesArg) {
     if (cfg.expressions?.enabled === false) return;
     if (!dshReady || expressionBusy || socialV2.paused) return;
-    const messages = slangWindows.get(key) ?? [];
+    // 注意：黑话提取后会把 slangWindows 里的窗口清空，所以优先用调用方传入的快照
+    const messages = (Array.isArray(messagesArg) && messagesArg.length) ? messagesArg : (slangWindows.get(key) ?? []);
     const min = Math.max(3, Number(cfg.expressions?.minMessages) || 8);
     if (messages.length < min) return;
     expressionBusy = true;
