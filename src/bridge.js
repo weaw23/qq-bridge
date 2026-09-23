@@ -7842,7 +7842,7 @@ async function main() {
   let memorySessionId = null;
   const MEMORY_SESSION_FILE = path.join(STATE_DIR, 'memory-agent.json');
   const autonomyFile = path.join(STATE_DIR, 'autonomy.json');
-  const readAutonomy = () => readJsonSafe(autonomyFile, {}, true) ?? {};
+  const readAutonomy = () => readJsonSafe(autonomyFile, {}, false) ?? {};
   const writeAutonomy = (obj) => { try { fs.writeFileSync(autonomyFile, JSON.stringify(obj, null, 2)); } catch {} };
 
   // facts 与 FTS 索引同步（中文用二元切分，见 memory-engine.js）
@@ -7863,7 +7863,7 @@ async function main() {
   async function ensureMemorySession() {
     const preset = resolvePresetName(cfg.agentPreset, { strict: true });
     if (!preset) throw new Error('记忆整理缺少已验证的安全 preset，拒绝创建会话');
-    const saved = readJsonSafe(MEMORY_SESSION_FILE, null, true);
+    const saved = readJsonSafe(MEMORY_SESSION_FILE, null);
     if (saved?.preset !== preset) {
       memorySessionId = null;
       try { fs.rmSync(MEMORY_SESSION_FILE, { force: true }); } catch {}
