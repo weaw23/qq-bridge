@@ -85,7 +85,7 @@
 <body>
 <div class="top">
   <h1>🐳 哦鲸鲸 · 控制台</h1>
-  <div class="sub">QQ 3692140164 · SnowLuma → qq-bridge → DSH</div>
+  <div class="sub" id="subTitle">SnowLuma → qq-bridge → DSH</div>
   <div style="flex:1"></div>
   <div class="pills" id="pills"><span class="pill"><span class="dot"></span>加载中…</span></div>
   <input type="text" id="token" placeholder="控制台令牌" style="width:230px">
@@ -324,6 +324,7 @@ async function refresh(allowRetry = true) {
       ['收藏表情', o.counts.stickers + ' 个'], ['控制台端口', o.consolePort],
     ].map(([k, v]) => `<div class="k">${k}</div><div>${v ?? ''}</div>`).join('');
     $('pauseBtn').textContent = o.paused ? '恢复 AI' : '暂停 AI';
+    $('subTitle').textContent = (o.qq?.userId ? 'QQ ' + o.qq.userId + ' ' + (o.qq.nickname || '') + ' · ' : '') + 'SnowLuma → qq-bridge → DSH';
     $('allowPrivate').value = (o.allowPrivate || []).join(', ');
     $('allowGroups').value = (o.allowGroups || []).join(', ');
     $('pcEnabled').checked = o.toggles.pcControl?.enabled !== false;
