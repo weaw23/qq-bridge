@@ -5432,12 +5432,16 @@ async function main() {
             });
             const rb = await res.json().catch(() => ({}));
             const arr = Array.isArray(rb?.data) ? rb.data : (Array.isArray(rb?.data?.messages) ? rb.data.messages : []);
+            // 自己的 QQ 号必须取运行时值：原先这里硬编码了已封旧号 3692140164，
+            // 导致换号后 isSelf 恒为 false —— 她读私聊历史时，自己说过的话会被标成对方说的，
+            // 进而把「自己承诺过的事」误记成「主人承诺过的事」，污染记忆归因。
+            const meFH = Number(selfUserId || cfg.botQQ || 0);
             sendJson({ ok: true, count: arr.length, messages: arr.map((m) => ({
               messageId: m.message_id,
               time: m.time,
               senderId: m.sender?.user_id ?? null,
               senderNickname: m.sender?.nickname ?? '',
-              isSelf: m.sender?.user_id === 3692140164,
+              isSelf: meFH > 0 && Number(m.sender?.user_id ?? 0) === meFH,
               text: Array.isArray(m.message) ? m.message.map((s) => (s.type === 'text' ? s.data?.text : '[' + s.type + ']')).join('') : String(m.raw_message ?? '')
             })) });
           } catch (error) {
@@ -5942,11 +5946,15 @@ async function main() {
         return `（诊断：本账号已被移出该群，期间所有发言必然失败。请勿重试发言；桥接会在确认后自动停用该群，也可提醒主人在面板恢复或重新拉群）`;
       }
       if (!(code === 120 || /rejected/i.test(wording))) return '';
+      // 拿不到自己的 QQ 号就别查成员信息：cfg.botQQ 当前为空，兜底会退化成 user_id:0，
+      // 那种查询必然失败 → 下面 !mi.data 分支会误记「被移出群」strike，两次就自动停用一个好好的群。
+      const meId = Number(selfUserId || cfg.botQQ || 0);
+      if (meId <= 0) return '';
       const httpUrlD = String(cfg.snowluma?.httpUrl || 'http://127.0.0.1:3000').replace(/\/+$/, '');
       const resD = await fetch(httpUrlD + '/get_group_member_info', {
         method: 'POST',
         headers: { 'content-type': 'application/json', ...(cfg.snowluma?.accessToken ? { authorization: 'Bearer ' + cfg.snowluma.accessToken } : {}) },
-        body: JSON.stringify({ group_id: Number(id), user_id: selfUserId || Number(cfg.botQQ ?? 0) }),
+        body: JSON.stringify({ group_id: Number(id), user_id: meId }),
         signal: AbortSignal.timeout(8000)
       });
       const mi = await resD.json().catch(() => ({}));

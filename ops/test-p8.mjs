@@ -166,7 +166,20 @@ for (const p of pairs) {
 }
 const willMerge = pairs.filter((p) => p.c >= 0.85).length;
 console.log(`\n≥0.85 将合并 ${willMerge} 对；0.6~0.85 保留 ${pairs.length - willMerge} 对`);
-check('近似合并有候选且阈值区分明显', pairs.length > 0 && pairs.some((p) => p.c >= 0.85) && pairs.some((p) => p.c < 0.85));
+// 断言随「维护是否已跑过今天的锚点」而变，否则维护真跑完合并后本项必然误报失败：
+//   已跑 → 库里不该再残留 ≥0.85 的近似重复（这才证明合并逻辑生效了）
+//   没跑 → 只要有候选，就要求 0.85 这条线两边都有样本（阈值确实能区分）
+let maintDone = false;
+try {
+  const autoM = JSON.parse(fs.readFileSync(path.join(ROOT, 'state', 'autonomy.json'), 'utf8'));
+  maintDone = shouldRun(new Date(), 1, Number(autoM.lastMaintainAt) || 0).fire === false;
+} catch { maintDone = false; }
+if (maintDone) {
+  check('维护已跑过 → 库内不应残留 ≥0.85 的近似重复', willMerge === 0,
+    willMerge === 0 ? '（重复已合并完毕，低包含度的对按设计保留）' : `（仍有 ${willMerge} 对未合并，合并逻辑可能失效）`);
+} else {
+  check('近似合并有候选且阈值区分明显', pairs.length > 0 && willMerge > 0 && pairs.some((p) => p.c < 0.85));
+}
 
 db.close();
 console.log(`\n===== ${failures === 0 ? '全部通过 ✅' : `${failures} 项失败 ❌`} =====`);
