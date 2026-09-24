@@ -6,9 +6,10 @@ import { execFileSync, spawn } from 'node:child_process';
 const NEW_UIN = '3835811547';
 const CFG_DIR = 'D:\\qqbot\\SnowLuma\\config';
 const DATA_DIR = 'D:\\qqbot\\SnowLuma\\data';
-// 令牌不入库：从 qq-bridge/.snowluma-token 读取（该文件在 .gitignore 中）
+// 令牌不入库：从 qq-bridge/.snowluma-token 读取（该文件在 .gitignore 中，P8-4 清洗）
 const TOKEN_FILE = 'D:\\qqbot\\qq-bridge\\.snowluma-token';
 const TOKEN = fs.readFileSync(TOKEN_FILE, 'utf8').trim();
+if (!TOKEN) throw new Error('OneBot 令牌为空：' + TOKEN_FILE);
 const LOGS = 'D:\\qqbot\\logs';
 const WD_LOG = path.join(LOGS, 'switch-account.log');
 const log = (m) => { const l = `${new Date().toLocaleString('zh-CN')} [switch] ${m}`; fs.appendFileSync(WD_LOG, l + '\n'); console.log(l); };
