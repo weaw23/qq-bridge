@@ -957,18 +957,24 @@ if (cfg.socialV2?.sticker?.enabled !== false && cfg.socialV2?.tools?.sendSticker
 if (cfg.socialV2?.sticker?.enabled !== false && cfg.socialV2?.tools?.collectSticker !== false) {
   server.tool(
     'qq_collect_sticker',
-    '收藏别人发的表情（偶尔，别手贱）。',
+    '收藏表情：聊天里别人发的图，或你在网上找到/自己生成的图（偶尔，别手贱）。',
     {
       key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
       token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
-      messageId: z.string().describe('要收藏的那条消息的 messageId 或 seq（来自 qq_get_unread_message…'),
+      messageId: z.string().optional().describe('要收藏的那条消息的 messageId 或 seq（来自 qq_get_unread_messages）；收聊天里的图时填这个'),
+      file: z.string().optional().describe('外部图源：https://直链 或 base64://数据 或 file:///D:/qqbot/outbox/文件名；收网上搜到的图或自己生成的图时填这个。与 messageId 二选一，两个都给则以 file 为准'),
       remark: z.string().optional().describe('简短备注，最多 20 字，例如“好图偷了，兄弟”')
     },
-    async ({ key, token, messageId, remark }) => {
+    async ({ key, token, messageId, file, remark }) => {
       try {
+        const f = String(file ?? '').trim();
+        const mid = String(messageId ?? '').trim();
+        if (!f && !mid) {
+          return { content: [{ type: 'text', text: 'messageId 和 file 至少要给一个：收聊天里的图填 messageId，收网上/本地的图填 file' }], isError: true };
+        }
         const data = await agentApi('/api/socialV2/collect-sticker', {
           method: 'POST',
-          body: JSON.stringify({ key, messageId: String(messageId), remark: remark || '' }),
+          body: JSON.stringify({ key, ...(f ? { file: f } : { messageId: mid }), remark: remark || '' }),
           headers: { 'x-agent-token': token },
           timeoutMs: 60000
         });
@@ -1153,7 +1159,7 @@ if (cfg.socialV2?.tools?.getFriendHistory !== false) {
         if (!m) return { content: [{ type: 'text', text: 'key 必须是 private:QQ号（本工具只读好友私聊历史）' }], isError: true };
         const data = await agentApi('/api/socialV2/friend-history', {
           method: 'POST',
-          body: JSON.stringify({ userId: m[1], count, messageSeq: messageSeq ?? null }),
+          body: JSON.stringify({ userId: m[1], count, messageSeq: messageSeq ?? null, token }),
           headers: { 'x-agent-token': token },
           timeoutMs: 60000
         });
@@ -1181,7 +1187,7 @@ if (cfg.socialV2?.tools?.sendImage !== false) {
         const parts = [{ type: 'image', file: String(file ?? '').trim() }];
         const cap = String(caption ?? '').trim();
         if (cap) parts.push({ type: 'text', text: cap });
-        const body = { key, parts };
+        const body = { key, parts, token };
         if (replyToMessageId != null && String(replyToMessageId).trim() !== '') body.replyToMessageId = replyToMessageId;
         const data = await agentApi('/api/send/rich', {
           method: 'POST',
@@ -1213,7 +1219,7 @@ if (cfg.socialV2?.tools?.sendFace !== false) {
         const parts = [{ type: 'face', id: String(faceId ?? '').trim() }];
         const cap = String(caption ?? '').trim();
         if (cap) parts.push({ type: 'text', text: cap });
-        const body = { key, parts };
+        const body = { key, parts, token };
         if (replyToMessageId != null && String(replyToMessageId).trim() !== '') body.replyToMessageId = replyToMessageId;
         const data = await agentApi('/api/send/rich', {
           method: 'POST',

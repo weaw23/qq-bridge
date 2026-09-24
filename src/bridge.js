@@ -905,7 +905,6 @@ async function main() {
 
   // 收藏聊天里的一张表情（add_custom_face），并按 AI 看到的含义写简短备注（modify_custom_face）。
   async function collectStickerV2(key, messageRef, remark) {
-    const assertSendAllowed = captureSendGuard(key);
     const st = getSocialV2State(key);
     const found = (st.recentMessages || []).find((m) => m && (String(m.seq) === String(messageRef) || (m.messageId && String(m.messageId) === String(messageRef))));
     if (!found) throw new Error('找不到这条消息，请确认 messageId/seq 有效且属于当前会话');
@@ -928,6 +927,14 @@ async function main() {
       if (face?.buffer) file = 'base64://' + face.buffer.toString('base64');
     }
     if (!file) throw new Error('无法获取该表情的图片源');
+    return addCustomFaceV2(key, file, remark);
+  }
+
+  // 收藏表情的公共尾部：add_custom_face →（可选）modify_custom_face 写备注 → 强刷本地库。
+  // 从 collectStickerV2 抽出，让「聊天里的图」与「外部图源」共用同一条入库通路，
+  // 避免两条路径各自演化出不同的限频/备注/刷新行为。
+  async function addCustomFaceV2(key, file, remark) {
+    const assertSendAllowed = captureSendGuard(key);
     assertSendAllowed();
     const addRes = await bot.request('add_custom_face', { file });
     if (!addRes || addRes.status !== 'ok' || addRes.retcode !== 0) {
@@ -948,6 +955,39 @@ async function main() {
     const synced = await syncStickerLibrary(true);
     const entry = findSticker(synced?.entries ?? stickerEntries, emojiId);
     return { emojiId, entry: entry || null, remark: cleanRemark };
+  }
+
+  // 从外部图源收藏表情：网络直链 / base64 / 本地 outbox 文件。
+  // 背景：原先只能收「本会话里别人发过的图」（collectStickerV2 在 st.recentMessages 里找，
+  // 且 found.isSelf 直接拒绝），她在浏览器里搜到的图根本无从入库。这里复用同一条
+  // add_custom_face 通路，只把图源换成外部给定。
+  // 安全：网络图一律经 safeFetchBuffer 自己取字节（SSRF 防护 + 重定向复验 + 图片类型校验），
+  // 绝不把 URL 直接交给 OneBot 去下载——与 collectStickerV2 里的同源警告保持一致。
+  // 本地文件仅允许 D:\qqbot\outbox\ 下（截屏/生图的既定落盘目录），且拒绝路径穿越。
+  async function collectStickerFromSourceV2(key, fileSrc, remark) {
+    const src = String(fileSrc ?? '').trim();
+    if (!src) throw new Error('file 不能为空');
+    const maxBytes = 4 * 1024 * 1024; // 与 safeFetchBuffer 默认上限一致
+    let buf = null;
+    if (src.startsWith('base64://')) {
+      const b64 = src.slice('base64://'.length).replace(/\s+/g, '');
+      if (b64.length > 12000000) throw new Error('图片 base64 过大（上限约 9MB）');
+      buf = Buffer.from(b64, 'base64');
+    } else if (/^https?:\/\//i.test(src)) {
+      const fetched = await safeFetchBuffer(src, maxBytes);
+      buf = fetched?.buffer ?? null;
+    } else {
+      const norm = src.replace(/\\/g, '/');
+      if (!/^file:\/\/\/D:\/qqbot\/outbox\//i.test(norm) || norm.includes('..')) {
+        throw new Error('图片仅支持 base64://、http(s):// 或 file:///D:/qqbot/outbox/ 下的本地文件');
+      }
+      const localPath = decodeURIComponent(norm.replace(/^file:\/\/\//i, '')).replace(/\//g, path.sep);
+      buf = fs.readFileSync(localPath);
+      if (buf.length > maxBytes) throw new Error(`本地图片超过 ${Math.round(maxBytes / 1024 / 1024)}MB 上限`);
+    }
+    if (!buf || !buf.length) throw new Error('未能取得图片字节');
+    if (!looksLikeImageBuffer(buf)) throw new Error('内容不是有效图片（PNG/JPEG/GIF/WebP）');
+    return addCustomFaceV2(key, 'base64://' + buf.toString('base64'), remark);
   }
 
   function saveSlangStore() {
@@ -1773,6 +1813,15 @@ async function main() {
       const st = socialV2.conversations.get(canonical ?? key);
       return !!st && !!st.agentToken && token === st.agentToken;
     };
+    // 令牌来源归一：本文件里两种约定长期并存——多数 /api/socialV2/* 从 x-agent-token 头读，
+    // 而 /api/send/* 与少数 v2 端点从 body.token 读。MCP 侧同样混用：qq_send_group_message /
+    // qq_affinity / qq_followup 等 body 与头都带，而 qq_send_image / qq_send_face /
+    // qq_get_friend_msg_history 只带头 —— 于是这几个工具在 reserved2 下必然被判「未携带令牌」
+    // 直接 403（发图通道整体不可用就是这么来的，与权限/风控/图片格式都无关）。
+    // 两处都接受即可消除这类不匹配；令牌值仍由 agentTokenOk 按会话逐一比对，不放宽任何权限。
+    const pickAgentToken = (req, body) => (
+      String(body?.token ?? '').trim() || String(req?.headers?.['x-agent-token'] ?? '').trim()
+    );
     // 二代会话工具必须仍命中当前模式的白名单/准入；避免白名单移除后旧 agentToken 继续读状态。
     const v2SessionAllowed = isSessionAllowedInCurrentMode;
     const v2ToolEnabled = (flag) => cfg.socialV2?.tools?.[flag] !== false;
@@ -3747,8 +3796,11 @@ async function main() {
           const body = await readBody();
           const key = String(body.key ?? '').trim();
           const messageRef = String(body.messageId ?? body.seq ?? '').trim();
+          // 外部图源（网络直链 / base64:// / file:///D:/qqbot/outbox/…）：与 messageId 二选一。
+          // 有了它，她在浏览器里搜到的图也能直接入库，不必等这张图先在聊天里出现。
+          const fileSrc = String(body.file ?? '').trim();
           const remark = String(body.remark ?? '').trim();
-          if (!key || !messageRef) { sendJson({ ok: false, error: 'key 和 messageId/seq 不能为空' }, 400); return; }
+          if (!key || (!messageRef && !fileSrc)) { sendJson({ ok: false, error: 'key 不能为空，且需提供 messageId/seq（收聊天里的图）或 file（收外部图源）' }, 400); return; }
           if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
           if (req.headers['x-agent-token'] && !v2SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
           if (req.headers['x-agent-token'] && !v2ToolEnabled('collectSticker')) { sendJson({ ok: false, error: '工具未启用：qq_collect_sticker' }, 403); return; }
@@ -3771,9 +3823,12 @@ async function main() {
           st.stickerCollectTimes.push(now);
           if (st.stickerCollectTimes.length > 500) st.stickerCollectTimes = st.stickerCollectTimes.slice(-500);
           try {
-            const result = await collectStickerV2(key, messageRef, remark);
+            // file 优先：显式给了外部图源就走外部图源，不再去 recentMessages 里找那条消息
+            const result = fileSrc
+              ? await collectStickerFromSourceV2(key, fileSrc, remark)
+              : await collectStickerV2(key, messageRef, remark);
             saveSocialV2State();
-            log(`[sticker] AI 收藏表情 ${key}: ${result.emojiId}${result.remark ? '（备注：' + result.remark + '）' : ''}`);
+            log(`[sticker] AI 收藏表情 ${key}: ${result.emojiId}${result.remark ? '（备注：' + result.remark + '）' : ''}${fileSrc ? '（外部图源）' : ''}`);
             appendActivity(`${key} [sticker] AI 收藏表情：${result.remark || result.emojiId}`);
             sendJson({ ok: true, key, sticker: result.entry, emojiId: result.emojiId, remark: result.remark });
           } catch (error) {
@@ -3992,7 +4047,7 @@ async function main() {
           const body = await readBody();
           const key = String(body.key ?? '').trim();
           const tool = String(body.tool ?? '').trim();
-          const token = String(body.token ?? '').trim();
+          const token = pickAgentToken(req, body);
           if (!key || !tool || !token) {
             sendJson({ ok: false, error: 'key/tool/token 不能为空' }, 400);
             return;
@@ -4441,7 +4496,7 @@ async function main() {
         if (req.method === 'POST' && url.pathname === '/api/socialV2/slang/submit') {
           const body = await readBody();
           const key = String(body.key ?? '').trim();
-          const token = String(body.token ?? '').trim();
+          const token = pickAgentToken(req, body);
           const content = redactKnownTokensOnly(String(body.content ?? '')).trim();
           const context = redactKnownTokensOnly(String(body.context ?? '')).trim();
           if (!key) { sendJson({ ok: false, error: 'key 不能为空' }, 400); return; }
@@ -4498,7 +4553,7 @@ async function main() {
         if (req.method === 'POST' && url.pathname === '/api/authorize/read') {
           const body = await readBody();
           const key = String(body.key ?? '').trim();
-          const token = String(body.token ?? '').trim();
+          const token = pickAgentToken(req, body);
           const keyMatch = /^(group|private):(\d+)$/.exec(key);
           if (!keyMatch) { sendJson({ ok: false, error: 'key 格式应为 group:群号 或 private:QQ号' }, 400); return; }
           if (currentMode === 'reserved2' && !agentTokenOk(key, token)) {
@@ -4567,7 +4622,7 @@ async function main() {
         // ── 管理操作端点（P1：仅主人私聊会话令牌可调用，全员审计） ──────────
         if (req.method === 'POST' && url.pathname === '/api/socialV2/admin') {
           const body = await readBody();
-          const token = String(body.token ?? '').trim();
+          const token = pickAgentToken(req, body);
           const action = String(body.action ?? '').trim();
           const ownerKey = 'private:' + String(cfg.ownerQQ ?? '');
           if (currentMode !== 'reserved2') { sendJson({ ok: false, error: '该接口仅 reserved2 模式可用' }, 403); return; }
@@ -4620,7 +4675,7 @@ async function main() {
         // ── 持久记忆端点（P2：跨会话事实库） ─────────────────────────────
         if (req.method === 'POST' && (url.pathname === '/api/socialV2/memory/remember' || url.pathname === '/api/socialV2/memory/recall' || url.pathname === '/api/socialV2/memory/forget')) {
           const body = await readBody();
-          const token = String(body.token ?? '').trim();
+          const token = pickAgentToken(req, body);
           const key = String(body.key ?? '').trim();
           if (currentMode !== 'reserved2') { sendJson({ ok: false, error: '该接口仅 reserved2 模式可用' }, 403); return; }
           if (!key || !agentTokenOk(key, token)) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
@@ -4663,7 +4718,7 @@ async function main() {
         // ── 定时提醒端点（P2：到期自动注入会话并唤醒） ───────────────────
         if (req.method === 'POST' && (url.pathname === '/api/socialV2/reminder/set' || url.pathname === '/api/socialV2/reminder/list' || url.pathname === '/api/socialV2/reminder/cancel')) {
           const body = await readBody();
-          const token = String(body.token ?? '').trim();
+          const token = pickAgentToken(req, body);
           const key = String(body.key ?? '').trim();
           if (currentMode !== 'reserved2') { sendJson({ ok: false, error: '该接口仅 reserved2 模式可用' }, 403); return; }
           if (!key || !agentTokenOk(key, token)) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
@@ -4696,7 +4751,7 @@ async function main() {
         // ── 自身状态端点（P3.5：查自己在群里的名片/角色/禁言等 + 好友清单） ──
         if (req.method === 'POST' && (url.pathname === '/api/socialV2/my-status' || url.pathname === '/api/socialV2/friend-list')) {
           const body = await readBody();
-          const token = String(body.token ?? '').trim();
+          const token = pickAgentToken(req, body);
           const key = String(body.key ?? '').trim();
           if (currentMode !== 'reserved2') { sendJson({ ok: false, error: '该接口仅 reserved2 模式可用' }, 403); return; }
           if (!key || !agentTokenOk(key, token)) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
@@ -4751,7 +4806,7 @@ async function main() {
         // ── 关系记忆端点（P4：好感度 upsert/查询） ───────────────────────
         if (req.method === 'POST' && url.pathname === '/api/socialV2/affinity') {
           const body = await readBody();
-          const token = String(body.token ?? '').trim();
+          const token = pickAgentToken(req, body);
           const key = String(body.key ?? '').trim();
           if (currentMode !== 'reserved2') { sendJson({ ok: false, error: '该接口仅 reserved2 模式可用' }, 403); return; }
           if (!key || !agentTokenOk(key, token)) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
@@ -4792,7 +4847,7 @@ async function main() {
         // ── 自我演化笔记端点（P4：她自己的风格/自我认知沉淀） ─────────────
         if (req.method === 'POST' && url.pathname === '/api/socialV2/self-note') {
           const body = await readBody();
-          const token = String(body.token ?? '').trim();
+          const token = pickAgentToken(req, body);
           const key = String(body.key ?? '').trim();
           if (currentMode !== 'reserved2') { sendJson({ ok: false, error: '该接口仅 reserved2 模式可用' }, 403); return; }
           if (!key || !agentTokenOk(key, token)) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
@@ -5226,7 +5281,7 @@ async function main() {
         // ── 人物画像端点（P6：结构化画像，比一句话印象更懂人） ─────────────
         if (req.method === 'POST' && url.pathname === '/api/socialV2/person-profile') {
           const body = await readBody();
-          const token = String(body.token ?? '').trim();
+          const token = pickAgentToken(req, body);
           const key = String(body.key ?? '').trim();
           if (currentMode !== 'reserved2') { sendJson({ ok: false, error: '该接口仅 reserved2 模式可用' }, 403); return; }
           if (!key || !agentTokenOk(key, token)) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
@@ -5267,7 +5322,7 @@ async function main() {
         // ── 待跟进事项端点（P6：从对话里自动提取 + 手动增删） ─────────────
         if (req.method === 'POST' && url.pathname === '/api/socialV2/followup') {
           const body = await readBody();
-          const token = String(body.token ?? '').trim();
+          const token = pickAgentToken(req, body);
           const key = String(body.key ?? '').trim();
           if (currentMode !== 'reserved2') { sendJson({ ok: false, error: '该接口仅 reserved2 模式可用' }, 403); return; }
           if (!key || !agentTokenOk(key, token)) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
@@ -5335,7 +5390,7 @@ async function main() {
         // ── 富媒体发送端点（P0：图片/系统表情段式发送，同一套白名单/令牌/审计） ──
         if (req.method === 'POST' && url.pathname === '/api/send/rich') {
           const body = await readBody();
-          const token = String(body.token ?? '').trim();
+          const token = pickAgentToken(req, body);
           const key = String(body.key ?? '').trim();
           const parts = Array.isArray(body.parts) ? body.parts.slice(0, 9) : [];
           const replyToMessageId = body.replyToMessageId;
@@ -5413,7 +5468,7 @@ async function main() {
         // ── 私聊历史代理（P0：qq_get_friend_msg_history 走这里，白名单内才可读） ──
         if (req.method === 'POST' && url.pathname === '/api/socialV2/friend-history') {
           const body = await readBody();
-          const token = String(body.token ?? '').trim();
+          const token = pickAgentToken(req, body);
           const userId = String(body.userId ?? '').trim();
           const count = Math.min(Math.max(Number(body.count) || 20, 1), 30);
           const messageSeq = body.messageSeq != null && Number.isFinite(Number(body.messageSeq)) ? Number(body.messageSeq) : undefined;
@@ -5453,7 +5508,7 @@ async function main() {
         // ── 统一发送端点（MCP 旧发送工具也走这里） ───────────────────────────
         if (req.method === 'POST' && (url.pathname === '/api/send/group' || url.pathname === '/api/send/private' || url.pathname === '/api/send/reply')) {
           const body = await readBody();
-          const token = String(body.token ?? '').trim();
+          const token = pickAgentToken(req, body);
           const isPrivate = url.pathname === '/api/send/private';
           const isReply = url.pathname === '/api/send/reply';
           const targetId = isPrivate ? String(body.userId ?? '').trim() : String(body.groupId ?? '').trim();
