@@ -1272,6 +1272,84 @@ async function main() {
     }
   }
 
+  // ── P8-1：长期记忆自动召回（唤醒时“自然想起”相关事实，补上 facts 只写不读的断层） ──
+  // 召回键 = 最近在场的人（QQ 号/称呼）+ 最近几条消息的关键词；FTS5 二元 MATCH 为主，LIKE 兜底。
+  // 说明：facts_fts 的 tokenize='ascii' 会把每个空格分隔的中文二元词当成一个 token，
+  // 所以 queryToMatch 生成的 "词" OR "词" 能正常命中（已实测）。
+  function recallFactLines(key, st, limit) {
+    try {
+      if (cfg.memory?.enabled === false || cfg.memory?.recallInject === false) return [];
+      const recent = Array.isArray(st?.recentMessages) ? st.recentMessages : [];
+      const others = recent.filter((m) => m && !m.isSelf);
+      if (!others.length) return [];
+      const db = getMemoryDb();
+      const max = Math.max(1, Math.min(6, Number(limit) || Number(cfg.memory?.recallInjectMax) || 4));
+      const pool = new Map();
+      // 分寸：私聊里记下的事实（45 条中有 20 条来自主人私聊）默认不带进群会话，
+      // 否则「主人爱摸头/抱抱」这类私人互动会被她拿到群里说；主人本人在场时才带。
+      const isGroupKey = String(key).startsWith('group:');
+      const ownerQQ = String(cfg.ownerQQ ?? '');
+      const ownerPresent = isGroupKey && !!ownerQQ && others.some((m) => String(m.userId ?? '') === ownerQQ);
+      const privateLeak = (r) => isGroupKey && !ownerPresent && String(r?.source_key ?? '').startsWith('private:');
+      const add = (rows, weight) => {
+        for (const r of rows) {
+          if (privateLeak(r)) continue;
+          const cur = pool.get(r.id) ?? { row: r, score: 0 };
+          // 同会话记下的加权；重要度加权；被多个召回键命中则分数叠加
+          cur.score += weight * (1 + 0.2 * (Number(r.importance) || 1)) + (String(r.source_key) === String(key) ? 0.8 : 0);
+          pool.set(r.id, cur);
+        }
+      };
+      // 1) 在场的人：QQ 号 / 群名片（短词不适合二元切分，用 LIKE）
+      const people = [];
+      const seenPeople = new Set();
+      for (let i = others.length - 1; i >= 0 && people.length < 6; i--) {
+        const m = others[i];
+        const uid = m.userId ? String(m.userId) : '';
+        const nm = String(m.sender || '').slice(0, 20);
+        if (uid && !seenPeople.has(uid)) { seenPeople.add(uid); people.push(uid); }
+        if (nm && nm.length >= 2 && !seenPeople.has(nm)) { seenPeople.add(nm); people.push(nm); }
+      }
+      for (const p of people) {
+        const like = '%' + String(p).replace(/[%_\\]/g, '') + '%';
+        if (like.length < 4) continue;
+        try { add(db.prepare('SELECT id, content, category, importance, source_key FROM facts WHERE content LIKE ? ORDER BY updated_at DESC LIMIT 3').all(like), 2.4); } catch {}
+      }
+      // 2) 最近消息关键词：FTS5 二元召回
+      const texts = others.slice(-6).map((m) => String(m.plain || m.text || '')).filter((t) => t.replace(/\s/g, '').length >= 4);
+      for (const t of texts) {
+        const match = queryToMatch(t.slice(0, 80));
+        if (!match) continue;
+        try { add(db.prepare('SELECT f.id, f.content, f.category, f.importance, f.source_key FROM facts f JOIN facts_fts ON facts_fts.rowid = f.id WHERE facts_fts MATCH ? ORDER BY bm25(facts_fts), f.importance DESC LIMIT 4').all(match), 1); } catch {}
+      }
+      // 近似去重：同一句话的不同版本只留分最高的一条。夜间维护只按「完全相同文本」合并，
+      // 挡不住实测存在的 ids 14/20 这类变体，否则 4 个召回名额被一句话占掉两个。
+      const sigOf = (s) => toBigrams(String(s ?? '').slice(0, 80)).split(' ').filter(Boolean);
+      const picked = [];
+      for (const cand of [...pool.values()].sort((a, b) => b.score - a.score)) {
+        const cs = sigOf(cand.row.content);
+        const dup = cs.length > 0 && picked.some((p) => p.sig.length > 0 &&
+          cs.filter((g) => p.sig.includes(g)).length / Math.min(cs.length, p.sig.length) >= 0.6);
+        if (dup) continue;
+        picked.push({ row: cand.row, score: cand.score, sig: cs });
+        if (picked.length >= max) break;
+      }
+      let out = picked;
+      // 3) 兜底：一条都没召回时带上高重要度事实，避免“完全失忆”开局（同样遵守私聊隔离）
+      if (!out.length) {
+        try {
+          out = db.prepare('SELECT id, content, category, importance, source_key FROM facts WHERE importance >= 4 ORDER BY updated_at DESC LIMIT 8').all()
+            .filter((row) => !privateLeak(row))
+            .slice(0, 2)
+            .map((row) => ({ row, score: 0.5, sig: sigOf(row.content) }));
+        } catch {}
+      }
+      return out.map((x) => '- ' + String(x.row.content).slice(0, 90) + (Number(x.row.importance) >= 4 ? '（重要）' : '') + (String(x.row.source_key) === String(key) ? '' : '（别的场合记下的）'));
+    } catch {
+      return [];
+    }
+  }
+
   function withSlangContext(promptText) {
     const now = new Date();
     const timeLine = `【当前时间】${now.toLocaleString('zh-CN', { hour12: false })}（${Intl.DateTimeFormat().resolvedOptions().timeZone}）`;
@@ -5882,8 +5960,46 @@ async function main() {
         noteGroupKick(id, '成员信息查询失败: ' + (mi?.wording || mi?.message || `retcode=${mi?.retcode ?? '?'}`));
         return `（诊断：无法查询本账号在该群的成员信息（${mi?.wording || 'AUTHORITY_FAIL'}），可能已被移出该群。请勿重试发言）`;
       }
+      // P8-3b：没被禁言、也还在群里，但消息被服务端拒绝 → 未解释的发送受阻（风控/客户端降级）
+      return noteUnexplainedSendBlock(id, code, wording);
     } catch {}
     return '';
+  }
+
+  // ── P8-3b：未解释的发送受阻（result=120 但未禁言、未被移出）────────────────
+  // 事故背景：9/23 晚群 1132819177 连续 result=120，muted=false、role=member，
+  // 旧逻辑三条分支都不命中 → 返回空诊断，她只能一遍遍重试，白烧 token 还刷屏。
+  // 现在：给出明确诊断（别再试）+ 连续 3 次进入冷却（暂停该群主动冒泡）+ 报警给主人。
+  const sendBlockUntil = new Map();    // gid → 冷却截止时间戳
+  const sendBlockStrikes = new Map();  // gid → { count, firstAt }
+  const sendBlockAlerted = new Set();  // 冷却期内只报警一次
+  function sendBlockActive(groupId) {
+    const until = sendBlockUntil.get(String(groupId)) || 0;
+    return until > Date.now() ? until : 0;
+  }
+  function noteUnexplainedSendBlock(groupId, code, wording) {
+    const gid = String(groupId);
+    const now = Date.now();
+    const s = sendBlockStrikes.get(gid) || { count: 0, firstAt: now };
+    if (now - (Number(s.firstAt) || now) > 60 * 60 * 1000) { s.count = 0; s.firstAt = now; } // 1h 窗口外的旧账清零
+    s.count = (Number(s.count) || 0) + 1;
+    sendBlockStrikes.set(gid, s);
+    const cooldownMin = Math.max(10, Number(cfg.socialV2?.sendBlockCooldownMin) || 60);
+    const hint = `（诊断：本账号在该群没被禁言、也还在群里，但消息被服务端拒绝（result=${code}${wording ? '，' + String(wording).slice(0, 40) : ''}）——像是新号触发风控或 QQ 客户端异常，不是你被禁言。请勿再重试发言，也别反复向群里解释；用 qq_set_wake_config 设长时间潜水，必要时在主人私聊里说一次就好。桥接已暂停该群的主动冒泡。）`;
+    if (s.count >= 3) {
+      sendBlockUntil.set(gid, now + cooldownMin * 60 * 1000);
+      cancelProactiveCheckV2('group:' + gid); // 立刻撤掉已排程的主动检查
+      log(`[send-block] 群 ${gid} 连续 ${s.count} 次未解释发送失败（result=${code}）→ 主动冒泡冷却 ${cooldownMin} 分钟`);
+      appendActivity(`群 ${gid} 发送受阻（result=${code}，未禁言/未退群）：主动冒泡冷却 ${cooldownMin} 分钟`);
+      const okey = 'private:' + String(cfg.ownerQQ ?? '');
+      if (currentMode === 'reserved2' && cfg.ownerQQ && isSessionAllowedInCurrentMode(okey) && !sendBlockAlerted.has(gid)) {
+        sendBlockAlerted.add(gid);
+        appendSocialV2Notice(okey, `[发送受阻] 群 ${gid} 的消息被服务端拒绝（result=${code}），但她没被禁言、也还在群里——像是新号风控或 QQ 客户端异常。已暂停该群主动冒泡 ${cooldownMin} 分钟避免空烧。如果持续这样，建议养号（降频、少发图）或重登 QQ 客户端。`);
+        scheduleWakeV2(okey, 'sendBlock');
+        setTimeout(() => sendBlockAlerted.delete(gid), cooldownMin * 60 * 1000).unref?.();
+      }
+    }
+    return hint;
   }
 
   // ── P7-A 群健康自愈：kick strike 计数 + 自动停用 ──────────────────────────
@@ -8238,24 +8354,41 @@ async function main() {
   const memoryTimer = setInterval(memorySweep, Math.max(5 * 60 * 1000, Number(cfg.memory?.intervalMs) || 20 * 60 * 1000));
   if (memoryTimer.unref) memoryTimer.unref();
 
-  // ── 自主性：每日复盘 ──
+  // P8-2：整点任务的「最近一次计划时刻」锚点——今天 hour 点，若还没到则昨天 hour 点。
+  // 用它判断某轮任务是否已跑：上次执行时间早于锚点 = 这一轮还欠着（准点跑和补跑用同一套判断）。
+  function lastScheduledAt(hour, now = new Date()) {
+    const sched = new Date(now);
+    sched.setHours(hour, 0, 0, 0);
+    if (sched.getTime() > now.getTime()) sched.setTime(sched.getTime() - 86400000);
+    return sched;
+  }
+
+  // ── 自主性：每日复盘（P8-2：错过整点自动补跑，不再依赖「23 点那一刻机器恰好在线」） ──
+  // 事故背景：9/23、9/24 连续两晚复盘都没跑成——23 点整点时 DSH 已关（dshReady=false），
+  // 旧逻辑 `getHours() !== targetHour` 直接 return，那一天的自我整理就永久丢失了。
+  // 新逻辑：锚点=最近一次计划时刻，上次执行早于锚点且距上次 ≥20h 就跑 → 恢复后 10 分钟内补上。
   const reflectTimer = setInterval(async () => {
     try {
       if (cfg.autonomy?.enabled === false || !dshReady || socialV2.paused) return;
       const hour = Number(cfg.autonomy?.reflectHour);
       const targetHour = Number.isFinite(hour) ? hour : 23;
       const now = new Date();
-      if (now.getHours() !== targetHour) return;
-      const today = now.toISOString().slice(0, 10);
+      const sched = lastScheduledAt(targetHour, now);
       const auto = readAutonomy();
-      if (auto.lastReflectDate === today) return;
+      const lastAt = Number(auto.lastReflectAt) || 0;
+      if (lastAt >= sched.getTime()) return;                              // 这一轮已经跑过
+      if (lastAt && now.getTime() - lastAt < 20 * 3600 * 1000) return;     // 20h 内刚复盘过，不重复
       const key = 'private:' + String(cfg.ownerQQ ?? '');
       if (!isSessionAllowedInCurrentMode(key)) return;
-      auto.lastReflectDate = today;
+      const lateMin = Math.max(0, Math.round((now.getTime() - sched.getTime()) / 60000));
+      auto.lastReflectAt = now.getTime();
+      auto.lastReflectDate = now.toISOString().slice(0, 10); // 兼容旧字段
       writeAutonomy(auto);
-      appendSocialV2Notice(key, '[每日复盘] 今天到这儿了，花一分钟整理一下自己吧。');
+      appendSocialV2Notice(key, lateMin > 20
+        ? `[每日复盘·补跑] 原定 ${targetHour}:00 的自我整理当时不在线（晚了 ${lateMin >= 1440 ? Math.round(lateMin / 1440) + ' 天' : lateMin + ' 分钟'}），现在补上。`
+        : '[每日复盘] 今天到这儿了，花一分钟整理一下自己吧。');
       scheduleWakeV2(key, 'reflect');
-      log('[autonomy] 已安排每日复盘唤醒');
+      log(`[autonomy] ${lateMin > 20 ? `复盘补跑（迟到 ${lateMin} 分钟）` : '已安排每日复盘唤醒'}`);
     } catch (error) { log('[autonomy] 复盘调度失败: ' + (error?.message ?? error)); }
   }, 10 * 60 * 1000);
   if (reflectTimer.unref) reflectTimer.unref();
@@ -8327,6 +8460,39 @@ async function main() {
       db.prepare('UPDATE facts SET importance = ?, updated_at = ? WHERE id = ?').run(d.mi, now, d.keep);
       merged++;
     }
+    // 1b) P8-1b：近似重复合并——同一句话的不同版本（实测 #14/#20）只留信息量更大的一条。
+    // 判据用「包含度」而非 Jaccard：短版本的二元词几乎被长版本全覆盖 → 视为变体，阈值 0.85 偏保守。
+    // 删除是破坏性操作，所以逐条打日志可审计，并留 memory.nearDupMerge=false 关闭开关。
+    if (cfg.memory?.nearDupMerge !== false) {
+      try {
+        const rows = db.prepare('SELECT id, content, importance FROM facts ORDER BY id ASC').all();
+        const sig = (s) => new Set(toBigrams(String(s ?? '').slice(0, 120)).split(' ').filter(Boolean));
+        const dropped = new Set();
+        for (let i = 0; i < rows.length; i++) {
+          if (dropped.has(rows[i].id)) continue;
+          const si = sig(rows[i].content);
+          if (si.size < 4) continue;
+          for (let j = i + 1; j < rows.length; j++) {
+            if (dropped.has(rows[j].id)) continue;
+            const sj = sig(rows[j].content);
+            if (sj.size < 4) continue;
+            let inter = 0;
+            for (const g of si) if (sj.has(g)) inter++;
+            const containment = inter / Math.min(si.size, sj.size);
+            if (containment < 0.85) continue;
+            const keep = String(rows[j].content).length >= String(rows[i].content).length ? rows[j] : rows[i];
+            const lose = keep.id === rows[i].id ? rows[j] : rows[i];
+            dropped.add(lose.id);
+            const mi = Math.max(Number(keep.importance) || 1, Number(lose.importance) || 1);
+            db.prepare('DELETE FROM facts WHERE id = ?').run(lose.id);
+            db.prepare('UPDATE facts SET importance = ?, updated_at = ? WHERE id = ?').run(mi, now, keep.id);
+            log(`[memory] 近似重复合并：#${lose.id} → #${keep.id}（包含度 ${(containment * 100).toFixed(0)}%）`);
+            merged++;
+            if (keep.id !== rows[i].id) break; // i 被并入 j，换下一条
+          }
+        }
+      } catch (error) { log('[memory] 近似去重失败: ' + (error?.message ?? error)); }
+    }
     // 2) 低价值衰减：importance<=1 且超过 decayDays → 删除
     const decayDays = Math.max(14, Number(cfg.memory?.decayDays) || 60);
     decayed = (db.prepare('DELETE FROM facts WHERE importance <= 1 AND created_at < ?').run(now - decayDays * 86400000)?.changes) || 0;
@@ -8350,11 +8516,12 @@ async function main() {
       if (cfg.memory?.enabled === false || cfg.memory?.maintain === false) return;
       const nowD = new Date();
       const hour = Number.isFinite(Number(cfg.memory?.maintainHour)) ? Number(cfg.memory?.maintainHour) : 1;
-      if (nowD.getHours() !== hour) return;
-      const today = nowD.toISOString().slice(0, 10);
+      // P8-2：与复盘同修——凌晨 1 点机器不在线时不再整轮丢失，恢复后补跑（纯 DB 操作，不需要 DSH）
+      const sched = lastScheduledAt(hour, nowD);
       const autoM = readAutonomy();
-      if (autoM.lastMaintainDate === today) return;
-      autoM.lastMaintainDate = today;
+      if ((Number(autoM.lastMaintainAt) || 0) >= sched.getTime()) return;
+      autoM.lastMaintainAt = sched.getTime();
+      autoM.lastMaintainDate = sched.toISOString().slice(0, 10); // 兼容旧字段
       writeAutonomy(autoM);
       const r = runMemoryMaintenance();
       log(`[memory] 夜间维护：合并重复 ${r.merged} 组，清理低价值 ${r.decayed} 条，归档跟进 ${r.archived} 条`);
@@ -8569,7 +8736,11 @@ async function main() {
     if (wcTr.anyMessage) wcTriggers.push('任意消息');
     if (Number(wcTr.probability) > 0) wcTriggers.push(`概率${wcTr.probability}`);
     const wakeLine = `【当前唤醒】${wcMode}，${wcTime}${wcTriggers.length ? `；触发：${wcTriggers.join('/')}` : ''}\n\n`;
-    const base = roleLine + tokenLine + antiAiLine + proactiveLine + stickerLine + preSleepLine + statusLine + wakeLine + memoryLine + participationLine;
+    const factLines = recallFactLines(key, st, 4);
+    const factLine = factLines.length
+      ? `【相关记忆（自动想起的长期事实）】\n${factLines.join('\n')}\n（这些是你确实记过的，用得上就自然提起，别照着念清单；想翻更多用 qq_db_recall）\n\n`
+      : '';
+    const base = roleLine + tokenLine + antiAiLine + proactiveLine + stickerLine + preSleepLine + statusLine + wakeLine + memoryLine + factLine + participationLine;
     if (reason === 'reflect') {
       return `${base}【每日复盘】现在是今天的自我整理时间，不需要给任何人发消息（除非你确实想对主人说一句）。\n请按顺序做三件事：\n1) 回顾今天：用 qq_db_recall 看看近期记忆，用 qq_affinity(action=list) 看关系变化；\n2) 沉淀：值得长期记住的写进 qq_db_remember；对某人的观感变了就 qq_affinity(action=bump/set) 更新；对自己的新发现写 qq_self_note；\n3) 给明天留话头：想主动聊的话题/想问的事，用 qq_memory_append(category=pendingThought, extra.expiresAtMs=从现在到明早合适时间的毫秒数，一般 10~16 小时后过期) 记 1~2 条，明早被叫醒时你会自然带着这个话题开口；也可以 qq_set_reminder 设具体提醒。\n注意：已被移出或停用的群不要规划话题。做完用 qq_mark_read 或 qq_set_wake_config 正常收尾即可。`;
     }
@@ -8900,6 +9071,9 @@ async function main() {
     if (cfg.socialV2?.proactive?.enabled === false) return;
     if (socialV2.paused || currentMode !== 'reserved2') return;
     if (!isSessionAllowedInCurrentMode(key)) return;
+    // P8-3b：该群发送受阻（未解释的 result=120）冷却期内不主动冒泡——省 token，也避免空烧
+    const sbm = /^group:(\d+)$/.exec(key);
+    if (sbm && sendBlockActive(sbm[1])) return;
     const st = getSocialV2State(key);
     if (st.proactiveTimer) return;
     const p = cfg.socialV2?.proactive ?? {};
@@ -9943,6 +10117,54 @@ async function main() {
   });
   bot.on('close', (info) => log(`SnowLuma 连接断开（code=${info?.code ?? '?'}），重连中…`));
   bot.on('error', (error) => log('SnowLuma 错误:', error));
+
+  // ── P8-3a：QQ 客户端挂死自检 ───────────────────────────────────────────────
+  // 事故背景：9/23 23:05 鲸鲸的 QQ 客户端进程挂死（SnowLuma hook 8.3 小时收不到包），
+  // 但 OneBot WS 还连着、桥接毫无察觉，直到 9/24 07:55 会话关闭——她整晚发不出消息。
+  // 现在每 5 分钟探一次 get_login_info：连续 3 次失败/账号不符 → feedback + activity 报警
+  // （每 30 分钟最多一条，恢复时再报一次），让「账号侧死了但网关活着」这种半死状态可见。
+  // 只在启动后曾成功拿到过登录信息时才开始探（selfUserId 有值），避免维护期没登号时刷报警。
+  let qqProbeStrikes = 0;
+  let qqProbeDownSince = 0;
+  let qqProbeLastAlertAt = 0;
+  const qqProbeTimer = setInterval(async () => {
+    if (currentMode !== 'reserved2' || !selfUserId) return;
+    const expected = Number(cfg.botQQ ?? 0);
+    try {
+      const li = await Promise.race([
+        Promise.resolve(bot.getLoginInfo()),
+        new Promise((_, rej) => { const t = setTimeout(() => rej(new Error('get_login_info 15s 超时')), 15000); if (t.unref) t.unref(); })
+      ]);
+      const uid = Number(li?.user_id ?? 0);
+      if (uid && (!expected || uid === expected)) {
+        if (qqProbeDownSince) {
+          const downMin = Math.max(1, Math.round((Date.now() - qqProbeDownSince) / 60000));
+          log(`[qq-probe] QQ 账号已恢复（${uid}），本次中断约 ${downMin} 分钟`);
+          appendActivity(`QQ 账号恢复（中断约 ${downMin} 分钟）`);
+          appendFeedbackEntry({ id: Date.now().toString(36) + '-qprecover', key: 'system', level: 'info', message: `QQ 账号已恢复在线（中断约 ${downMin} 分钟）。中断期间她发不出消息，群里可能有没接上的话。`, time: new Date().toISOString() });
+        }
+        qqProbeStrikes = 0;
+        qqProbeDownSince = 0;
+        qqProbeLastAlertAt = 0;
+        return;
+      }
+      qqProbeStrikes++;
+      log(`[qq-probe] get_login_info 账号异常（user_id=${uid || '空'}，期望 ${expected || '未配置'}），第 ${qqProbeStrikes} 次`);
+    } catch (error) {
+      qqProbeStrikes++;
+      if (qqProbeStrikes <= 3 || qqProbeStrikes % 12 === 0) log(`[qq-probe] get_login_info 失败（第 ${qqProbeStrikes} 次）：${error?.message ?? error}`);
+    }
+    if (qqProbeStrikes < 3) return;
+    const nowP = Date.now();
+    if (!qqProbeDownSince) qqProbeDownSince = nowP;
+    if (nowP - qqProbeLastAlertAt < 30 * 60 * 1000) return;
+    qqProbeLastAlertAt = nowP;
+    const mins = Math.max(1, Math.round((nowP - qqProbeDownSince) / 60000));
+    log(`[qq-probe] ⚠️ QQ 客户端疑似挂死/掉线：连续 ${qqProbeStrikes} 次探测失败，已持续约 ${mins} 分钟`);
+    appendActivity(`⚠️ QQ 客户端探测失败 ${qqProbeStrikes} 次（约 ${mins} 分钟）`);
+    appendFeedbackEntry({ id: Date.now().toString(36) + '-qqprobe', key: 'system', level: 'error', message: `QQ 客户端疑似挂死/掉线：get_login_info 连续 ${qqProbeStrikes} 次失败（约 ${mins} 分钟）。OneBot 网关可能还活着，但账号侧已不能收发——需要人工重登 QQ 客户端（机器人账号 ${cfg.botQQ || selfUserId}）。这段时间她发不出任何消息。`, time: new Date().toISOString() });
+  }, 5 * 60 * 1000);
+  if (qqProbeTimer.unref) qqProbeTimer.unref();
 
   // SnowLuma 尚未就绪时不阻塞桥接启动：SDK 自带后台重连，DSH 侧照常连接。
   bot.connect().catch((error) => {
