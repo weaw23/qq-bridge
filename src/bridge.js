@@ -10128,41 +10128,46 @@ async function main() {
   let qqProbeDownSince = 0;
   let qqProbeLastAlertAt = 0;
   const qqProbeTimer = setInterval(async () => {
-    if (currentMode !== 'reserved2' || !selfUserId) return;
-    const expected = Number(cfg.botQQ ?? 0);
+    // 整体兜底：这是 async 回调，任何未捕获异常都会变成 unhandled rejection（Node 22 默认直接终止进程）
     try {
-      const li = await Promise.race([
-        Promise.resolve(bot.getLoginInfo()),
-        new Promise((_, rej) => { const t = setTimeout(() => rej(new Error('get_login_info 15s 超时')), 15000); if (t.unref) t.unref(); })
-      ]);
-      const uid = Number(li?.user_id ?? 0);
-      if (uid && (!expected || uid === expected)) {
-        if (qqProbeDownSince) {
-          const downMin = Math.max(1, Math.round((Date.now() - qqProbeDownSince) / 60000));
-          log(`[qq-probe] QQ 账号已恢复（${uid}），本次中断约 ${downMin} 分钟`);
-          appendActivity(`QQ 账号恢复（中断约 ${downMin} 分钟）`);
-          appendFeedbackEntry({ id: Date.now().toString(36) + '-qprecover', key: 'system', level: 'info', message: `QQ 账号已恢复在线（中断约 ${downMin} 分钟）。中断期间她发不出消息，群里可能有没接上的话。`, time: new Date().toISOString() });
+      if (currentMode !== 'reserved2' || !selfUserId) return;
+      const expected = Number(cfg.botQQ ?? 0);
+      try {
+        const li = await Promise.race([
+          Promise.resolve(bot.getLoginInfo()),
+          new Promise((_, rej) => { const t = setTimeout(() => rej(new Error('get_login_info 15s 超时')), 15000); if (t.unref) t.unref(); })
+        ]);
+        const uid = Number(li?.user_id ?? 0);
+        if (uid && (!expected || uid === expected)) {
+          if (qqProbeDownSince) {
+            const downMin = Math.max(1, Math.round((Date.now() - qqProbeDownSince) / 60000));
+            log(`[qq-probe] QQ 账号已恢复（${uid}），本次中断约 ${downMin} 分钟`);
+            appendActivity(`QQ 账号恢复（中断约 ${downMin} 分钟）`);
+            appendFeedbackEntry({ id: Date.now().toString(36) + '-qprecover', key: 'system', level: 'info', message: `QQ 账号已恢复在线（中断约 ${downMin} 分钟）。中断期间她发不出消息，群里可能有没接上的话。`, time: new Date().toISOString() });
+          }
+          qqProbeStrikes = 0;
+          qqProbeDownSince = 0;
+          qqProbeLastAlertAt = 0;
+          return;
         }
-        qqProbeStrikes = 0;
-        qqProbeDownSince = 0;
-        qqProbeLastAlertAt = 0;
-        return;
+        qqProbeStrikes++;
+        log(`[qq-probe] get_login_info 账号异常（user_id=${uid || '空'}，期望 ${expected || '未配置'}），第 ${qqProbeStrikes} 次`);
+      } catch (error) {
+        qqProbeStrikes++;
+        if (qqProbeStrikes <= 3 || qqProbeStrikes % 12 === 0) log(`[qq-probe] get_login_info 失败（第 ${qqProbeStrikes} 次）：${error?.message ?? error}`);
       }
-      qqProbeStrikes++;
-      log(`[qq-probe] get_login_info 账号异常（user_id=${uid || '空'}，期望 ${expected || '未配置'}），第 ${qqProbeStrikes} 次`);
+      if (qqProbeStrikes < 3) return;
+      const nowP = Date.now();
+      if (!qqProbeDownSince) qqProbeDownSince = nowP;
+      if (nowP - qqProbeLastAlertAt < 30 * 60 * 1000) return;
+      qqProbeLastAlertAt = nowP;
+      const mins = Math.max(1, Math.round((nowP - qqProbeDownSince) / 60000));
+      log(`[qq-probe] ⚠️ 账号侧探测失败：连续 ${qqProbeStrikes} 次，已持续约 ${mins} 分钟`);
+      appendActivity(`⚠️ QQ 账号探测失败 ${qqProbeStrikes} 次（约 ${mins} 分钟）`);
+      appendFeedbackEntry({ id: Date.now().toString(36) + '-qqprobe', key: 'system', level: 'error', message: `QQ 账号侧探测失败：get_login_info 连续 ${qqProbeStrikes} 次不成功（约 ${mins} 分钟）。可能是 QQ 客户端挂死/掉登录，也可能是 OneBot 网关不可达——请检查 QQ 客户端（机器人账号 ${cfg.botQQ || selfUserId}）是否还在登录状态、SnowLuma 是否在跑。这段时间她发不出任何消息。`, time: new Date().toISOString() });
     } catch (error) {
-      qqProbeStrikes++;
-      if (qqProbeStrikes <= 3 || qqProbeStrikes % 12 === 0) log(`[qq-probe] get_login_info 失败（第 ${qqProbeStrikes} 次）：${error?.message ?? error}`);
+      log('[qq-probe] 自检异常: ' + (error?.message ?? error));
     }
-    if (qqProbeStrikes < 3) return;
-    const nowP = Date.now();
-    if (!qqProbeDownSince) qqProbeDownSince = nowP;
-    if (nowP - qqProbeLastAlertAt < 30 * 60 * 1000) return;
-    qqProbeLastAlertAt = nowP;
-    const mins = Math.max(1, Math.round((nowP - qqProbeDownSince) / 60000));
-    log(`[qq-probe] ⚠️ QQ 客户端疑似挂死/掉线：连续 ${qqProbeStrikes} 次探测失败，已持续约 ${mins} 分钟`);
-    appendActivity(`⚠️ QQ 客户端探测失败 ${qqProbeStrikes} 次（约 ${mins} 分钟）`);
-    appendFeedbackEntry({ id: Date.now().toString(36) + '-qqprobe', key: 'system', level: 'error', message: `QQ 客户端疑似挂死/掉线：get_login_info 连续 ${qqProbeStrikes} 次失败（约 ${mins} 分钟）。OneBot 网关可能还活着，但账号侧已不能收发——需要人工重登 QQ 客户端（机器人账号 ${cfg.botQQ || selfUserId}）。这段时间她发不出任何消息。`, time: new Date().toISOString() });
   }, 5 * 60 * 1000);
   if (qqProbeTimer.unref) qqProbeTimer.unref();
 
