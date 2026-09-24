@@ -23,6 +23,8 @@ QQ 消息 ──► SnowLuma（OneBot v11 WS）──► 本桥接进程 ──�
 📽️ [AI 仿真群友 - 项目介绍视频](https://github.com/Derpyu520/qq-bridge/releases/download/v0.1.5/project-intro.mp4)（约 11 MB）
 
 > 视频改由 **Release 附件**托管，不在仓库里——只想安装桥接的人不必再下载这 11 MB（它此前占整个仓库体积的 88%）。
+>
+> 📌 本仓库已从 `Derpyu520/qq-bridge` 迁到 `weaw23/qq-bridge`。**代码与 tag 已完整迁移**，但 Release 附件（介绍视频等二进制）无法随 git 推送转移，仍托管在原仓库，故上文链接仍指向 `Derpyu520`——这不是笔误。
 
 ## 架构
 
@@ -110,7 +112,7 @@ node scripts/setup-dsh.mjs
 
 2. **装桥接并复制配置**
    ```bash
-   git clone https://github.com/Derpyu520/qq-bridge.git
+   git clone https://github.com/weaw23/qq-bridge.git
    cd qq-bridge
    npm install
    ```
