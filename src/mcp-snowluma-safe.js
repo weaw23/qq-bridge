@@ -1519,7 +1519,7 @@ if (getConfig().pcControl?.enabled !== false) {
 
   server.tool(
     'pc_run_command',
-    '执行 PowerShell 并回传输出（最高权限）。仅主人私聊。',
+    '执行 PowerShell 并回传输出（最高权限，超时上限 120 秒）。输出超 12000 字符会截断，但全文落盘并回传路径，可用 Get-Content 分页读。要跑更久的活请用 pc_job_start。仅主人私聊。',
     {
       key: z.string().describe('必须为 private:1918594889（主人私聊）'),
       token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
@@ -1531,6 +1531,160 @@ if (getConfig().pcControl?.enabled !== false) {
       if (deny) return { content: [{ type: 'text', text: deny }], isError: true };
       const r = await pc.runCommand(command, timeoutSec);
       return { content: [{ type: 'text', text: r.ok ? r.output : '执行失败：' + r.error }], isError: r.ok === false };
+    }
+  );
+
+  // ── 打字与组合键 ──────────────────────────────────────────────────────────
+  server.tool(
+    'pc_type_text',
+    '在「当前前台窗口」里打字，支持中文。打之前先用 pc_window 把焦点对准目标窗口，否则会打到别处。仅主人私聊。',
+    {
+      key: z.string().describe('必须为 private:1918594889（主人私聊）'),
+      token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
+      text: z.string().describe('要打的字，单次上限 4000 字符（更长请分段，或改用剪贴板粘贴）')
+    },
+    async ({ key, token, text }) => {
+      const deny = await pcGate(key, token);
+      if (deny) return { content: [{ type: 'text', text: deny }], isError: true };
+      const r = await pc.typeText(text);
+      return { content: [{ type: 'text', text: JSON.stringify(r, null, 2) }], isError: r.ok === false };
+    }
+  );
+
+  server.tool(
+    'pc_send_keys',
+    '发组合键/功能键，如 ctrl+s、alt+tab、win+d、ctrl+shift+esc、f5、enter。仅主人私聊。',
+    {
+      key: z.string().describe('必须为 private:1918594889（主人私聊）'),
+      token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
+      combo: z.string().describe('键名用 + 连接：修饰键 ctrl/alt/shift/win + 一个主键。主键支持 a-z、0-9、f1-f24、enter/tab/esc/space/del/ins/home/end/pgup/pgdn/上下左右'),
+      times: z.number().optional().describe('重复次数 1-20，默认 1')
+    },
+    async ({ key, token, combo, times }) => {
+      const deny = await pcGate(key, token);
+      if (deny) return { content: [{ type: 'text', text: deny }], isError: true };
+      const r = await pc.sendKeys(combo, times ?? 1);
+      return { content: [{ type: 'text', text: JSON.stringify(r, null, 2) }], isError: r.ok === false };
+    }
+  );
+
+  // ── 窗口管理 ──────────────────────────────────────────────────────────────
+  server.tool(
+    'pc_list_windows',
+    '列出当前有标题的窗口（pid / 进程名 / 标题）。仅主人私聊。',
+    {
+      key: z.string().describe('必须为 private:1918594889（主人私聊）'),
+      token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）')
+    },
+    async ({ key, token }) => {
+      const deny = await pcGate(key, token);
+      if (deny) return { content: [{ type: 'text', text: deny }], isError: true };
+      const r = await pc.listWindows();
+      return { content: [{ type: 'text', text: r.ok ? r.output : '查询失败：' + r.error }], isError: r.ok === false };
+    }
+  );
+
+  server.tool(
+    'pc_window',
+    '操作窗口：focus 聚焦 / minimize 最小化 / maximize 最大化 / restore 还原 / close 礼貌关闭（不强杀，程序有未保存内容会自己弹框）。仅主人私聊。',
+    {
+      key: z.string().describe('必须为 private:1918594889（主人私聊）'),
+      token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
+      target: z.string().describe('窗口 PID，或窗口标题里的关键词（取第一个匹配）'),
+      action: z.string().describe('focus | minimize | maximize | restore | close')
+    },
+    async ({ key, token, target, action }) => {
+      const deny = await pcGate(key, token);
+      if (deny) return { content: [{ type: 'text', text: deny }], isError: true };
+      const r = await pc.windowAction(target, action);
+      return { content: [{ type: 'text', text: r.ok ? r.output : '操作失败：' + r.error }], isError: r.ok === false };
+    }
+  );
+
+  // ── 剪贴板 ────────────────────────────────────────────────────────────────
+  server.tool(
+    'pc_clipboard',
+    '读写剪贴板。读到的内容可能含密码等敏感信息：只用于当前任务，绝不转发到任何群聊、也别写进记忆。仅主人私聊。',
+    {
+      key: z.string().describe('必须为 private:1918594889（主人私聊）'),
+      token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
+      action: z.string().describe('get 读 | set 写（会覆盖原内容，不做备份）'),
+      text: z.string().optional().describe('action=set 时要写入的内容，上限 20000 字符')
+    },
+    async ({ key, token, action, text }) => {
+      const deny = await pcGate(key, token);
+      if (deny) return { content: [{ type: 'text', text: deny }], isError: true };
+      const r = await pc.clipboard(action, text);
+      // get 返回 output 字符串，set 返回 chars；note 只拼一次，别和 JSON 里的重复
+      const body = r.ok
+        ? [r.output ?? `已写入剪贴板 ${r.chars ?? 0} 字符`, r.note ? '（' + r.note + '）' : ''].filter(Boolean).join('\n')
+        : '剪贴板操作失败：' + r.error;
+      return { content: [{ type: 'text', text: body }], isError: r.ok === false };
+    }
+  );
+
+  // ── 后台长任务 ────────────────────────────────────────────────────────────
+  server.tool(
+    'pc_job_start',
+    '后台跑长命令（构建、批量转码、大文件处理），不受 120 秒限制，最长 180 分钟。立刻返回 jobId，不占用当前回合。仅主人私聊。',
+    {
+      key: z.string().describe('必须为 private:1918594889（主人私聊）'),
+      token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
+      command: z.string().describe('要后台执行的 PowerShell 命令'),
+      maxMinutes: z.number().optional().describe('最长允许分钟数 1-180，默认 30，超时强制结束')
+    },
+    async ({ key, token, command, maxMinutes }) => {
+      const deny = await pcGate(key, token);
+      if (deny) return { content: [{ type: 'text', text: deny }], isError: true };
+      const r = await pc.startJob(command, maxMinutes ?? 30);
+      return { content: [{ type: 'text', text: JSON.stringify(r, null, 2) }], isError: r.ok === false };
+    }
+  );
+
+  server.tool(
+    'pc_job_status',
+    '查后台任务进度：状态、已耗时、输出尾部（边跑边落盘，运行中也能看到进度）。仅主人私聊。',
+    {
+      key: z.string().describe('必须为 private:1918594889（主人私聊）'),
+      token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
+      jobId: z.string().describe('pc_job_start 返回的 jobId')
+    },
+    async ({ key, token, jobId }) => {
+      const deny = await pcGate(key, token);
+      if (deny) return { content: [{ type: 'text', text: deny }], isError: true };
+      const r = await pc.jobStatus(jobId);
+      return { content: [{ type: 'text', text: JSON.stringify(r, null, 2) }], isError: r.ok === false };
+    }
+  );
+
+  server.tool(
+    'pc_job_kill',
+    '中止后台任务。仅主人私聊。',
+    {
+      key: z.string().describe('必须为 private:1918594889（主人私聊）'),
+      token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
+      jobId: z.string().describe('要中止的 jobId')
+    },
+    async ({ key, token, jobId }) => {
+      const deny = await pcGate(key, token);
+      if (deny) return { content: [{ type: 'text', text: deny }], isError: true };
+      const r = await pc.jobKill(jobId);
+      return { content: [{ type: 'text', text: JSON.stringify(r, null, 2) }], isError: r.ok === false };
+    }
+  );
+
+  server.tool(
+    'pc_job_list',
+    '列出所有后台任务（注册表落盘，桥接重启后仍能查到历史）。仅主人私聊。',
+    {
+      key: z.string().describe('必须为 private:1918594889（主人私聊）'),
+      token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）')
+    },
+    async ({ key, token }) => {
+      const deny = await pcGate(key, token);
+      if (deny) return { content: [{ type: 'text', text: deny }], isError: true };
+      const r = await pc.jobList();
+      return { content: [{ type: 'text', text: JSON.stringify(r, null, 2) }], isError: r.ok === false };
     }
   );
 }
