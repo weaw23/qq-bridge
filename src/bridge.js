@@ -77,6 +77,9 @@ import {
   STICKER_STATES,
   STICKER_COLD_FAMILIARITY
 } from './sticker-lib.js';
+// L2 唤醒节流：给群打开「每条消息都看」(triggers.anyMessage) 之后，唤醒次数会逼近消息数，
+// 必须有频率帽 + 发言后冷却。判定逻辑全部在纯函数模块里（可以离线穷举），这里只做调用与日志。
+import { wakeThrottleVerdict, WAKE_SPEAK_COOLDOWN_MS } from './wake-throttle.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, '..');
@@ -3117,7 +3120,11 @@ async function main() {
           const st = getSocialV2State(key);
           // 如果当前已经是“潜水”唤醒配置，且最近还有对话/刚被唤醒，不允许用 mark_read 直接回到潜水；
           // 必须先等够沉睡前观察窗口，避免“聊两句又去潜水”。
-          if (isSleepingConfigV2(st.wakeConfig) && preSleepWaitBlockedV2(st)) {
+          // 但**管理员（控制台令牌、不带 agent 令牌）不受这条限制**，与上方三条守卫、以及本文件
+          // 其余所有路由的 `if (header && ...)` 管理员直通惯例保持一致：这条守卫要拦的是 AI
+          // 自己冲动收尾，不是运维用控制台收尾。对活跃会话，无条件拦会把控制台也一起锁死。
+          const isAdminMarkRead = !req.headers['x-agent-token'];
+          if (!isAdminMarkRead && isSleepingConfigV2(st.wakeConfig) && preSleepWaitBlockedV2(st)) {
             const preSleepMs = Math.max(0, Number(cfg.socialV2?.wake?.preSleepWaitMs) || 300000);
             const remaining = Math.max(0, preSleepMs - ((st.lastIncomingAt || 0) ? Date.now() - st.lastIncomingAt : 0));
             const remainMin = Math.ceil(remaining / 60000);
@@ -3167,11 +3174,24 @@ async function main() {
                 ? rawKeywords.map((k) => String(k ?? '').trim()).filter(Boolean).slice(0, 50).map((k) => k.slice(0, 100))
                 : [])
             : (Array.isArray(current.triggers.keywords) ? current.triggers.keywords.slice(0, 50).map((k) => String(k).slice(0, 100)) : []);
+          // L2 节流三参数：只接受「非负整数」，非法值（负数/NaN/字符串乱写）一律保留原值
+          // ——既不写脏值，也不当成 0（0 的语义是「不限」，会意外把限制全放开）。
+          // 从没传过就是 undefined，保持 undefined，这样 sendWakePromptV2 里的
+          // `st.wakeConfig?.x ?? cfg.socialV2?.wake?.x` 才会正确回落到全局默认。
+          // 传 null = 显式清除该会话的覆盖、退回全局默认。没有这条，「按会话覆盖」
+          // 就是个只能拧紧不能松的旋钮：一旦设过，想退回全局值只剩手改
+          // state/social-v2.json 一条路。注意 Number(null) === 0，所以必须先判 null，
+          // 否则 null 会被当成 0（= 不限），把限制悄悄全放开。
+          const numOr = (v, fallback) => (v === null ? undefined : (Number.isFinite(Number(v)) && Number(v) >= 0 ? Math.round(Number(v)) : fallback));
           const next = {
             ...current,
             mode: input.mode === 'active' ? 'active' : input.mode === 'diving' ? 'diving' : current.mode,
             infinite: typeof input.infinite === 'boolean' ? input.infinite : current.infinite,
             sleepUntil: current.sleepUntil,
+            // 按会话覆盖的唤醒节流（见 src/wake-throttle.js）。大群单独压小，别动全局值。
+            maxWakePerMinute: numOr(input.maxWakePerMinute, current.maxWakePerMinute),
+            maxWakePerHour: numOr(input.maxWakePerHour, current.maxWakePerHour),
+            speakCooldownMs: numOr(input.speakCooldownMs, current.speakCooldownMs),
             triggers: {
               ...current.triggers,
               ...inputTriggers,
@@ -3187,8 +3207,15 @@ async function main() {
               : current.batchWindowMs
           };
           // 从 active 切回 diving 时，若 AI 没显式保留 anyMessage，则清除，避免“潜水=每条都唤醒”的语义矛盾。
-          if (next.mode === 'diving' && !('anyMessage' in inputTriggers)) {
+          // ★ 只在**真的发生模式切换**时才清除。原写法是「只要 next.mode 是 diving 就无条件清除」，
+          //   比它自己注释里说的范围大得多：后果是任何一次与触发条件无关的写入（例如只调
+          //   按会话的唤醒节流参数、或只改 batchWindowMs）都会把 anyMessage 悄悄关掉。
+          //   主人明确为某个大群配置的「每条消息都看」＝ diving + anyMessage=true + 按会话频率帽，
+          //   会因此无声失效，表现为「配好了，过一阵又只看被 @ 的了」——排查起来毫无线索。
+          //   diving → diving 的写入不该动 anyMessage；真要关，就显式带 triggers.anyMessage=false。
+          if (current.mode !== 'diving' && next.mode === 'diving' && !('anyMessage' in inputTriggers)) {
             next.triggers.anyMessage = false;
+            log(`[reserved2] ${key} 从 ${current.mode} 切回 diving 且未显式保留 anyMessage，已清除该触发条件（想保留就在同一次写入里带 triggers.anyMessage=true）`);
           }
           if (next.mode === 'active') {
             next.infinite = true;
@@ -3251,7 +3278,14 @@ async function main() {
             }
           }
           // 沉睡前强制观察窗口：除非对方明确结束、或已经安静/等待足够时间，否则不允许 AI 聊两句就设置潜水。
-          if (isSleepingConfigV2(next) && preSleepWaitBlockedV2(st)) {
+          // 但**管理员（控制台令牌、不带 agent 令牌）不受这条限制**：本路由其余守卫全是
+          // `if (header && ...)` 形式（管理员直通），只有这一条漏了，后果是在一个活跃群里
+          // 改任何唤醒参数都会被 400 挡住——而 134 人的群几乎不可能安静满 5 分钟，
+          // 等于把「按会话调唤醒参数」这个功能彻底锁死。错误文案还在让「你」去调
+          // qq_wait_for_messages，可操作者是人、根本没有这个工具。
+          // 这条守卫的立意是拦 AI 冲动潜水，不是拦运维改配置，所以按同一惯例放行管理员。
+          const isAdminCall = !req.headers['x-agent-token'];
+          if (!isAdminCall && isSleepingConfigV2(next) && preSleepWaitBlockedV2(st)) {
             const preSleepMs = Math.max(0, Number(cfg.socialV2?.wake?.preSleepWaitMs) || 300000);
             const remaining = Math.max(0, preSleepMs - ((st.lastIncomingAt || 0) ? Date.now() - st.lastIncomingAt : 0));
             const remainMin = Math.ceil(remaining / 60000);
@@ -7281,7 +7315,15 @@ async function main() {
       wakeCount: old.wakeCount || 0,
       noActionCount: old.noActionCount || 0,
       confirmedAt: old.confirmedAt || 0,
-      confirmedBy: 'default'
+      confirmedBy: 'default',
+      // L2 节流三参数不来自 defaultWakeConfigV2()（它只写 mode/infinite/sleepUntil/
+      // triggers/batchWindowMs），而是「按会话单独设的覆盖值，没设就是 undefined →
+      // 回落到全局 cfg.socialV2.wake」。所以这里必须显式原样搬过来：
+      // 这个函数会把整个对象重建一遍，不搬就等于每次「保存推荐参数」都把大群的
+      // 节流覆盖悄悄抹掉，表现为「配了 2 次/分，过几天又变成不设防」。
+      maxWakePerMinute: old.maxWakePerMinute,
+      maxWakePerHour: old.maxWakePerHour,
+      speakCooldownMs: old.speakCooldownMs
     };
     return true;
   }
@@ -9547,14 +9589,40 @@ async function main() {
       log(`[reserved2] 会话繁忙，暂存唤醒原因 ${key}（${reason}@seq${seq}）`);
       return;
     }
-    // 唤醒频率硬限制：超限则跳过本次唤醒，避免成本失控
+    // ── L2 唤醒节流 ────────────────────────────────────────────────
+    // 两道互相独立的约束，判定逻辑全部在 src/wake-throttle.js（纯函数，可离线穷举）：
+    //   ① 频率帽 maxWakePerMinute / maxWakePerHour —— 对所有唤醒原因生效，是硬上限。
+    //      **支持按会话覆盖**：st.wakeConfig 优先于全局 cfg.socialV2.wake。
+    //      理由：给某个 134 人的大群打开「每条消息都看」（triggers.anyMessage）之后，
+    //      它的唤醒次数会逼近消息条数；全局 20/200 对它等于不设防，但直接调小全局值
+    //      又会把主人私聊也一起限死。所以按会话单独压。
+    //   ② 发言后冷却 speakCooldownMs —— 只对「闲聊类」原因生效（群里有人随便说了句话）。
+    //      被 @、被提问、被叫名字、被拍、定时提醒、待跟进、主动关怀一律直通：
+    //      她刚说完话不代表别人叫她时可以不理。常量表见 AMBIENT_WAKE_REASONS。
     const now = Date.now();
-    const maxPerMinute = Number(cfg.socialV2?.wake?.maxWakePerMinute) || 0;
-    const maxPerHour = Number(cfg.socialV2?.wake?.maxWakePerHour) || 0;
-    const recentMinute = (st.wakeTimes || []).filter((t) => now - t < 60000).length;
-    const recentHour = (st.wakeTimes || []).filter((t) => now - t < 3600000).length;
-    if ((maxPerMinute > 0 && recentMinute >= maxPerMinute) || (maxPerHour > 0 && recentHour >= maxPerHour)) {
-      log(`[reserved2] 唤醒频率超限，跳过 ${key}（${reason}）`);
+    const throttle = wakeThrottleVerdict({
+      reason,
+      wakeTimes: st.wakeTimes,
+      sendTimes: st.sendTimes,
+      now,
+      maxPerMinute: st.wakeConfig?.maxWakePerMinute ?? cfg.socialV2?.wake?.maxWakePerMinute,
+      maxPerHour: st.wakeConfig?.maxWakePerHour ?? cfg.socialV2?.wake?.maxWakePerHour,
+      speakCooldownMs: st.wakeConfig?.speakCooldownMs ?? cfg.socialV2?.wake?.speakCooldownMs ?? WAKE_SPEAK_COOLDOWN_MS
+    });
+    if (!throttle.ok) {
+      // throttle.park 只在「被频率帽拦住、且不是闲聊类」时为 true：
+      // 有人点她、或她自己约好的事被限流了，不能就这么算了，暂存等当前回合结束补发
+      // （复用上面「会话繁忙」那套 pendingWakeReasons，重放逻辑在 10600 行附近）。
+      // 闲聊类则直接丢 —— 被限流时丢掉闲聊正是节流的目的。
+      if (throttle.park) {
+        if (!Array.isArray(st.pendingWakeReasons)) st.pendingWakeReasons = [];
+        const seq = st.lastUnreadSeq || 0;
+        if (!st.pendingWakeReasons.some((r) => r && r.reason === reason && r.seq === seq)) {
+          st.pendingWakeReasons.push({ reason, seq });
+          if (st.pendingWakeReasons.length > 20) st.pendingWakeReasons.splice(0, st.pendingWakeReasons.length - 20);
+        }
+      }
+      log(`[reserved2] 唤醒节流命中（${throttle.stage}）${throttle.park ? '暂存' : '跳过'} ${key}（${reason}）：${throttle.detail}`);
       return;
     }
     cancelReplyCheckV2(key); // 本次唤醒已接管，清理仍在排队的回复检查
@@ -9672,6 +9740,10 @@ async function main() {
   const WAKE_PRIORITY = {
     private: 100,
     atMention: 90,
+    // 被拍一拍必须高于 question/anyMessage：拍她是一个明确的「叫你看一下」动作。
+    // 而命中拍一拍时 reason 恰好就是 'poke'，高于 anyMessage 才能避免它被当成
+    // 「群里随便有人说了句话」处理 —— 那样开了 anyMessage 之后会被发言后冷却挡掉。
+    poke: 85,
     question: 80,
     speaker: 75,
     nameMention: 70,
