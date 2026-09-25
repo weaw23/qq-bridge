@@ -880,20 +880,51 @@ if (cfg.socialV2?.sticker?.enabled !== false && cfg.socialV2?.tools?.listSticker
     {
       key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
       token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
-      query: z.string().optional().describe('可选搜索词，按备注/本地笔记/标签/用法过滤'),
+      query: z.string().optional().describe('可选搜索词，按意思搜（备注/笔记/标签/用法，含同义词扩展：「嘲讽」也能搜到标了「阴阳怪气」的那张）'),
+      state: z.string().optional().describe('可选三态过滤：visible（默认，收藏+待整理）/ fav 收藏 / pending 待整理 / trash 回收站 / all 全部'),
       count: z.number().optional().describe('最多返回条数，默认 48，受 socialV2.sticker.maxListCount 配置上限约…'),
       refresh: z.boolean().optional().describe('是否强制从 QQ 重新同步收藏表情，默认 false（走缓存）')
     },
-    async ({ key, token, query, count, refresh }) => {
+    async ({ key, token, query, state, count, refresh }) => {
       try {
         const q = new URLSearchParams({ key });
         if (query) q.set('query', String(query));
+        if (state) q.set('state', String(state));
         if (count != null) q.set('count', String(count));
         if (refresh) q.set('refresh', '1');
         const data = await agentApi(`/api/socialV2/sticker-list?${q.toString()}`, { headers: { 'x-agent-token': token } });
         return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
       } catch (error) {
         return { content: [{ type: 'text', text: `获取表情列表失败：${error?.message ?? error}` }], isError: true };
+      }
+    }
+  );
+}
+
+// P1-5 三态切换。只有「收藏」能发出去，所以这是她整理图库的必备动作：
+//   待整理 → 收藏 = 看过图、写好了标签，宣布「我认识这张了」；
+//   收藏 → 回收站 = 软删除（不碰 QQ 端，用过的次数和当时的语境都留着，随时能捞回来）；
+//   回收站 → 收藏 = 恢复。
+if (cfg.socialV2?.sticker?.enabled !== false && cfg.socialV2?.tools?.stickerState !== false) {
+  server.tool(
+    'qq_sticker_state',
+    '改表情的三态：pending 待整理 / fav 收藏（能发） / trash 回收站。',
+    {
+      key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
+      token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
+      stickerId: z.string().describe('表情标识：emoji_id / md5 / 图片 URL（来自 qq_list_stickers）'),
+      state: z.string().describe('目标状态：pending 待整理 | fav 收进收藏（之后就能发） | trash 丢进回收站（软删除，可恢复）')
+    },
+    async ({ key, token, stickerId, state }) => {
+      try {
+        const data = await agentApi('/api/socialV2/sticker-state', {
+          method: 'POST',
+          body: JSON.stringify({ key, stickerId: String(stickerId), state: String(state) }),
+          headers: { 'x-agent-token': token }
+        });
+        return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
+      } catch (error) {
+        return { content: [{ type: 'text', text: `切换表情状态失败：${error?.message ?? error}` }], isError: true };
       }
     }
   );

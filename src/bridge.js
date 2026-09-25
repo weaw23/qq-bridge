@@ -62,12 +62,20 @@ import {
   saveStickerStore,
   mergeStickerLibrary,
   findSticker,
-  formatStickerList,
   buildStickerContext,
   buildStickerStrategyHint,
   applyStickerNote,
   markStickerUsed,
-  stickerRepeatBlocked
+  stickerRepeatBlocked,
+  searchStickers,
+  stickerSendable,
+  setStickerState,
+  stickerColdChannel,
+  stickerStateCounts,
+  normalizeStickerState,
+  stickerStateLabel,
+  STICKER_STATES,
+  STICKER_COLD_FAMILIARITY
 } from './sticker-lib.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -790,10 +798,15 @@ async function main() {
   }
 
   // 返回给 AI 的表情列表（带本地认知）。
-  async function listStickersForV2(query = '', count = 48, force = false) {
+  // P1-5：改成走语义检索（同义词扩展 + 打分），并默认只给「收藏 + 待整理」两种状态。
+  async function listStickersForV2(query = '', count = 48, force = false, state = 'visible') {
     const synced = await syncStickerLibrary(force);
     const entries = synced?.entries ?? stickerEntries;
-    return formatStickerList(entries, query, count);
+    return searchStickers(entries, query, {
+      limit: count,
+      state,
+      extraSynonyms: cfg.socialV2?.sticker?.synonyms ?? {}
+    });
   }
 
   // 取单个表情的图片字节（多模态用）。
@@ -899,6 +912,18 @@ async function main() {
     return updated.entry;
   }
 
+  // P1-5 三态切换：待整理 → 收藏 / 收藏 → 回收站 / 回收站 → 收藏（恢复）。
+  // 只动本地库，不碰 QQ 端 —— 删除是软删除，用过的次数和当时的语境都留着。
+  function applyStickerStateV2(stickerId, state) {
+    const updated = setStickerState(stickerEntries, stickerId, state);
+    if (!updated.entry) return null;
+    if (updated.changed) {
+      stickerEntries = updated.entries;
+      saveStickerStoreSafe();
+    }
+    return updated.entry;
+  }
+
   // 修改 QQ 账号里的收藏表情备注（modify_custom_face），并同步本地 desc。
   async function setStickerRemarkV2(stickerId, remark) {
     const synced = await syncStickerLibrary(false);
@@ -971,6 +996,12 @@ async function main() {
     // 强制刷新本地库，让刚收藏的表情立即可用。
     const synced = await syncStickerLibrary(true);
     const entry = findSticker(synced?.entries ?? stickerEntries, emojiId);
+    // P1-5：主动收藏进来的图直接算「收藏」—— 她亲手挑一张图这件事本身就是一次整理。
+    // （只有从 QQ 端被动同步进来、本地一次都没看过的那批才会落在「待整理」。）
+    if (entry && normalizeStickerState(entry.state) === 'pending') {
+      const promoted = applyStickerStateV2(entry.id, 'fav');
+      return { emojiId, entry: promoted || entry, remark: cleanRemark };
+    }
     return { emojiId, entry: entry || null, remark: cleanRemark };
   }
 
@@ -3795,31 +3826,73 @@ async function main() {
           const now = Date.now();
           try {
             const st = getSocialV2State(key);
+            // 解析一次，后面三道闸门都用它。只能用模块级 stickerEntries —— `synced` 只存在于
+            // getStickerImageData / 表情列表路由等函数的局部作用域，本路由里引用它会直接
+            // ReferenceError（被外层 catch 吞成 500，表面看像「QQ 发图失败」），而 stickerEntries
+            // 是本地已落盘的那一份，正是「这张图是什么状态」「上一张发的是什么」的依据。
+            const resolvedSticker = findSticker(stickerEntries, stickerId);
             // P0-2 同图不连发：连着两张一模一样的表情包最像机器人，真人不会这么干。
             // 比对用「解析后的 id / md5」，而不是用户传来的原始 stickerId —— 同一张图允许用
             // id / md5 / url 三种写法传入，只比原串会被换个写法绕过。
             // 语义是「上一张不同才算翻篇」：中间发了别的表情就解锁，中间只发文字不解锁。
             {
-              // 注意：这里只能用模块级 stickerEntries —— `synced` 只存在于 getStickerImageData /
-              // 表情列表路由等函数的局部作用域，本路由里引用它会直接 ReferenceError（被外层 catch
-              // 吞成 500，表面看像「QQ 发图失败」），而 stickerEntries 是本地已落盘的那一份，
-              // 正是「上一张发的是什么」的依据。
-              // findSticker 负责解析 id/md5/url 三种写法，比对逻辑在纯函数 stickerRepeatBlocked 里
-              // （所有分叉离线穷举，见 ops/test-proactive-quota.mjs）；解析不出来时退回原串，
-              // 否则「刚发过的那张」用原样 id 再发一次会漏过。
-              const resolved = findSticker(stickerEntries, stickerId);
-              const { blocked: same, rid } = stickerRepeatBlocked(resolved ?? { id: stickerId }, st.lastStickerId, st.lastStickerMd5);
+              const { blocked: same, rid } = stickerRepeatBlocked(resolvedSticker ?? { id: stickerId }, st.lastStickerId, st.lastStickerMd5);
               if (same) {
                 // 顺手给几个替代选项：她通常只是「想发个表情」，不是非这张不可，
                 // 直接返回候选能省掉一次 qq_list_stickers 往返。
-                const alts = (Array.isArray(stickerEntries) ? stickerEntries : [])
-                  .filter((e) => e && e.id && e.id !== rid && e.desc)
-                  .slice(0, 3)
+                // P1-5 起只从「收藏」里挑替代品（待整理/回收站里的本来也发不出去）。
+                const alts = searchStickers(stickerEntries, '', { state: 'fav', limit: 6, excludeId: rid })
+                  .stickers.filter((e) => e.desc).slice(0, 3)
                   .map((e) => `${e.id}（${e.desc}）`);
                 sendJson({
                   ok: false,
                   error: `刚才已经发过这张表情了（${rid}），连着两张一样的很像机器人；换一张${alts.length ? '，可选：' + alts.join('、') : '，或用 qq_list_stickers 看看别的'}`
                 }, 409);
+                return;
+              }
+            }
+            // P1-5 三态闸门：只有「收藏」能发。
+            //   待整理 = 本地还没写过含义，发出去大概率牛头不对马嘴（她要先看图写标签）；
+            //   回收站 = 她自己删过的图，不能靠一个旧 id 又发出去。
+            // 解析不出来（id 不存在）时放行，让下游 sendStickerV2 报它自己的错 —— 这里拦了
+            // 会把「id 写错了」误报成「这张没整理过」，反而更难查。
+            if (resolvedSticker) {
+              const gate = stickerSendable(resolvedSticker);
+              if (!gate.ok) {
+                sendJson({
+                  ok: false,
+                  error: gate.reason,
+                  stickerState: gate.state,
+                  stickerStateLabel: stickerStateLabel(gate.state)
+                }, 409);
+                return;
+              }
+            }
+            // P1-5 冷频道闸门：刚认识的人 + 她在这个会话里还一句话都没说过 → 别一上来就甩表情包。
+            // 真人不会这么干，而且对方根本看不懂你的图。发过第一句话之后闸门就永久打开。
+            if (cfg.socialV2?.sticker?.coldChannel !== false) {
+              const recent = Array.isArray(st.recentMessages) ? st.recentMessages : [];
+              const aiMsgCount = recent.filter((m) => m && m.isSelf).length;
+              const lastOther = [...recent].reverse().find((m) => m && !m.isSelf && m.userId);
+              let otherFamiliarity = 0;
+              if (lastOther) {
+                try {
+                  const row = getMemoryDb()
+                    .prepare('SELECT familiarity FROM affinity WHERE member_id = ?')
+                    .get(String(lastOther.userId));
+                  otherFamiliarity = Number(row?.familiarity) || 0;
+                } catch {
+                  // 读不到就当陌生（宁可不发，也不要对着刚认识的人甩图）
+                  otherFamiliarity = 0;
+                }
+              }
+              const cold = stickerColdChannel({
+                familiarity: otherFamiliarity,
+                aiMessages: aiMsgCount,
+                threshold: Number(cfg.socialV2?.sticker?.coldFamiliarity) || STICKER_COLD_FAMILIARITY
+              });
+              if (cold.cold) {
+                sendJson({ ok: false, error: cold.reason, coldChannel: true, familiarity: cold.familiarity }, 409);
                 return;
               }
             }
@@ -3937,6 +4010,10 @@ async function main() {
           if (!stickerEnabled()) { sendJson({ ok: false, error: '表情包体系已关闭' }, 403); return; }
           const key = String(url.searchParams.get('key') ?? '').trim();
           const query = String(url.searchParams.get('query') ?? '').trim();
+          // P1-5 三态口径：默认 visible = 收藏 + 待整理（回收站不出现）；
+          // 想看被删的图要显式 state=trash，想全看用 state=all。
+          const stateParam = String(url.searchParams.get('state') ?? '').trim().toLowerCase();
+          const stateView = stateParam === 'all' || STICKER_STATES.includes(stateParam) ? stateParam : 'visible';
           const maxCount = Math.max(1, Number(cfg.socialV2?.sticker?.maxListCount) || 100);
           const count = Math.min(500, Math.max(1, Math.min(Number(url.searchParams.get('count')) || 48, maxCount)));
           let force = url.searchParams.get('refresh') === '1' || url.searchParams.get('refresh') === 'true';
@@ -3952,22 +4029,83 @@ async function main() {
           }
           try {
             const synced = await syncStickerLibrary(force);
-            const list = formatStickerList(synced?.entries ?? stickerEntries, query, count);
+            // 把「上一张发的是哪张」传进去：同图连发的那张会被打到分数最底（-100），
+            // 这样她搜出来的第一个候选天然就不是刚发过的那张，省一次往返。
+            const stForList = getSocialV2State(key);
+            const list = searchStickers(synced?.entries ?? stickerEntries, query, {
+              limit: count,
+              state: stateView,
+              lastId: stForList.lastStickerId,
+              lastMd5: stForList.lastStickerMd5,
+              now: Date.now(),
+              cooldownMs: Number(cfg.socialV2?.sticker?.listCooldownMs) || 0,
+              extraSynonyms: cfg.socialV2?.sticker?.synonyms ?? {}
+            });
             sendJson({ ok: true, key, ...list, syncedAt: synced?.syncedAt ?? stickerSyncedAt, fromCache: synced?.fromCache ?? false });
           } catch (error) {
             sendJson({ ok: false, error: `获取表情列表失败：${error?.message ?? error}` }, 500);
           }
           return;
         }
+        // P1-5 三态切换（待整理 / 收藏 / 回收站）。软删除：只改本地库的 state，不碰 QQ 端，
+        // 用过的次数与当时的语境都留着，随时能恢复。
+        if (req.method === 'POST' && url.pathname === '/api/socialV2/sticker-state') {
+          if (!stickerEnabled()) { sendJson({ ok: false, error: '表情包体系已关闭' }, 403); return; }
+          const body = await readBody();
+          const key = String(body.key ?? '').trim();
+          const stickerId = String(body.stickerId ?? '').trim();
+          const stateArg = String(body.state ?? '').trim().toLowerCase();
+          if (!key || !stickerId) { sendJson({ ok: false, error: 'key 与 stickerId 不能为空' }, 400); return; }
+          if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
+          if (req.headers['x-agent-token'] && !v2SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
+          if (req.headers['x-agent-token'] && !v2ToolEnabled('stickerState')) { sendJson({ ok: false, error: '工具未启用：qq_sticker_state' }, 403); return; }
+          if (!STICKER_STATES.includes(stateArg)) {
+            sendJson({ ok: false, error: `state 只能是 ${STICKER_STATES.join(' / ')}（待整理 / 收藏 / 回收站）` }, 400);
+            return;
+          }
+          try {
+            const synced = await syncStickerLibrary(false);
+            const entriesBefore = synced?.entries ?? stickerEntries;
+            const target = findSticker(entriesBefore, stickerId);
+            if (!target) {
+              sendJson({ ok: false, error: `找不到表情 ${stickerId}，请先用 qq_list_stickers 拿有效 id` }, 404);
+              return;
+            }
+            // 用同步后的那份 entries 作为基准（syncStickerLibrary 会更新模块级 stickerEntries，
+            // 但这里拿到的是它的返回值，直接以它为准避免两份数据打架）。
+            stickerEntries = entriesBefore;
+            const entry = applyStickerStateV2(target.id, stateArg);
+            if (!entry) { sendJson({ ok: false, error: `找不到表情 ${stickerId}` }, 404); return; }
+            log(`[sticker] 三态切换 ${key}: ${entry.id} → ${stickerStateLabel(entry.state)}`);
+            sendJson({
+              ok: true,
+              key,
+              sticker: entry,
+              state: entry.state,
+              stateLabel: stickerStateLabel(entry.state),
+              counts: stickerStateCounts(stickerEntries),
+              sendable: stickerSendable(entry).ok
+            });
+          } catch (error) {
+            sendJson({ ok: false, error: `切换表情状态失败：${error?.message ?? error}` }, 500);
+          }
+          return;
+        }
         // 管理端表情库接口（控制台）
         if (req.method === 'GET' && url.pathname === '/api/stickers') {
           const query = String(url.searchParams.get('query') ?? '').trim();
+          const stateParam = String(url.searchParams.get('state') ?? '').trim().toLowerCase();
+          const stateView = stateParam === 'all' || STICKER_STATES.includes(stateParam) ? stateParam : 'visible';
           const maxCount = Math.max(1, Number(cfg.socialV2?.sticker?.maxListCount) || 100);
           const count = Math.min(500, Math.max(1, Math.min(Number(url.searchParams.get('count')) || 48, maxCount)));
           const force = url.searchParams.get('refresh') === '1' || url.searchParams.get('refresh') === 'true';
           try {
             const synced = await syncStickerLibrary(force);
-            const list = formatStickerList(synced?.entries ?? stickerEntries, query, count);
+            const list = searchStickers(synced?.entries ?? stickerEntries, query, {
+              limit: count,
+              state: stateView,
+              extraSynonyms: cfg.socialV2?.sticker?.synonyms ?? {}
+            });
             sendJson({ ok: true, ...list, syncedAt: synced?.syncedAt ?? stickerSyncedAt, fromCache: synced?.fromCache ?? false });
           } catch (error) {
             sendJson({ ok: false, error: `获取表情失败：${error?.message ?? error}` }, 500);
