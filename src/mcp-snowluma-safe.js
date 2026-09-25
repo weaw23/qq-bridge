@@ -1733,7 +1733,7 @@ if (cfg.socialV2?.tools?.myStatus !== false) {
 if (cfg.socialV2?.tools?.affinity !== false) {
   server.tool(
     'qq_affinity',
-    '好感度与印象：list/get/bump/set。',
+    '好感度与熟识度双维度：list/get/bump/set。好感度你改，熟识度自动累计；好感低只少主动，语气照常。',
     {
       key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
       token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),

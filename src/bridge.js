@@ -44,6 +44,12 @@ import {
   outboxCanAttempt, outboxDedupeKey, OUTBOX_MAX_ATTEMPTS, OUTBOX_DEDUPE_WINDOW_MS
 } from './send-outbox.js';
 import {
+  familiarityFromStats, familiarityTier, affinityTier,
+  affinityBoostFromScores, detectConcession, concessionDetectEnabled,
+  concessionRollover, concessionAllowed, relationLine, AFFINITY_REDLINE_NOTE,
+  CONCESSION_DAILY_CAP
+} from './affinity-model.js';
+import {
   loadExpressionStore,
   saveExpressionStore,
   upsertExpression,
@@ -1295,16 +1301,18 @@ async function main() {
         if (seen.size) {
           const rows = [];
           for (const [uid, name] of seen) {
-            const r = db.prepare('SELECT score, notes, profile FROM affinity WHERE member_id = ?').get(uid);
+            const r = db.prepare('SELECT score, familiarity, active_days, interactions, notes, profile FROM affinity WHERE member_id = ?').get(uid);
             let prof = '';
             try { const pj = JSON.parse(r?.profile || '{}') || {}; prof = formatProfileLine(pj); } catch {}
-            rows.push({ uid, name, score: r?.score ?? 0, notes: r?.notes ?? '', prof });
+            rows.push({ uid, name, score: r?.score ?? 0, familiarity: r?.familiarity ?? 0, activeDays: r?.active_days ?? 0, interactions: r?.interactions ?? 0, notes: r?.notes ?? '', prof });
           }
-          rows.sort((a, b) => Math.abs(b.score) - Math.abs(a.score));
-          const top = rows.slice(0, 6).filter((r) => r.score !== 0 || r.notes);
+          // P1-4：召回权重 = 熟识度为主、好感度为辅 —— 天天来的人不该因为好感中性就被挤出上下文，
+          // 刚认识却有强烈观感的人也要在。两条都算，避免任何单一维度独占。
+          rows.sort((a, b) => (b.familiarity * 2 + Math.abs(b.score) * 1.5) - (a.familiarity * 2 + Math.abs(a.score) * 1.5));
+          const top = rows.slice(0, 6).filter((r) => r.score !== 0 || r.notes || r.familiarity >= 20);
           if (top.length) {
-            const lines = top.map((r) => `- ${r.name}(${r.uid})：好感度 ${r.score}${r.notes ? '，' + String(r.notes).slice(0, 60) : ''}${r.prof ? '｜' + r.prof : ''}`);
-            parts.push('【关系记忆 · 好感度（-100 疏离 ~ +100 亲近）】\n' + lines.join('\n') + '\n（对高分的人毒舌/撒娇可以更放肆，对 0 分或负分的人礼貌但有距离；互动后有变化就用 qq_affinity 更新）');
+            const lines = top.map((r) => relationLine({ ...r, profile: r.prof }));
+            parts.push('【关系记忆 · 双维度（好感度 -100 疏离 ~ +100 亲近；熟识度 0~100 由客观互动自动累计）】\n' + lines.join('\n') + '\n' + AFFINITY_REDLINE_NOTE);
           }
         }
       }
@@ -4917,15 +4925,16 @@ async function main() {
           const clamp = (n) => Math.max(-100, Math.min(100, Math.round(n)));
           if (action === 'list') {
             const limit = Math.min(Math.max(Number(body.limit) || 20, 1), 50);
-            const rows = db.prepare('SELECT member_id AS memberId, name, score, notes, updated_at AS updatedAt FROM affinity ORDER BY ABS(score) DESC, updated_at DESC LIMIT ?').all(limit);
+            const rows = db.prepare('SELECT member_id AS memberId, name, score, familiarity, active_days AS activeDays, interactions, mentions, notes, updated_at AS updatedAt FROM affinity ORDER BY ABS(score) DESC, updated_at DESC LIMIT ?').all(limit)
+              .map((r) => ({ ...r, tier: affinityTier(r.score).label, familiarityTier: familiarityTier(r.familiarity).label }));
             sendJson({ ok: true, count: rows.length, affinity: rows });
             return;
           }
           const memberId = String(body.memberId ?? '').trim();
           if (!/^\d{5,12}$/.test(memberId)) { sendJson({ ok: false, error: 'memberId 必须是 5-12 位 QQ 号' }, 400); return; }
           if (action === 'get') {
-            const row = db.prepare('SELECT member_id AS memberId, name, score, notes, updated_at AS updatedAt FROM affinity WHERE member_id = ?').get(memberId);
-            sendJson({ ok: true, affinity: row ?? { memberId, name: '', score: 0, notes: '', updatedAt: null } });
+            const row = db.prepare('SELECT member_id AS memberId, name, score, familiarity, active_days AS activeDays, interactions, mentions, concessions, first_seen AS firstSeen, last_seen AS lastSeen, notes, updated_at AS updatedAt FROM affinity WHERE member_id = ?').get(memberId);
+            sendJson({ ok: true, affinity: row ? { ...row, tier: affinityTier(row.score).label, familiarityTier: familiarityTier(row.familiarity).label } : { memberId, name: '', score: 0, familiarity: 0, activeDays: 0, interactions: 0, mentions: 0, concessions: 0, notes: '', updatedAt: null, tier: affinityTier(0).label, familiarityTier: familiarityTier(0).label } });
             return;
           }
           if (action === 'bump' || action === 'set') {
@@ -5002,6 +5011,29 @@ async function main() {
             res.writeHead(500, { 'content-type': 'text/plain; charset=utf-8', ...SECURITY_HEADERS });
             res.end('面板文件缺失：' + (error?.message ?? error));
           }
+          return;
+        }
+
+        // P1-4 只读观察点：双维度关系的原始统计量。
+        // 为什么单独开：熟识度是**累计量**，只看提示词注入的结果无法判断「累计有没有真的发生」；
+        // 而 /api/socialV2/affinity 要 agent token 且会 upsert，不适合当测试读口。
+        // 这里只 SELECT，绝不 INSERT/UPDATE，合成 memberId 也能安全查。
+        if (req.method === 'GET' && url.pathname === '/api/panel/affinity') {
+          const memberId = String(url.searchParams.get('memberId') ?? '').trim();
+          const limit = Math.min(Math.max(Number(url.searchParams.get('limit')) || 20, 1), 100);
+          const db = getMemoryDb();
+          const fields = 'member_id AS memberId, name, score, familiarity, active_days AS activeDays, interactions, mentions, concessions, first_seen AS firstSeen, last_seen AS lastSeen, notes, updated_at AS updatedAt';
+          const rows = /^\d{5,12}$/.test(memberId)
+            ? db.prepare(`SELECT ${fields} FROM affinity WHERE member_id = ?`).all(memberId)
+            : db.prepare(`SELECT ${fields} FROM affinity ORDER BY familiarity DESC, ABS(score) DESC LIMIT ?`).all(limit);
+          sendJson({
+            ok: true,
+            memberId: memberId || null,
+            count: rows.length,
+            concessionDailyCap: CONCESSION_DAILY_CAP,
+            concessionDetect: concessionDetectEnabled(cfg.socialV2?.affinity?.concessionDetect),
+            affinity: rows.map((r) => ({ ...r, tier: affinityTier(r.score).label, familiarityTier: familiarityTier(r.familiarity).label }))
+          });
           return;
         }
 
@@ -8328,6 +8360,82 @@ async function main() {
   }
 
   // ── 二代仿真模式（reserved2）唤醒调度 ──────────────────────────────────
+  // P1-4 熟识度累计 ---------------------------------------------------------------------------
+  // 熟识度是**客观量**，必须由桥接在消息入站时自动累计，不靠 AI 手填 —— AI 只会动好感度
+  // （score/note）。这样即使她懒得用 qq_affinity，关系也不会「永远停在初见」。
+  // 代价是每条入站消息多两条 SQLite 语句（本地库，微秒级）。
+  function noteMemberActivityV2(userId, name = '', isMention = false) {
+    const uid = String(userId ?? '').trim();
+    if (!/^\d{5,12}$/.test(uid)) return null;
+    try {
+      const db = getMemoryDb();
+      const now = Date.now();
+      const today = localDayKey(now);
+      const row = db.prepare(`
+        INSERT INTO affinity (member_id, name, score, notes, updated_at, first_seen, last_seen, last_seen_day, active_days, interactions, mentions, familiarity)
+        VALUES (?, ?, 0, '', ?, ?, ?, ?, 1, 1, ?, 0)
+        ON CONFLICT(member_id) DO UPDATE SET
+          name = COALESCE(NULLIF(?, ''), name),
+          last_seen = excluded.last_seen,
+          active_days = affinity.active_days + (CASE WHEN affinity.last_seen_day <> excluded.last_seen_day THEN 1 ELSE 0 END),
+          last_seen_day = excluded.last_seen_day,
+          interactions = affinity.interactions + 1,
+          mentions = affinity.mentions + ?,
+          updated_at = excluded.updated_at
+        RETURNING active_days, interactions, mentions`).get(
+        uid, String(name ?? '').slice(0, 30), now, now, now, today, isMention ? 1 : 0,
+        String(name ?? '').slice(0, 30), isMention ? 1 : 0
+      );
+      const { familiarity } = familiarityFromStats({
+        activeDays: row?.active_days, interactions: row?.interactions, mentions: row?.mentions
+      });
+      db.prepare('UPDATE affinity SET familiarity = ? WHERE member_id = ?').run(familiarity, uid);
+      return familiarity;
+    } catch (e) {
+      log(`[affinity] 熟识度累计失败（不影响本条消息）${uid}: ${e?.message ?? e}`);
+      return null;
+    }
+  }
+
+  // 让步：心里不肯但话仍照顾。规则判定，保守（两侧都命中才算），每天限额。
+  // 🚫 红线：让步**只**扣好感度，不碰熟识度，且好感度的唯一消费点是主动概率 —— 绝不改变语气。
+  function noteConcessionV2(key, internalText, publicTexts) {
+    try {
+      if (currentMode !== 'reserved2') return;
+      const db = getMemoryDb();
+      if (!concessionDetectEnabled(cfg.socialV2?.affinity?.concessionDetect)) return;
+      const det = detectConcession(internalText, publicTexts);
+      if (!det.concession) return;
+      const st = socialV2.conversations.get(key);
+      const uid = String(st?.recentMessages?.slice(-30)?.find?.((m) => m && !m.isSelf && m.userId)?.userId ?? '').trim();
+      if (!/^\d{5,12}$/.test(uid)) return;
+      const now = Date.now();
+      const today = localDayKey(now);
+      const cur = db.prepare('SELECT concession_day, concession_used FROM affinity WHERE member_id = ?').get(uid);
+      const roll = concessionRollover(cur?.concession_day, today, cur?.concession_used);
+      if (!concessionAllowed(roll.used)) { log(`[affinity] ${uid} 今日让步已达上限（${roll.used}/${CONCESSION_DAILY_CAP}），不再扣分`); return; }
+      db.prepare(`UPDATE affinity SET score = MAX(-100, score + ?), concessions = concessions + 1,
+                  concession_day = ?, concession_used = ?, updated_at = ? WHERE member_id = ?`)
+        .run(det.delta, roll.day, roll.used + 1, now, uid);
+      log(`[affinity] 判定到一次让步（心里不肯、话仍照顾）${uid} 好感 ${det.delta}（今日第 ${roll.used + 1}/${CONCESSION_DAILY_CAP} 次）· 熟识度不动`);
+    } catch (e) {
+      log(`[affinity] 让步判定失败（忽略）: ${e?.message ?? e}`);
+    }
+  }
+
+  // 本轮她真正说出口的话（比对内心用）。只存内存、只留最近 12 条，别让它无界增长。
+  const turnOutboundV2 = new Map();
+  function noteOutboundV2(key, texts) {
+    try {
+      const arr = turnOutboundV2.get(key) ?? [];
+      for (const t of (Array.isArray(texts) ? texts : [])) {
+        const s = String(t ?? '').trim();
+        if (s) arr.push(s.slice(0, 200));
+      }
+      turnOutboundV2.set(key, arr.slice(-12));
+    } catch {}
+  }
+
   function appendSocialV2Message(key, sender, textContent, plainContent, quoteTargetIsSelf, isOwner, messageId, media = [], userId = null, forwardIds = []) {
     const st = getSocialV2State(key);
     const recentLimit = Number(cfg.socialV2?.context?.recentLimit) || 100;
@@ -8381,6 +8489,8 @@ async function main() {
     if (st.recentMessages.length > recentLimit) st.recentMessages.splice(0, st.recentMessages.length - recentLimit);
     st.unread.push(msg);
     if (st.unread.length > unreadLimit) st.unread.splice(0, st.unread.length - unreadLimit);
+    // P1-4：客观累计熟识度（「回复她」= 被点名）。放这里是因为 appendSocialV2Poke / Notice 共用同样结构。
+    noteMemberActivityV2(msg.userId, sender, !!quoteTargetIsSelf);
     const lowerPlain = String(plainContent ?? textContent ?? '');
     for (const t of st.activeTopics || []) {
       if (!t || typeof t !== 'object') continue;
@@ -8447,6 +8557,26 @@ async function main() {
     db.exec("CREATE TABLE IF NOT EXISTS persona_notes (id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL DEFAULT 'style', content TEXT NOT NULL, created_at INTEGER NOT NULL)");
     // P6：结构化人物画像列（JSON）+ 待跟进事项 + 中文二元 FTS5 索引
     try { const cols = db.prepare('PRAGMA table_info(affinity)').all().map((c) => c.name); if (!cols.includes('profile')) db.exec("ALTER TABLE affinity ADD COLUMN profile TEXT NOT NULL DEFAULT ''"); } catch {}
+    // P1-4 双维度：熟识度与它的客观统计量（老行全部默认 0 = 从今天开始重新认识，行为不受影响）
+    try {
+      const cols = db.prepare('PRAGMA table_info(affinity)').all().map((c) => c.name);
+      const add = [
+        'familiarity INTEGER NOT NULL DEFAULT 0',   // 熟识度 0-100，客观自动算，只增不减
+        'first_seen INTEGER NOT NULL DEFAULT 0',
+        'last_seen INTEGER NOT NULL DEFAULT 0',
+        'last_seen_day TEXT NOT NULL DEFAULT \'\'', // 本地日键，用于「来过几天」去重
+        'active_days INTEGER NOT NULL DEFAULT 0',
+        'interactions INTEGER NOT NULL DEFAULT 0',
+        'mentions INTEGER NOT NULL DEFAULT 0',      // 被点名（回复她/拍她）
+        'concessions INTEGER NOT NULL DEFAULT 0',   // 让步次数（心里不肯、话仍照顾）
+        'concession_day TEXT NOT NULL DEFAULT \'\'',// 让步的每日限额，必须本地日
+        'concession_used INTEGER NOT NULL DEFAULT 0'
+      ];
+      for (const def of add) {
+        const name = def.split(' ')[0];
+        if (!cols.includes(name)) db.exec(`ALTER TABLE affinity ADD COLUMN ${def}`);
+      }
+    } catch {}
     // P0-1：重复提醒四列（''/0 = 旧的一次性提醒，行为完全不变）。
     // repeat_kind: '' | 'daily' | 'weekly' | 'interval'；mode: 'text'（念稿）| 'ai'（到点现场发挥）。
     // 旧库没有这些列时靠这里补齐，新库建表语句直接带上。
@@ -9005,6 +9135,8 @@ async function main() {
       });
     }
     if (st.recentMessages.length > recentLimit) st.recentMessages.splice(0, st.recentMessages.length - recentLimit);
+    // P1-4：记下本轮说出去的话，收尾时与「内心」比对（让步判定）
+    noteOutboundV2(key, list);
     // AI 实际发言/参与了，说明这轮选择“继续回复”，沉睡前观察状态作废；下次想睡需重新走 5 分钟等待。
     st.preSleepWaitSatisfiedAt = 0;
     st.preSleepWaitObservedAt = 0;
@@ -9522,6 +9654,9 @@ async function main() {
     return Math.max(0, Math.min(1, v));
   }
   // P7-D 好感度加权：最近聊过的人里好感越高，越想主动找话（上限 +0.4）
+  // 🚫 红线（P1-4）：好感度的**唯一**消费点就是这里的主动概率乘数。
+  // 它绝不能出现在任何影响措辞、称呼、语气、是否回复、回复长短的分支里 ——
+  // 负好感只有「少主动」这一个后果，禁止冷落/阴阳/攻击。
   function affinityBoostFor(key) {
     try {
       const st = socialV2.conversations.get(key);
@@ -9529,13 +9664,13 @@ async function main() {
       const ids = Array.from(new Set(recent.filter((m) => m && !m.isSelf && m.userId).map((m) => String(m.userId))));
       if (!ids.length) return 1;
       const db = getMemoryDb();
-      let sum = 0, n = 0;
+      const scores = [];
       for (const id of ids.slice(0, 8)) {
         const r = db.prepare('SELECT score FROM affinity WHERE member_id = ?').get(id);
-        if (r && Number(r.score) > 0) { sum += Number(r.score); n++; }
+        if (r) scores.push(Number(r.score) || 0);
       }
-      if (!n) return 1;
-      return 1 + Math.min(0.4, (sum / n) / 250);
+      // 交由纯函数决定（可离线穷举边界）；负分也算，但下限锁在 0.7
+      return affinityBoostFromScores(scores);
     } catch { return 1; }
   }
 
@@ -10455,6 +10590,9 @@ async function main() {
                 } else if (currentMode === 'reserved2') {
                   log(`[reserved2] AI 内部输出（不自动转发）(${key}): ${plain.slice(0, 80)}`);
                   appendActivity(`${key} [reserved2] AI 内部输出：${plain.slice(0, 80)}${plain.length > 80 ? '…' : ''}`);
+                  // P1-4：reserved2 下这段就是「内心」通道，而本轮真正发出去的话在 turnOutboundV2 里。
+                  // 心里不肯、话仍照顾 → 记一次让步（只扣好感度 1 分、每天最多 2 次、不碰熟识度）。
+                  try { noteConcessionV2(key, plain, turnOutboundV2.get(key) ?? []); } finally { turnOutboundV2.delete(key); }
                 } else {
                   if (shouldBlockSilentReply(key)) {
                     log(`静默模式，拦截在途回复 (${key})`);
