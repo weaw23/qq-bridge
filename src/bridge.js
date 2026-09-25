@@ -34,6 +34,9 @@ import {
 } from './slang-learner.js';
 import { buildSummaryPrompt, parseSummaryJson, toBigrams, queryToMatch, formatProfileLine } from './memory-engine.js';
 import {
+  normalizeRepeatSpec, nextRepeatFireMs, repeatFromRow, repeatColumnsFor, describeRepeat
+} from './repeat-schedule.js';
+import {
   loadExpressionStore,
   saveExpressionStore,
   upsertExpression,
@@ -4769,18 +4772,35 @@ async function main() {
           if (url.pathname.endsWith('/set')) {
             const text = String(body.text ?? '').trim().slice(0, 400);
             if (!text) { sendJson({ ok: false, error: 'text 不能为空' }, 400); return; }
+            const mode = body.mode === 'ai' ? 'ai' : (body.mode === 'text' ? 'text' : '');
+            if (body.mode != null && !mode) { sendJson({ ok: false, error: "mode 仅支持 'text'（念稿）或 'ai'（现场发挥）" }, 400); return; }
+            // repeat 与 delayMinutes/fireAt 二选一：给了 repeat 就由 repeat 规格推下一次触发时间。
+            const spec = normalizeRepeatSpec(body.repeat);
+            if (spec.error) { sendJson({ ok: false, error: spec.error }, 400); return; }
+            const repeat = spec.repeat;
             let fireAt = 0;
-            if (body.delayMinutes != null && Number.isFinite(Number(body.delayMinutes))) fireAt = now + Math.min(Math.max(Number(body.delayMinutes), 0.5), 129600) * 60000;
+            if (repeat) {
+              fireAt = nextRepeatFireMs(repeat);
+              if (!fireAt) { sendJson({ ok: false, error: '无法从 repeat 规格推算出下一次触发时间' }, 400); return; }
+            } else if (body.delayMinutes != null && Number.isFinite(Number(body.delayMinutes))) fireAt = now + Math.min(Math.max(Number(body.delayMinutes), 0.5), 129600) * 60000;
             else if (body.fireAt != null) { const n = Number(body.fireAt); fireAt = Number.isFinite(n) && n > 1e12 ? n : Date.parse(String(body.fireAt)); }
             if (!Number.isFinite(fireAt) || fireAt < now - 60000 || fireAt > now + 1296000000 + 60000) { sendJson({ ok: false, error: 'fireAt 无效（需为未来时间，最远 15 天）' }, 400); return; }
-            const rRem = db.prepare('INSERT INTO reminders (conv_key, text, fire_at, created_at) VALUES (?, ?, ?, ?)').run(key, text, Math.round(fireAt), now);
-            sendJson({ ok: true, id: Number(rRem.lastInsertRowid), fireAt: Math.round(fireAt) });
+            const rc = repeatColumnsFor(repeat);
+            const rRem = db.prepare('INSERT INTO reminders (conv_key, text, fire_at, created_at, repeat_kind, repeat_at, repeat_days, every_ms, mode) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)')
+              .run(key, text, Math.round(fireAt), now, rc.repeat_kind, rc.repeat_at, rc.repeat_days, rc.every_ms, mode || 'text');
+            sendJson({ ok: true, id: Number(rRem.lastInsertRowid), fireAt: Math.round(fireAt), repeat: repeat || null, mode: mode || 'text', repeatLabel: describeRepeat(repeat) });
             return;
           }
           if (url.pathname.endsWith('/list')) {
             const status = String(body.status ?? 'pending');
-            const rows = db.prepare('SELECT id, text, fire_at AS fireAt, status, created_at FROM reminders WHERE conv_key = ? AND status = ? ORDER BY fire_at ASC LIMIT 50').all(key, status);
-            sendJson({ ok: true, reminders: rows });
+            const rows = db.prepare('SELECT id, text, fire_at AS fireAt, status, created_at, repeat_kind, repeat_at, repeat_days, every_ms, mode FROM reminders WHERE conv_key = ? AND status = ? ORDER BY fire_at ASC LIMIT 50').all(key, status);
+            sendJson({
+              ok: true,
+              reminders: rows.map((row) => {
+                const rep = repeatFromRow(row);
+                return { id: row.id, text: row.text, fireAt: row.fireAt, status: row.status, createdAt: row.created_at, mode: row.mode || 'text', repeat: rep, repeatLabel: describeRepeat(rep) };
+              })
+            });
             return;
           }
           const rid = Number(body.id);
@@ -8155,6 +8175,17 @@ async function main() {
     db.exec("CREATE TABLE IF NOT EXISTS persona_notes (id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL DEFAULT 'style', content TEXT NOT NULL, created_at INTEGER NOT NULL)");
     // P6：结构化人物画像列（JSON）+ 待跟进事项 + 中文二元 FTS5 索引
     try { const cols = db.prepare('PRAGMA table_info(affinity)').all().map((c) => c.name); if (!cols.includes('profile')) db.exec("ALTER TABLE affinity ADD COLUMN profile TEXT NOT NULL DEFAULT ''"); } catch {}
+    // P0-1：重复提醒四列（''/0 = 旧的一次性提醒，行为完全不变）。
+    // repeat_kind: '' | 'daily' | 'weekly' | 'interval'；mode: 'text'（念稿）| 'ai'（到点现场发挥）。
+    // 旧库没有这些列时靠这里补齐，新库建表语句直接带上。
+    try {
+      const rCols = db.prepare('PRAGMA table_info(reminders)').all().map((c) => c.name);
+      if (!rCols.includes('repeat_kind')) db.exec("ALTER TABLE reminders ADD COLUMN repeat_kind TEXT NOT NULL DEFAULT ''");
+      if (!rCols.includes('repeat_at')) db.exec("ALTER TABLE reminders ADD COLUMN repeat_at TEXT NOT NULL DEFAULT ''");
+      if (!rCols.includes('repeat_days')) db.exec("ALTER TABLE reminders ADD COLUMN repeat_days TEXT NOT NULL DEFAULT ''");
+      if (!rCols.includes('every_ms')) db.exec('ALTER TABLE reminders ADD COLUMN every_ms INTEGER NOT NULL DEFAULT 0');
+      if (!rCols.includes('mode')) db.exec("ALTER TABLE reminders ADD COLUMN mode TEXT NOT NULL DEFAULT 'text'");
+    } catch {}
     db.exec("CREATE TABLE IF NOT EXISTS followups (id INTEGER PRIMARY KEY AUTOINCREMENT, conv_key TEXT NOT NULL, member_id TEXT NOT NULL DEFAULT '', name TEXT NOT NULL DEFAULT '', topic TEXT NOT NULL, due_at INTEGER, status TEXT NOT NULL DEFAULT 'pending', created_at INTEGER NOT NULL)");
     db.exec("CREATE INDEX IF NOT EXISTS idx_followups_due ON followups (status, due_at)");
     try { db.exec("CREATE VIRTUAL TABLE IF NOT EXISTS facts_fts USING fts5(content, bigrams, tokenize='ascii')"); } catch {}
@@ -8231,22 +8262,41 @@ async function main() {
   setTimeout(ensureWatchdog, 20000);
 
   // 提醒扫描器：每 30s 把到期提醒注入对应会话并唤醒（会话仍需在白名单内）。
+  // P0-1：带 repeat_kind 的行触发后不置 fired，而是原地把 fire_at 推到下一次（行保持 pending）。
   const reminderTimer = setInterval(() => {
     try {
       const db = getMemoryDb();
       const now = Date.now();
-      const due = db.prepare("SELECT id, conv_key, text FROM reminders WHERE status = 'pending' AND fire_at <= ? ORDER BY fire_at ASC LIMIT 20").all(now);
+      const due = db.prepare("SELECT id, conv_key, text, fire_at, repeat_kind, repeat_at, repeat_days, every_ms, mode FROM reminders WHERE status = 'pending' AND fire_at <= ? ORDER BY fire_at ASC LIMIT 20").all(now);
       for (const r of due) {
-        const resU = db.prepare("UPDATE reminders SET status = 'fired', fired_at = ? WHERE id = ? AND status = 'pending'").run(now, r.id);
+        // 认领必须是原子的：WHERE 带上 status 与 fire_at 条件，避免将来出现多写者时同一行被处理两次。
+        const repeat = repeatFromRow(r);
+        let resU = null;
+        let nextMs = 0;
+        if (repeat) {
+          // 第三个参数传本行的 fire_at：interval 类要以上次触发时刻为基准算下一周期，否则会逐次漂移。
+          nextMs = nextRepeatFireMs(repeat, now, r.fire_at);
+          if (nextMs) resU = db.prepare('UPDATE reminders SET fire_at = ? WHERE id = ? AND status = ? AND fire_at <= ?').run(Math.round(nextMs), r.id, 'pending', now);
+          else {
+            // repeat 规格坏了（例如手工改库改出非法值）：置 fired 兜底，别让它无限期占着 pending。
+            resU = db.prepare('UPDATE reminders SET status = ?, fired_at = ? WHERE id = ? AND status = ? AND fire_at <= ?').run('fired', now, r.id, 'pending', now);
+            log(`[reminder] #${r.id} 的 repeat 规格无法推算下一次触发，已置 fired 兜底`);
+          }
+        } else {
+          resU = db.prepare('UPDATE reminders SET status = ?, fired_at = ? WHERE id = ? AND status = ? AND fire_at <= ?').run('fired', now, r.id, 'pending', now);
+        }
         if (!resU.changes) continue;
+        // 放到白名单检查之前：不在白名单的重复提醒也要重排，否则它会每 30s 被反复捞出来。
+        if (repeat && nextMs) log(`[reminder] 重复 #${r.id} 已重排（${describeRepeat(repeat)}）-> 下次 ${new Date(nextMs).toLocaleString('zh-CN')}`);
         const km = /^(group|private):(\d+)$/.exec(r.conv_key);
         if (!km || !modeAllowed(r.conv_key, km[1], Number(km[2]), cfg, currentMode)) {
           log(`[reminder] 跳过 #${r.id}（会话 ${r.conv_key} 不在白名单）`);
           continue;
         }
-        appendSocialV2Notice(r.conv_key, `[定时提醒] ${r.text}`);
-        if (currentMode === 'reserved2' && !socialV2.paused) scheduleWakeV2(r.conv_key, 'reminder');
-        log(`[reminder] 已触发 #${r.id} -> ${r.conv_key}: ${r.text.slice(0, 50)}`);
+        const isAi = r.mode === 'ai';
+        appendSocialV2Notice(r.conv_key, isAi ? `[定时任务到点] ${r.text}` : `[定时提醒] ${r.text}`);
+        if (currentMode === 'reserved2' && !socialV2.paused) scheduleWakeV2(r.conv_key, isAi ? 'schedule' : 'reminder');
+        log(`[reminder] 已触发 #${r.id}${repeat ? `（${describeRepeat(repeat)}）` : ''} -> ${r.conv_key}${isAi ? '（现场发挥）' : ''}: ${r.text.slice(0, 50)}`);
       }
     } catch (error) {
       log('提醒扫描失败:', error?.message ?? error);
@@ -8870,6 +8920,12 @@ async function main() {
         ? '现在是深夜：真人这个点要么睡了要么静音刷手机，没话找话最扣分。没有非说不可的事就别冒泡，直接把下一次唤醒用 qq_set_wake_config 设到明早 8~11 点的有限潜水，安静睡下。\n'
         : '';
       return `${base}【主动机会】${key}\n原因：群里已经安静了一段时间，这是一次你可以主动冒泡的机会。\n${nightNote}优先主动开个话题、追问上次没聊完的事、分享一个刚想到的想法；如果一时想不到，可以用 mcp__web-search-safe__web_search 搜一下当前热点/时事/网络热梗，再结合记忆里的群友兴趣挑一个自然角度。只要内容自然，就大胆开口；如果实在没话想说，再安静收尾（qq_mark_read 或 qq_set_wake_config）。`;
+    }
+    if (reason === 'reminder') {
+      return `${base}【定时提醒到点】未读里的 [定时提醒] 是你自己此前定下的提醒，现在到点了。\n把这件事自然地转达或处理掉——像平时说话一样，别照着念通知原文，也别说明“这是我设的提醒”。如果这件事已经不需要提了，说明一句或直接收尾。收尾照常（qq_mark_read 或 qq_set_wake_config）。`;
+    }
+    if (reason === 'schedule') {
+      return `${base}【定时任务到点】未读里的 [定时任务到点] 是你自己定下的定时任务，现在到了该你开口的时间。\n按任务要求现场发挥：内容要像平时说话一样自然，别念任务原文，也别暴露这是定时任务；该查资料/查记忆就先去查。如果现在场合不合适（比如深夜、群里正冷清）也可以说一句更合适的，或安静收尾（qq_mark_read 或 qq_set_wake_config）。`;
     }
     if (reason === 'poke') {
       return `${base}【唤醒】${key}\n原因：有人拍了一拍（可能拍了你，也可能拍了别人）。\n先看未读/最近消息里的 [拍一拍] 事件：如果是拍你，可以自然回应一句，也可以用 qq_send_poke 回一个拍一拍；如果是拍别人，觉得有趣也可以接梗。除了回应，偶尔也可以主动戳一下正在聊的人/熟人，像真人手贱/提醒/逗一下，但别频繁。不想接就安静收尾（qq_mark_read 或 qq_set_wake_config）。`;
