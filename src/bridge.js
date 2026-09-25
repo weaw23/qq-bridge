@@ -40,6 +40,10 @@ import {
   localDayKey, quotaPerDayFromConfig, proactiveAllowed, nextLocalMidnight
 } from './proactive-quota.js';
 import {
+  classifySendFailure, outboxBackoffMs, outboxExhausted, outboxExpired,
+  outboxCanAttempt, outboxDedupeKey, OUTBOX_MAX_ATTEMPTS, OUTBOX_DEDUPE_WINDOW_MS
+} from './send-outbox.js';
+import {
   loadExpressionStore,
   saveExpressionStore,
   upsertExpression,
@@ -5050,6 +5054,8 @@ async function main() {
             utcDay: new Date().toISOString().slice(0, 10),
             nextLocalMidnight: nextLocalMidnight(),
             serverNow: Date.now(),
+            // P0-3：出箱概况（只读）。pending>0 说明有消息正在等重投 —— 以前这种状态在外部完全看不到。
+            outbox: outboxStats(),
             sessions
           });
           return;
@@ -5755,6 +5761,13 @@ async function main() {
             }
             if (st.sendTimes.length > 500) st.sendTimes = st.sendTimes.slice(-500);
             saveSocialV2State();
+            if (error?.queued) {
+              // P0-3：消息已进箱、后台会重投。用 202（Accepted）而不是 500 —— 语义不同：
+              // 不是「发失败了」，而是「已受理、稍后送达」。响应里带上 outboxId 便于排查。
+              log(`[send] ${url.pathname} ${key}: 已入出箱 #${error.outboxId}，等待重投`);
+              sendJson({ ok: false, queued: true, outboxId: error.outboxId, klass: error.klass, error: error.message }, 202);
+              return;
+            }
             sendJson({ ok: false, error: error?.message ?? String(error) }, 500);
           }
           return;
@@ -6098,7 +6111,10 @@ async function main() {
   }
 
 
-  async function onebotSend(kind, id, message, replyToMessageId, atUserId = null) {
+  // 真正的 OneBot 调用。失败时**必须**把结构化信息挂在 error.ob 上：
+  // 出箱分类（send-outbox.js）要看 retcode / httpStatus，而给人看的那条中文消息里
+  // 这几个值和诊断文案已经混在一起，反解不可靠。
+  async function onebotSendRaw(kind, id, message, replyToMessageId, atUserId = null) {
     const segments = [];
     if (replyToMessageId !== undefined && replyToMessageId !== null && String(replyToMessageId).trim() !== '') {
       const rid = String(replyToMessageId).trim();
@@ -6121,22 +6137,182 @@ async function main() {
     const action = kind === 'private' ? 'send_private_msg' : 'send_group_msg';
     const params = kind === 'private' ? { user_id: Number(id), message: segments } : { group_id: Number(id), message: segments };
     const httpUrl = String(cfg.snowluma?.httpUrl || 'http://127.0.0.1:3000').replace(/\/+$/, '');
-    const res = await fetch(`${httpUrl}/${action}`, {
-      method: 'POST',
-      headers: {
-        'content-type': 'application/json',
-        ...(cfg.snowluma?.accessToken ? { authorization: `Bearer ${cfg.snowluma.accessToken}` } : {})
-      },
-      body: JSON.stringify(params),
-      signal: AbortSignal.timeout(15000)
-    });
-    const body = await res.json().catch(() => ({}));
+    let res = null;
+    let body = {};
+    try {
+      res = await fetch(`${httpUrl}/${action}`, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          ...(cfg.snowluma?.accessToken ? { authorization: `Bearer ${cfg.snowluma.accessToken}` } : {})
+        },
+        body: JSON.stringify(params),
+        signal: AbortSignal.timeout(15000)
+      });
+      body = await res.json().catch(() => ({}));
+    } catch (netErr) {
+      // 网络层失败（连接被拒/超时/中断）：这正是「可重投」的第一典型场景，标记出来给出箱判定。
+      const err = new Error(`OneBot ${action} 网络错误: ${netErr?.message ?? netErr}`);
+      err.ob = { httpStatus: 0, networkError: true, wording: String(netErr?.message ?? netErr) };
+      err.action = action;
+      throw err;
+    }
     if (!res.ok || body.status !== 'ok' || body.retcode !== 0) {
       const hint = res.status === 426 ? '（HTTP 426：snowluma.httpUrl 可能指向了 WebSocket 端口，请检查 config.json 的 snowluma.httpUrl 是否为 OneBot HTTP API 地址）' : '';
       const muteNote = await diagnoseGroupSendFailure(kind, id, body);
-      throw new Error(`OneBot ${action} 失败: ${body.wording || body.retcode || res.status}${hint}${muteNote}`);
+      const err = new Error(`OneBot ${action} 失败: ${body.wording || body.retcode || res.status}${hint}${muteNote}`);
+      err.ob = { httpStatus: Number(res.status) || 0, retcode: Number(body.retcode), wording: String(body.wording ?? ''), networkError: false };
+      err.action = action;
+      throw err;
     }
     return body.data;
+  }
+
+  // ── P0-3：发送失败出箱重投 ────────────────────────────────────────────────
+  // 原行为：失败 → 诊断 → 丢弃。网关重启、客户端重连这种几十秒的抖动会让一句话直接消失，
+  // 而她以为说过了（reserved2 下她的文本不自动转发，丢了主人根本不知道）。
+  //
+  // 现在的行为：**只有可重投类失败才进箱**，其余照旧直接抛。
+  // 三条硬约束（都在 send-outbox.js 里以纯函数形式穷举单测）：
+  //   ① 被禁言/被移出/参数错/令牌错 → 不重投（重投是空烧 token，且只会加重风控）；
+  //   ② sendBlock 冷却期内 → **不入箱**（P8-3b 的三振冷却本来就是「别再试了」的意思，
+  //      进了箱也只是等冷却结束再失败一次）；
+  //   ③ 同一会话同一条内容 5 分钟内重复失败 → 归并到已有记录，避免「她看到报错又自己发一遍」变成双份。
+  async function onebotSend(kind, id, message, replyToMessageId, atUserId = null) {
+    try {
+      return await onebotSendRaw(kind, id, message, replyToMessageId, atUserId);
+    } catch (err) {
+      const cls = classifySendFailure(err);
+      if (!cls.retryable) throw err;
+      const gid = kind === 'group' ? String(id) : '';
+      if (gid && sendBlockActive(gid)) {
+        const until = new Date(sendBlockActive(gid)).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' });
+        log(`[outbox] 群 ${gid} 正处于发送受阻冷却中（至 ${until}），不入箱以免空烧`);
+        throw err;
+      }
+      let row = null;
+      try {
+        row = enqueueSendOutbox(kind, id, message, replyToMessageId, atUserId, cls);
+      } catch (e) {
+        // 入库失败不能让原错误消失：至少让她知道这条没发出去。
+        log(`[outbox] 入箱失败：${e?.message ?? e}`);
+        throw err;
+      }
+      if (row.deduped) {
+        log(`[outbox] 重复失败已归并到 #${row.id}（${kind}:${id}）`);
+      } else {
+        log(`[outbox] 已入箱 #${row.id}（${cls.klass}：${cls.reason}）${kind}:${id}，${Math.round(outboxBackoffMs(1) / 1000)}s 后重投，最多 ${OUTBOX_MAX_ATTEMPTS} 次`);
+      }
+      const q = new Error(`${err.message} ｜ 已放入出箱（${cls.klass}），稍后自动重投（最多 ${OUTBOX_MAX_ATTEMPTS} 次）——**不要再手动重发同一条**，否则主人会收到两份`);
+      q.queued = true;
+      q.outboxId = row.id;
+      q.klass = cls.klass;
+      throw q;
+    }
+  }
+
+  // 入箱。去重窗口内的同一条（同会话+同内容+同引用/@）归并到已有 pending 记录。
+  function enqueueSendOutbox(kind, id, message, replyToMessageId, atUserId, cls) {
+    const db = getMemoryDb();
+    const now = Date.now();
+    const key = outboxDedupeKey(kind, id, message, replyToMessageId, atUserId);
+    const dup = db.prepare("SELECT id FROM send_outbox WHERE dedupe_key = ? AND status = 'pending' AND created_at > ? ORDER BY id DESC LIMIT 1").get(key, now - OUTBOX_DEDUPE_WINDOW_MS);
+    if (dup) return { id: Number(dup.id), deduped: true };
+    const r = db.prepare(`INSERT INTO send_outbox
+      (dedupe_key, conv_key, kind, target_id, message, reply_to, at_user, klass, reason, attempts, max_attempts, next_at, created_at, updated_at, status)
+      VALUES (?,?,?,?,?,?,?,?,?,0,?,?,?,?,'pending')`).run(
+      key, `${kind}:${id}`, String(kind), String(id), String(message),
+      String(replyToMessageId ?? ''), String(atUserId ?? ''),
+      String(cls?.klass ?? ''), String(cls?.reason ?? ''),
+      OUTBOX_MAX_ATTEMPTS, now + outboxBackoffMs(1), now, now
+    );
+    return { id: Number(r.lastInsertRowid), deduped: false };
+  }
+
+  // 出箱巡检：每 60s 跑一次。冷却期内的记录只推迟、不消耗重投次数。
+  async function sweepSendOutbox() {
+    let db = null;
+    try { db = getMemoryDb(); } catch { return; }
+    let due = [];
+    try {
+      due = db.prepare("SELECT id, conv_key, kind, target_id, message, reply_to, at_user, klass, attempts, max_attempts, next_at, created_at FROM send_outbox WHERE status = 'pending' AND next_at <= ? ORDER BY next_at ASC LIMIT 10").all(Date.now());
+    } catch { return; }
+    for (const row of due) {
+      const km = /^(group|private):(\d+)$/.exec(String(row.conv_key));
+      if (!km) {
+        db.prepare("UPDATE send_outbox SET status = 'dead', reason = ?, updated_at = ? WHERE id = ? AND status = 'pending'").run('conv_key 格式非法', Date.now(), row.id);
+        continue;
+      }
+      // 白名单/模式可能在排队期间变了：变了就直接丢，别越权补发。
+      if (!modeAllowed(row.conv_key, km[1], Number(km[2]), cfg, currentMode)) {
+        db.prepare("UPDATE send_outbox SET status = 'dead', reason = ?, updated_at = ? WHERE id = ? AND status = 'pending'").run('会话已不在当前模式允许范围', Date.now(), row.id);
+        log(`[outbox] #${row.id} 丢弃：${row.conv_key} 已不在白名单`);
+        continue;
+      }
+      const block = km[1] === 'group' ? sendBlockActive(km[2]) : 0;
+      const gate = outboxCanAttempt(row, Date.now(), block);
+      if (!gate.ok) {
+        if (gate.defer) {
+          // 推迟：next_at 推到冷却结束，attempts 保持原值（不消耗重投次数）。
+          const nextAt = block > Date.now() ? block + 5000 : Number(row.next_at) || Date.now();
+          db.prepare("UPDATE send_outbox SET next_at = ?, updated_at = ? WHERE id = ? AND status = 'pending'").run(Math.round(nextAt), Date.now(), row.id);
+        } else {
+          const status = outboxExhausted(row.attempts, row.max_attempts) ? 'dead' : (outboxExpired(row.created_at) ? 'expired' : 'dead');
+          db.prepare("UPDATE send_outbox SET status = ?, reason = ?, updated_at = ? WHERE id = ? AND status = 'pending'").run(status, String(gate.reason), Date.now(), row.id);
+          log(`[outbox] #${row.id} ${status}：${gate.reason}（${row.conv_key}）`);
+        }
+        continue;
+      }
+      try {
+        await onebotSendRaw(row.kind, row.target_id, row.message, row.reply_to || null, row.at_user || null);
+      } catch (e) {
+        const attempts = (Number(row.attempts) || 0) + 1;
+        const cls2 = classifySendFailure(e);
+        if (!cls2.retryable || outboxExhausted(attempts, row.max_attempts)) {
+          db.prepare("UPDATE send_outbox SET status = 'dead', attempts = ?, reason = ?, updated_at = ? WHERE id = ? AND status = 'pending'").run(attempts, `${cls2.klass}: ${cls2.reason}`, Date.now(), row.id);
+          log(`[outbox] #${row.id} 重投失败已放弃（${attempts}/${row.max_attempts}，${cls2.klass}）：${e?.message ?? e}`);
+          notifyOutboxDead(row, cls2);
+        } else {
+          db.prepare("UPDATE send_outbox SET attempts = ?, next_at = ?, reason = ?, updated_at = ? WHERE id = ? AND status = 'pending'").run(attempts, Date.now() + outboxBackoffMs(attempts + 1), `${cls2.klass}: ${cls2.reason}`, Date.now(), row.id);
+          log(`[outbox] #${row.id} 重投第 ${attempts} 次失败（${cls2.klass}），${Math.round(outboxBackoffMs(attempts + 1) / 1000)}s 后再试`);
+        }
+        continue;
+      }
+      db.prepare("UPDATE send_outbox SET status = 'sent', attempts = attempts + 1, updated_at = ? WHERE id = ? AND status = 'pending'").run(Date.now(), row.id);
+      log(`[outbox] #${row.id} 重投成功（${row.conv_key}）：${String(row.message).slice(0, 60)}`);
+      appendActivity(`[补发成功] ${row.conv_key}：${String(row.message).slice(0, 80)}`);
+      // 重投成功说明该群其实能发 → 清掉 P8-3b 的三振计数，别让一次抖动永久压制这个群。
+      if (km[1] === 'group') {
+        sendBlockStrikes.delete(String(km[2]));
+        log(`[outbox] 群 ${km[2]} 补发成功，已清零发送受阻三振计数`);
+      }
+      try {
+        recordSentMessagesV2(row.conv_key, [String(row.message)]);
+        if (currentMode === 'reserved2') scheduleReplyCheckV2(row.conv_key);
+      } catch (e) { log(`[outbox] 补记已发消息失败：${e?.message ?? e}`); }
+    }
+  }
+
+  // 彻底放弃时通知主人一次（复用既有 notice 通道）。不唤醒、不刷屏。
+  function notifyOutboxDead(row, cls) {
+    try {
+      const okey = 'private:' + String(cfg.ownerQQ ?? '');
+      if (!cfg.ownerQQ || !isSessionAllowedInCurrentMode(okey)) return;
+      appendSocialV2Notice(okey, `[补发失败] 有一条消息重投 ${row.max_attempts} 次都没发出去，已放弃：${String(row.message).slice(0, 60)}（${cls.klass}：${cls.reason}）`);
+    } catch {}
+  }
+
+  // 面板只读用
+  function outboxStats() {
+    try {
+      const db = getMemoryDb();
+      const rows = db.prepare("SELECT status, COUNT(*) AS n FROM send_outbox GROUP BY status").all();
+      const out = { pending: 0, sent: 0, dead: 0, expired: 0 };
+      for (const r of rows) if (Object.prototype.hasOwnProperty.call(out, r.status)) out[r.status] = Number(r.n) || 0;
+      const items = db.prepare("SELECT id, conv_key, klass, reason, attempts, max_attempts, next_at, created_at FROM send_outbox WHERE status = 'pending' ORDER BY next_at ASC LIMIT 10").all()
+        .map((r) => ({ id: Number(r.id), key: String(r.conv_key), klass: String(r.klass), reason: String(r.reason), attempts: Number(r.attempts), maxAttempts: Number(r.max_attempts), nextAt: Number(r.next_at), createdAt: Number(r.created_at) }));
+      return { ...out, items };
+    } catch { return { pending: 0, sent: 0, dead: 0, expired: 0, items: [] }; }
   }
 
   // 群发送失败自诊：禁言(120/rejected)给出期限；被移出(result=110/权限失败)记 strike，两次自动停用整群。
@@ -8287,6 +8463,27 @@ async function main() {
     // P0-2 主动消息每日硬配额：按 (会话, 本地日期) 计数。落 SQLite 而不是内存，是因为
     // 桥接每晚重启（用户宿舍限电），只放内存等于每天配额都会归零，配额就形同虚设。
     db.exec("CREATE TABLE IF NOT EXISTS proactive_quota (conv_key TEXT NOT NULL, day TEXT NOT NULL, count INTEGER NOT NULL DEFAULT 0, updated_at INTEGER NOT NULL, PRIMARY KEY (conv_key, day))");
+    // P0-3 发送失败出箱：同样落 SQLite —— 出箱的意义就是「扛过抖动」，而抖动最严重的一种
+    // 正是网关/客户端重启，那时进程本来就可能刚重启过。只放内存等于最需要它的时候它自己也没了。
+    db.exec(`CREATE TABLE IF NOT EXISTS send_outbox (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      dedupe_key TEXT NOT NULL,
+      conv_key TEXT NOT NULL,
+      kind TEXT NOT NULL,
+      target_id TEXT NOT NULL,
+      message TEXT NOT NULL,
+      reply_to TEXT NOT NULL DEFAULT '',
+      at_user TEXT NOT NULL DEFAULT '',
+      klass TEXT NOT NULL DEFAULT '',
+      reason TEXT NOT NULL DEFAULT '',
+      attempts INTEGER NOT NULL DEFAULT 0,
+      max_attempts INTEGER NOT NULL DEFAULT 3,
+      next_at INTEGER NOT NULL DEFAULT 0,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL,
+      status TEXT NOT NULL DEFAULT 'pending'
+    )`);
+    db.exec("CREATE INDEX IF NOT EXISTS idx_send_outbox_due ON send_outbox(status, next_at)");
     try { db.exec("CREATE VIRTUAL TABLE IF NOT EXISTS facts_fts USING fts5(content, bigrams, tokenize='ascii')"); } catch {}
     memoryDb = db;
     log('记忆数据库已就绪：' + path.join(STATE_DIR, 'memory.db'));
@@ -8359,6 +8556,12 @@ async function main() {
   const watchdogGuardTimer = setInterval(ensureWatchdog, 3 * 60 * 1000);
   if (watchdogGuardTimer.unref) watchdogGuardTimer.unref();
   setTimeout(ensureWatchdog, 20000);
+
+  // P0-3 出箱巡检：每 60s 一次。为什么是 60s：最短退避就是 60s，扫得更勤没有意义；
+  // 更慢则会把「网关重启 30 秒」这种最常见的抖动拖成两分钟。
+  const outboxTimer = setInterval(() => { void sweepSendOutbox(); }, 60 * 1000);
+  if (outboxTimer.unref) outboxTimer.unref();
+  setTimeout(() => { void sweepSendOutbox(); }, 15000);
 
   // 提醒扫描器：每 30s 把到期提醒注入对应会话并唤醒（会话仍需在白名单内）。
   // P0-1：带 repeat_kind 的行触发后不置 fired，而是原地把 fire_at 推到下一次（行保持 pending）。
