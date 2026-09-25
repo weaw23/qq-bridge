@@ -9431,7 +9431,6 @@ async function main() {
   function evaluateWakeTriggerV2(key, st, event, kind, textContent, plainContent, quoteTargetIsSelf) {
     if (kind === 'private') return 'private';
     const tr = st.wakeConfig?.triggers ?? {};
-    if (tr.anyMessage) return 'anyMessage';
     if (tr.atMention) {
       const atSelf = Array.isArray(event?.message) && event.message.some((seg) => seg?.type === 'at' && String(seg.data?.qq) === String(event?.self_id ?? ''));
       if (atSelf || quoteTargetIsSelf) return 'atMention';
@@ -9461,6 +9460,12 @@ async function main() {
         return `speaker:${senderLabel}`;
       }
     }
+    // anyMessage 是**兜底**，不是优先项：放在具体触发之后，让 @/名字/关键词/提问/指定群友
+    // 先拿到自己的标签。若把它放在最前面（曾经如此），一个开了「每条消息都看」的群里
+    // 被 @ 也会被打成 anyMessage（闲聊类）—— 于是她刚说完话时有人叫她会被发言后冷却挡掉、
+    // 被频率帽拦下时会被「丢弃」而不是「暂存」。唤醒次数不变、错的只是标签，
+    // 但后果恰好是「她刚说完话就不理人」。拍一拍走独立入口（reason 恒为 'poke'），不受此行影响。
+    if (tr.anyMessage) return 'anyMessage';
     if (Number(tr.probability) > 0 && Math.random() < Number(tr.probability)) return 'probability';
     return null;
   }

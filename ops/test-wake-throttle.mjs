@@ -207,6 +207,25 @@ check('S14 mark-read 的睡前观察守卫放行管理员', /const isAdminMarkRe
 check('S15 diving→diving 的写入不会关掉 anyMessage（只在真的模式切换时才清除）',
   /if \(current\.mode !== 'diving' && next\.mode === 'diving' && !\('anyMessage' in inputTriggers\)\)/.test(src)
     && !/if \(next\.mode === 'diving' && !\('anyMessage' in inputTriggers\)\)/.test(src));
+// ★ 开了 anyMessage 的群，`evaluateWakeTriggerV2` 的第一句原来是
+//   `if (tr.anyMessage) return 'anyMessage';` —— 于是同一个群里「被 @、被提问、叫她的名字、
+//   命中关键词、指定群友发言」也全被打成 `anyMessage`（闲聊类）。后果不是少唤醒，而是**标签错**：
+//   她刚说完话时，有人 @ 她会被发言后冷却挡掉、被频率帽拦下时会被「丢弃」而不是「暂存」。
+//   这正是主人开的那个群的处境 ——「她刚说完话」不等于「别人叫她时可以不理」。
+//   修法：anyMessage 退到兜底位（概率那一句之前），具体触发优先拿到自己的标签。
+const evalRegion = src.slice(src.indexOf('function evaluateWakeTriggerV2'), src.indexOf('function buildWakePromptV2'));
+const at = (re) => { const m = evalRegion.match(re); return m ? evalRegion.indexOf(m[0]) : -1; };
+const iAny = at(/if \(tr\.anyMessage\) return 'anyMessage';/);
+const iAt = at(/if \(tr\.atMention\) \{/);
+const iName = at(/if \(tr\.nameMention && selfNickname\)/);
+const iKw = at(/if \(Array\.isArray\(tr\.keywords\) && tr\.keywords\.length\)/);
+const iQ = at(/if \(tr\.question && isDirectedAtAi\(plainContent\)\)/);
+const iSpk = at(/if \(Array\.isArray\(tr\.speakerIds\) && tr\.speakerIds\.length\)/);
+const iProb = at(/if \(Number\(tr\.probability\) > 0/);
+check('S16 anyMessage 只当兜底，不抢 @/提问/名字/关键词/指定群友的标签',
+  [iAt, iName, iKw, iQ, iSpk, iProb].every((i) => i >= 0)
+    && iAny > iAt && iAny > iName && iAny > iKw && iAny > iQ && iAny > iSpk && iAny < iProb,
+  `anyMessage@${iAny} at@${iAt} name@${iName} kw@${iKw} question@${iQ} speaker@${iSpk} probability@${iProb}`);
 
 // ══════════════════════════════════════════════════════════════════
 section('A 段：活体配置面（真路由 / 真落盘 / 不冲掉既有配置）');
