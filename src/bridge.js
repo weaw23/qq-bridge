@@ -37,6 +37,9 @@ import {
   normalizeRepeatSpec, nextRepeatFireMs, repeatFromRow, repeatColumnsFor, describeRepeat
 } from './repeat-schedule.js';
 import {
+  localDayKey, quotaPerDayFromConfig, proactiveAllowed, nextLocalMidnight
+} from './proactive-quota.js';
+import {
   loadExpressionStore,
   saveExpressionStore,
   upsertExpression,
@@ -53,7 +56,8 @@ import {
   buildStickerContext,
   buildStickerStrategyHint,
   applyStickerNote,
-  markStickerUsed
+  markStickerUsed,
+  stickerRepeatBlocked
 } from './sticker-lib.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -3779,6 +3783,34 @@ async function main() {
           const now = Date.now();
           try {
             const st = getSocialV2State(key);
+            // P0-2 同图不连发：连着两张一模一样的表情包最像机器人，真人不会这么干。
+            // 比对用「解析后的 id / md5」，而不是用户传来的原始 stickerId —— 同一张图允许用
+            // id / md5 / url 三种写法传入，只比原串会被换个写法绕过。
+            // 语义是「上一张不同才算翻篇」：中间发了别的表情就解锁，中间只发文字不解锁。
+            {
+              // 注意：这里只能用模块级 stickerEntries —— `synced` 只存在于 getStickerImageData /
+              // 表情列表路由等函数的局部作用域，本路由里引用它会直接 ReferenceError（被外层 catch
+              // 吞成 500，表面看像「QQ 发图失败」），而 stickerEntries 是本地已落盘的那一份，
+              // 正是「上一张发的是什么」的依据。
+              // findSticker 负责解析 id/md5/url 三种写法，比对逻辑在纯函数 stickerRepeatBlocked 里
+              // （所有分叉离线穷举，见 ops/test-proactive-quota.mjs）；解析不出来时退回原串，
+              // 否则「刚发过的那张」用原样 id 再发一次会漏过。
+              const resolved = findSticker(stickerEntries, stickerId);
+              const { blocked: same, rid } = stickerRepeatBlocked(resolved ?? { id: stickerId }, st.lastStickerId, st.lastStickerMd5);
+              if (same) {
+                // 顺手给几个替代选项：她通常只是「想发个表情」，不是非这张不可，
+                // 直接返回候选能省掉一次 qq_list_stickers 往返。
+                const alts = (Array.isArray(stickerEntries) ? stickerEntries : [])
+                  .filter((e) => e && e.id && e.id !== rid && e.desc)
+                  .slice(0, 3)
+                  .map((e) => `${e.id}（${e.desc}）`);
+                sendJson({
+                  ok: false,
+                  error: `刚才已经发过这张表情了（${rid}），连着两张一样的很像机器人；换一张${alts.length ? '，可选：' + alts.join('、') : '，或用 qq_list_stickers 看看别的'}`
+                }, 409);
+                return;
+              }
+            }
             const maxPerMinute = Number(sendCfg.maxSendPerMinute) || 0;
             const maxPerHour = Number(sendCfg.maxSendPerHour) || 0;
             const recentMinute = (st.sendTimes || []).filter((t) => now - t < 60000).length;
@@ -3816,6 +3848,9 @@ async function main() {
             if (st.recentMessages.length > recentLimit) st.recentMessages.splice(0, st.recentMessages.length - recentLimit);
             st.lastAiReplyAt = now;
             st.lastActionAt = now;
+            // P0-2 同图不连发：只有真发成功了才记，失败/被拦的不算（否则一次失败会白锁住一张图）
+            st.lastStickerId = String(sent.entry?.id || stickerId || '');
+            st.lastStickerMd5 = String(sent.entry?.md5 || '').toUpperCase();
             st.wakeConfig.noActionCount = 0;
             st.preSleepWaitSatisfiedAt = 0;
             st.preSleepWaitObservedAt = 0;
@@ -4966,6 +5001,59 @@ async function main() {
           return;
         }
 
+        // P0-2 只读观察点：主动配额用量 + 每个会话「最近发出去的那张表情」。
+        // 加这个端点是因为这两样东西此前只活在内存/DB 深处，出了事只能靠猜；测试也需要一个
+        // 零副作用的读口来验证状态机（发图被拦之后 lastStickerId 有没有被误改）。
+        if (req.method === 'GET' && url.pathname === '/api/panel/social-state') {
+          const quota = proactiveQuotaPerDay();
+          // 显式 ?key= 分支：只读 DB + 只读已存在的会话状态，**不创建**新会话。
+          // 作用：面板 sessions 只列「已经有过消息的对话」，而配额表和 lastSticker 状态都按 key
+          // 存放，所以「某个 key 的配额读出来是多少」在默认视图里查不到（合成 key 更是查不到）。
+          // 调试和回归测试都需要一个能按任意 key 读、且不产生副作用的口子。
+          const qKey = String(url.searchParams.get('key') ?? '').trim();
+          if (qKey) {
+            const used = proactiveUsedToday(qKey);
+            const st = socialV2.conversations.get(qKey) || null;
+            sendJson({
+              ok: true,
+              localDay: localDayKey(),
+              utcDay: new Date().toISOString().slice(0, 10),
+              nextLocalMidnight: nextLocalMidnight(),
+              serverNow: Date.now(),
+              key: qKey,
+              known: !!st,
+              proactiveUsedToday: used,
+              proactiveQuota: quota,
+              proactiveAllowed: proactiveAllowed(quota, used),
+              lastStickerId: String(st?.lastStickerId || ''),
+              lastStickerMd5: String(st?.lastStickerMd5 || ''),
+              lastAiReplyAt: Number(st?.lastAiReplyAt) || 0
+            });
+            return;
+          }
+          const sessions = [];
+          for (const [key, st] of socialV2.conversations) {
+            const used = proactiveUsedToday(key);
+            sessions.push({
+              key,
+              proactiveUsedToday: used,
+              proactiveQuota: quota,
+              proactiveAllowed: proactiveAllowed(quota, used),
+              lastStickerId: String(st.lastStickerId || ''),
+              lastStickerMd5: String(st.lastStickerMd5 || ''),
+              lastAiReplyAt: Number(st.lastAiReplyAt) || 0
+            });
+          }
+          sendJson({
+            ok: true,
+            localDay: localDayKey(),
+            utcDay: new Date().toISOString().slice(0, 10),
+            nextLocalMidnight: nextLocalMidnight(),
+            serverNow: Date.now(),
+            sessions
+          });
+          return;
+        }
         if (req.method === 'GET' && url.pathname === '/api/panel/overview') {
           const login = await (async () => {
             try {
@@ -6972,7 +7060,11 @@ async function main() {
         lastSummarizedSeq: 0,
         activeTopics: [],
         pendingThoughts: [],
-        memberImpressions: {}
+        memberImpressions: {},
+        // P0-2 同图不连发：记住这个会话最近发出去的那张表情（id 与 md5 双份，
+        // 因为 stickerId 允许传 id/md5/url，只比 id 会被换个写法绕过）
+        lastStickerId: '',
+        lastStickerMd5: ''
       };
       KNOWN_AGENT_TOKENS.add(st.agentToken);
       socialV2.conversations.set(key, st);
@@ -7025,6 +7117,8 @@ async function main() {
             lastSummarizedSeq: Number(val.lastSummarizedSeq) || 0,
             activeTopics: Array.isArray(val.activeTopics) ? val.activeTopics : [],
             pendingThoughts: Array.isArray(val.pendingThoughts) ? val.pendingThoughts : [],
+            lastStickerId: String(val.lastStickerId ?? ''),
+            lastStickerMd5: String(val.lastStickerMd5 ?? ''),
             memberImpressions: (() => {
               const rawImp = (val.memberImpressions && typeof val.memberImpressions === 'object') ? val.memberImpressions : {};
               const clean = {};
@@ -7099,6 +7193,8 @@ async function main() {
           activeTopics: Array.isArray(st.activeTopics) ? st.activeTopics.slice(-50) : [],
           pendingThoughts: Array.isArray(st.pendingThoughts) ? st.pendingThoughts.slice(-50) : [],
           memberImpressions: st.memberImpressions && typeof st.memberImpressions === 'object' ? st.memberImpressions : {},
+          lastStickerId: String(st.lastStickerId || ''),
+          lastStickerMd5: String(st.lastStickerMd5 || ''),
           seenForwardIds: Array.from(seenForwardIds.get(key) || []).slice(-1000)
         };
       }
@@ -8188,6 +8284,9 @@ async function main() {
     } catch {}
     db.exec("CREATE TABLE IF NOT EXISTS followups (id INTEGER PRIMARY KEY AUTOINCREMENT, conv_key TEXT NOT NULL, member_id TEXT NOT NULL DEFAULT '', name TEXT NOT NULL DEFAULT '', topic TEXT NOT NULL, due_at INTEGER, status TEXT NOT NULL DEFAULT 'pending', created_at INTEGER NOT NULL)");
     db.exec("CREATE INDEX IF NOT EXISTS idx_followups_due ON followups (status, due_at)");
+    // P0-2 主动消息每日硬配额：按 (会话, 本地日期) 计数。落 SQLite 而不是内存，是因为
+    // 桥接每晚重启（用户宿舍限电），只放内存等于每天配额都会归零，配额就形同虚设。
+    db.exec("CREATE TABLE IF NOT EXISTS proactive_quota (conv_key TEXT NOT NULL, day TEXT NOT NULL, count INTEGER NOT NULL DEFAULT 0, updated_at INTEGER NOT NULL, PRIMARY KEY (conv_key, day))");
     try { db.exec("CREATE VIRTUAL TABLE IF NOT EXISTS facts_fts USING fts5(content, bigrams, tokenize='ascii')"); } catch {}
     memoryDb = db;
     log('记忆数据库已就绪：' + path.join(STATE_DIR, 'memory.db'));
@@ -8919,7 +9018,13 @@ async function main() {
       const nightNote = (hh >= 23 || hh < 7)
         ? '现在是深夜：真人这个点要么睡了要么静音刷手机，没话找话最扣分。没有非说不可的事就别冒泡，直接把下一次唤醒用 qq_set_wake_config 设到明早 8~11 点的有限潜水，安静睡下。\n'
         : '';
-      return `${base}【主动机会】${key}\n原因：群里已经安静了一段时间，这是一次你可以主动冒泡的机会。\n${nightNote}优先主动开个话题、追问上次没聊完的事、分享一个刚想到的想法；如果一时想不到，可以用 mcp__web-search-safe__web_search 搜一下当前热点/时事/网络热梗，再结合记忆里的群友兴趣挑一个自然角度。只要内容自然，就大胆开口；如果实在没话想说，再安静收尾（qq_mark_read 或 qq_set_wake_config）。`;
+      // P0-2：把配额余量告诉她。不告诉的话她不知道今天还剩几次机会，可能上午就把额度用完，
+      // 后半天想说话却张不开嘴，只能困惑地安静收尾。
+      const quota = proactiveQuotaPerDay();
+      const quotaNote = quota >= 0
+        ? `【今日主动机会】本次是第 ${proactiveUsedToday(key)}/${quota} 次（每天上限，用完后不会再被主动唤醒，只能等主人说话）。请把额度留给真正想说的那一句，别为冒泡而冒泡。\n`
+        : '';
+      return `${base}【主动机会】${key}\n原因：群里已经安静了一段时间，这是一次你可以主动冒泡的机会。\n${quotaNote}${nightNote}优先主动开个话题、追问上次没聊完的事、分享一个刚想到的想法；如果一时想不到，可以用 mcp__web-search-safe__web_search 搜一下当前热点/时事/网络热梗，再结合记忆里的群友兴趣挑一个自然角度。只要内容自然，就大胆开口；如果实在没话想说，再安静收尾（qq_mark_read 或 qq_set_wake_config）。`;
     }
     if (reason === 'reminder') {
       return `${base}【定时提醒到点】未读里的 [定时提醒] 是你自己此前定下的提醒，现在到点了。\n把这件事自然地转达或处理掉——像平时说话一样，别照着念通知原文，也别说明“这是我设的提醒”。如果这件事已经不需要提了，说明一句或直接收尾。收尾照常（qq_mark_read 或 qq_set_wake_config）。`;
@@ -9231,6 +9336,31 @@ async function main() {
     } catch { return 1; }
   }
 
+  // P0-2 主动消息每日硬配额 -------------------------------------------------------------------
+  // 病因：主动冒泡只有概率、没有任何上限。每 30~90 分钟抽查一次，乘上精力曲线与好感加成，
+  // 一天攒出几十次「没人叫她、她自己想说话」是可能的，而且主人越不回她越可能连发。
+  // 计数口径只算 proactiveCheck（真正没人叫她时她自己开口）：reminder / schedule / followup
+  // 是明确安排的任务，属于「该做的事」；reflect 每天一次、care 有 3 天冷却，本身已有硬上限，
+  // 再吃配额只会把日常闲聊挤没。判定逻辑在 src/proactive-quota.js（纯函数，可单测）。
+  // 日期一律本地时区（见 repeat-schedule.js 的时区纪律）：用 toISOString 会在当地早上 8 点
+  // 才换日，于是「今天」一直是昨天，配额要拖到下午才刷新。
+  function proactiveQuotaPerDay() {
+    return quotaPerDayFromConfig(cfg.socialV2?.proactive?.quotaPerDay);
+  }
+  function proactiveUsedToday(key, ts = Date.now()) {
+    try {
+      const r = getMemoryDb().prepare('SELECT count FROM proactive_quota WHERE conv_key = ? AND day = ?').get(key, localDayKey(ts));
+      return Number(r?.count) || 0;
+    } catch { return 0; }
+  }
+  function bumpProactiveQuota(key, ts = Date.now()) {
+    try {
+      getMemoryDb().prepare(
+        'INSERT INTO proactive_quota (conv_key, day, count, updated_at) VALUES (?, ?, 1, ?) ON CONFLICT(conv_key, day) DO UPDATE SET count = count + 1, updated_at = excluded.updated_at'
+      ).run(key, localDayKey(ts), ts);
+    } catch (error) { log('[reserved2] 主动配额计数失败:', error?.message ?? error); }
+  }
+
   function scheduleProactiveCheckV2(key) {
     if (cfg.socialV2?.proactive?.enabled === false) return;
     if (socialV2.paused || currentMode !== 'reserved2') return;
@@ -9263,7 +9393,16 @@ async function main() {
       const aiCount = recent.filter((m) => m && m.isSelf && Date.now() - Number(m.time || 0) < 60 * 60 * 1000).length;
       if (aiCount >= 5) prob *= 0.3;
       if (idle >= idleThreshold && Math.random() < prob && !isConversationBusyV2(key, st)) {
-        void sendWakePromptV2(key, 'proactiveCheck').catch((error) => log(`[reserved2] proactive 唤醒异常 ${key}:`, error?.message ?? error));
+        // P0-2：配额检查放在最后一步（概率已过、对话也确实空闲），日志才说明得了
+        // 「本来想说话、但今天额度用完了」，而不是每次抽查都刷一行噪音。
+        const quota = proactiveQuotaPerDay();
+        const used = proactiveUsedToday(key);
+        if (!proactiveAllowed(quota, used)) {
+          log(`[reserved2] 主动消息今日配额已用完（${used}/${quota}），本次不主动 ${key}`);
+        } else {
+          if (quota >= 0) bumpProactiveQuota(key);
+          void sendWakePromptV2(key, 'proactiveCheck').catch((error) => log(`[reserved2] proactive 唤醒异常 ${key}:`, error?.message ?? error));
+        }
       }
       scheduleProactiveCheckV2(key);
     }, delay);

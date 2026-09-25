@@ -237,3 +237,25 @@ export function markStickerUsed(entries, id, context = '') {
   list[idx] = next;
   return { entries: list, entry: next };
 }
+
+// P0-2 同图不连发：判断这次要发的表情，是否就是该会话「上一张成功发出去的」那张。
+//
+// 为什么单独成纯函数：判定有三个容易写错的地方，而且全都可以离线穷举——
+//   ① stickerId 允许传 id / md5 / url 三种写法，只比原串会被「换个写法」绕过
+//      （所以调用方先 findSticker 解析，这里再比解析后的 id 与 md5）；
+//   ② md5 大小写不固定，比较前统一大写；
+//   ③ 解析不出来时（传了个不存在的 id）rid 会退回原串，否则「刚发过的那张」
+//      原样再发一次就会漏过。
+// 留在发图路由里就只能真发一张图之后靠 409 验证——而测试消息会进主人的真实聊天。
+// 抽出来所有分叉都能离线覆盖。
+//
+// 语义是「上一张不同才算翻篇」：中间发了别的表情就解锁；中间只发文字不解锁。
+// 任一侧为空一律放行 —— 宁可漏拦，也不能把正常发表情拦死。
+export function stickerRepeatBlocked(entry, lastId = '', lastMd5 = '') {
+  const rid = String(entry?.id ?? '').trim();
+  const rmd5 = String(entry?.md5 ?? '').trim().toUpperCase();
+  const prevId = String(lastId ?? '').trim();
+  const prevMd5 = String(lastMd5 ?? '').trim().toUpperCase();
+  const blocked = (!!rid && rid === prevId) || (!!rmd5 && rmd5 === prevMd5);
+  return { blocked, rid, rmd5 };
+}
