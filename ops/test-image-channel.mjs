@@ -89,13 +89,20 @@ console.log('\n=== B) 安全边界（必须仍然拦得住）===');
   check('带空字符串令牌 → 必须 403（不能被当成管理端绕过）', r.status === 403, `实得 ${r.status} ${r.json?.error ?? ''}`);
 }
 {
-  // 拿 A 会话的令牌去开 B 会话：跨会话必须拦下
-  const other = sessions.find((s) => s.key !== KEY);
+  // 拿 A 会话的令牌去开 B 会话。
+  // ⚠️ 2026-09-25 语义变更：主人私聊令牌已升级为「主令牌」，跨会话操作是**有意放开**的
+  // （起因是一轮唤醒只注入当前会话令牌，她在私聊里被叫去管群事时群工具全部 403）。
+  // 所以这里不能再断言「跨会话一律 403 agent token 无效」——那会把正常行为当成回归。
+  // 跨会话的完整矩阵（谁能跨、谁不能跨、群令牌会不会反向升级）见 ops/test-cross-session.mjs。
+  // 本项只保留一条与主令牌无关的硬边界：目标会话不在白名单内就必须 403。
+  const cfgJ = JSON.parse(fs.readFileSync(path.join(ROOT, 'config.json'), 'utf8'));
+  const allowG = (cfgJ.allow?.groups ?? []).map(String);
+  const other = sessions.find((s) => s.key !== KEY && !allowG.includes(String(s.key).split(':')[1] ?? ''));
   if (other) {
     const r = await call('/api/send/rich', { key: other.key, parts: [] }, { 'x-agent-token': TOK });
-    check('跨会话盗用令牌 → 必须 403', r.status === 403, `实得 ${r.status} ${r.json?.error ?? ''}（目标 ${other.key}）`);
+    check('非白名单会话 → 必须 403（主令牌也不能绕过白名单）', r.status === 403, `实得 ${r.status} ${r.json?.error ?? ''}（目标 ${other.key}）`);
   } else {
-    console.log('⚪ 只有一个会话，跳过跨会话盗用测试');
+    console.log('⚪ 找不到非白名单会话，跳过白名单边界测试');
   }
 }
 

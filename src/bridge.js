@@ -1797,6 +1797,31 @@ async function main() {
 
   // ── 本地控制台（独立 Web 面板，不依赖 DSH WebUI） ───────────────────────────
   // 模式/角色/静默状态都存 state/*.json，桥接即时感知；此服务只读写这些文件。
+  // 主人私聊会话的规范 key：跨会话主令牌的作用域锚点（见 agentTokenOk）。
+  // cfg.ownerQQ 留空或不是正整数时返回 null，此时主令牌机制自动失效——
+  // 宁可退回「一轮一会话」，也不能因为配置缺失变成「任何令牌都是主令牌」。
+  function ownerSessionKeyV2() {
+    return canonicalV2Key('private:' + String(cfg.ownerQQ ?? '').trim());
+  }
+
+  // 只有主人私聊会话需要这段：告诉它这个令牌能跨会话用，并列出可操作的会话。
+  // 群名不在这里注入——桥接没有群名缓存（只有实时 OneBot 调用才拿得到），
+  // 在唤醒热路径上逐群查一次会白白增加延迟；需要名字时它自己调 qq_list_groups 就行，
+  // 那个工具不要令牌。
+  function crossSessionLineV2(key) {
+    if (cfg.socialV2?.ownerMasterToken === false) return '';
+    const ownerKey = ownerSessionKeyV2();
+    if (!ownerKey || canonicalV2Key(key) !== ownerKey) return '';
+    const others = [];
+    for (const k of socialV2.conversations.keys()) {
+      if (k === ownerKey) continue;
+      if (!isSessionAllowedInCurrentMode(k)) continue;
+      others.push(k);
+    }
+    if (!others.length) return '';
+    return `【跨会话权限】你现在这个是主人私聊令牌，同时是主令牌：可以直接操作下面这些会话，调用工具时把 key 换成目标会话即可，令牌不用换。\n可操作：${others.join('、')}\n（群号对应的群名用 qq_list_groups 查，那个工具不需要令牌。）\n只有主人私聊令牌能跨会话，群会话的令牌只能动它自己那个群。这个令牌绝对不要发到任何群、不要写进任何消息内容里。\n\n`;
+  }
+
   function startConsoleServer() {
     const port = cfg.consolePort ?? 3100;
     // 控制台鉴权：优先用 config.consoleToken，未配置则自动生成并持久化，不再默认无鉴权。
@@ -1808,10 +1833,27 @@ async function main() {
     if (!configuredToken) log(`控制台未配置 consoleToken，已自动生成：${String(consoleToken).slice(0, 6)}…（完整值保存在 state/console-token）`);
     // 二代会话级隔离：MCP 工具调用时若带 x-agent-token，则必须匹配该会话的 agentToken。
     // 控制台/管理端请求不带此头，仍走 consoleToken 管理通道。
+    //
+    // 例外——主人私聊令牌是「主令牌」，可跨会话操作（cfg.socialV2.ownerMasterToken=false 可关断）。
+    // 起因：一轮唤醒只注入当前会话的令牌，于是主人在私聊里叫她去管群事时，群工具全部 403
+    // 「agent token 无效」。她甚至查得到自己在某群的状态（qq_my_group_status 允许私聊会话 +
+    // 显式 groupId），却读不了也发不了那个群的消息——不是权限设计要拦她，
+    // 是令牌作用域把她锁死在了单个会话里。放开后与本文件既有先例一致：
+    // /api/socialV2/admin 本来就是「仅限主人私聊会话的令牌」。
+    //
+    // 群会话令牌不跟着放开，仍然只能动它自己那个群：群令牌活在群上下文里，群友可以用话术
+    // 诱导她「去看看主人私聊都说了什么」，一旦群令牌也能跨会话，就等于把 prompt injection
+    // 直接放大成越权读取主人私聊。而主人私聊只有主人进得来（allowPrivate 只有他一个），
+    // 所以主令牌挂在这里是安全的。
     const agentTokenOk = (key, token) => {
+      const t = String(token ?? '').trim();
+      if (!t) return false;
       const canonical = canonicalV2Key(key);
       const st = socialV2.conversations.get(canonical ?? key);
-      return !!st && !!st.agentToken && token === st.agentToken;
+      if (st?.agentToken && t === st.agentToken) return true;
+      if (cfg.socialV2?.ownerMasterToken === false) return false;
+      const ost = socialV2.conversations.get(ownerSessionKeyV2());
+      return !!ost?.agentToken && t === ost.agentToken;
     };
     // 令牌来源归一：本文件里两种约定长期并存——多数 /api/socialV2/* 从 x-agent-token 头读，
     // 而 /api/send/* 与少数 v2 端点从 body.token 读。MCP 侧同样混用：qq_send_group_message /
@@ -8763,7 +8805,7 @@ async function main() {
     const roleState = readRoleState();
     const roleLine = roleState.role ? `【当前角色】${roleState.role}（完整角色卡请调用 qq_get_prompt 查看）\n\n` : '';
     const st = getSocialV2State(key);
-    const tokenLine = `【会话令牌】${st.agentToken}（调用二代状态工具时请在参数中带上此令牌）\n\n`;
+    const tokenLine = `【会话令牌】${st.agentToken}（调用二代状态工具时请在参数中带上此令牌）\n\n` + crossSessionLineV2(key);
     const memoryText = formatMemoryV2(st);
     const memoryLine = memoryText ? `${memoryText}\n\n` : '';
     // 注意：黑话表不在这里注入，deliverPromptNow 的 withSlangContext 会统一注入，
@@ -8910,7 +8952,10 @@ async function main() {
     st.lastWakeReason = reason;
     saveSocialV2State();
     const promptText = buildWakePromptV2(key, reason);
-    log(`[reserved2] 唤醒 ${key}（${reason}）`);
+    // 把「有没有注入跨会话主令牌说明」写进唤醒日志：只是个布尔标记，不含令牌本身。
+    // 提示词正文不落日志，所以这类问题原本无从查证——她若又说「动不了别的会话」，
+    // 先看这行就能分清是提示词没给到，还是给了她没照着用。
+    log(`[reserved2] 唤醒 ${key}（${reason}）${promptText.includes('【跨会话权限】') ? '｜已注入跨会话主令牌说明' : ''}`);
     const rollbackWakeTime = () => {
       const idx = st.wakeTimes.lastIndexOf(wakeTime);
       if (idx >= 0) st.wakeTimes.splice(idx, 1);
