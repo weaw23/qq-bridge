@@ -79,7 +79,7 @@ import {
 } from './sticker-lib.js';
 // L2 唤醒节流：给群打开「每条消息都看」(triggers.anyMessage) 之后，唤醒次数会逼近消息数，
 // 必须有频率帽 + 发言后冷却。判定逻辑全部在纯函数模块里（可以离线穷举），这里只做调用与日志。
-import { wakeThrottleVerdict, WAKE_SPEAK_COOLDOWN_MS } from './wake-throttle.js';
+import { wakeThrottleVerdict, WAKE_SPEAK_COOLDOWN_MS, preservedOwnerOverrides, THROTTLE_OVERRIDE_FIELDS } from './wake-throttle.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, '..');
@@ -7406,11 +7406,35 @@ async function main() {
         clearTimeout(st.sleepTimer);
         st.sleepTimer = null;
       }
-      st.wakeConfig = defaultWakeConfigV2();
+      resetWakeConfigV2(st, { key, why: '无任何触发条件' });
       if (!opts.skipSave) saveSocialV2State();
       if (key) setupSleepTimerV2(key);
-      log(`[reserved2] 唤醒配置无任何触发条件，已重置为默认配置，避免永眠`);
     }
+  }
+
+  // 把唤醒配置重置为默认值，但**刻意保留**两样东西 —— 因为这几处重置的唯一目的是「别永眠」：
+  //   ① triggers.anyMessage：主人给大群配的「每条消息都看」。它只会让她**更容易**被唤醒，保留它
+  //      绝不妨碍防永眠；反过来，在开了它的群里「连续几个回合不说话」是常态（她看每条消息、
+  //      只在该说话时说话），不是卡死 —— 不该拿它当卡死的证据，把她按回「只看被 @ 的」。
+  //   ② 按会话的节流三参数：同样只会「限制频率」，不会造成永眠（0 = 不限，负值在路由层被拒）。
+  //      丢掉它们等于把主人配的成本闸门一起清掉（134 人群会退回全局默认 20 次/分、200 次/时）。
+  function resetWakeConfigV2(st, { key, why } = {}) {
+    const keep = preservedOwnerOverrides(st.wakeConfig);
+    const next = defaultWakeConfigV2();
+    const kept = [];
+    if (keep.anyMessage) {
+      next.triggers = { ...next.triggers, anyMessage: true };
+      kept.push('anyMessage');
+    }
+    for (const field of THROTTLE_OVERRIDE_FIELDS) {
+      if (keep.fields[field] !== undefined) {
+        next[field] = keep.fields[field];
+        kept.push(`${field}=${keep.fields[field]}`);
+      }
+    }
+    st.wakeConfig = next;
+    if (key) log(`[reserved2] ${key} 重置唤醒配置（${why ?? '永眠兜底'}）${kept.length ? `；保留主人配置：${kept.join('、')}` : ''}`);
+    return next;
   }
 
   function getSocialV2State(key) {
@@ -10613,8 +10637,7 @@ async function main() {
                   st.wakeConfig.noActionCount = (st.wakeConfig.noActionCount || 0) + 1;
                   const limit = Number(cfg.socialV2?.wake?.noActionLimit) || 3;
                   if (st.wakeConfig.noActionCount >= limit) {
-                    log(`[reserved2] ${key} 连续 ${st.wakeConfig.noActionCount} 次唤醒无行动，重置唤醒配置`);
-                    st.wakeConfig = defaultWakeConfigV2();
+                    resetWakeConfigV2(st, { key, why: `连续 ${st.wakeConfig.noActionCount} 次唤醒无行动` });
                     st.bootstrapSent = true;
                     st.wakeConfig.noActionCount = 0;
                   }
@@ -10673,9 +10696,8 @@ async function main() {
                     log(`[reserved2] ${key} 未设置唤醒条件，发送提醒 (${currentMiss}/${maxReminders})`);
                   } else {
                     const st = getSocialV2State(key);
-                    st.wakeConfig = defaultWakeConfigV2();
+                    resetWakeConfigV2(st, { key, why: '连续未设置唤醒条件' });
                     saveSocialV2State();
-                    log(`[reserved2] ${key} 连续未设置唤醒条件，已重置为默认唤醒配置`);
                   }
                 }
               }

@@ -160,3 +160,31 @@ export function wakeThrottleVerdict({ reason, wakeTimes, sendTimes, now, maxPerM
   }
   return { ok: true, stage: 'ok', ambient: true, base, rate, cooldown, park: false, detail: '' };
 }
+
+// ── 永眠兜底重置时「该保留什么」────────────────────────────────────────
+//
+// bridge.js 有三处把唤醒配置重置为默认值的兜底（ensureWakeableV2 / 连续无行动 / 连续未设置唤醒
+// 条件），原本都是 `st.wakeConfig = defaultWakeConfigV2()` —— 换掉整个对象。而默认值里
+// anyMessage 取的是 `mode === 'active'`（diving 就是 false），三个节流参数也不在里面。
+// 后果（实测会踩）：给大群开了「每条消息都看」之后，只要她**连续 3 个回合选择不说话**
+// —— 在这种群里这是常态，不是卡死 —— 主人的 anyMessage 与成本闸门就被无声抹掉，
+// 退回「只看被 @ 的」+ 全局默认 20 次/分、200 次/时。
+//
+// 判断依据只有一句：这几处重置的唯一目的是「别永眠」。anyMessage 与频率帽都只会让她
+// **更容易**被唤醒 / **限制**唤醒频率，不可能造成永眠，所以它们不在重置范围内。
+export const THROTTLE_OVERRIDE_FIELDS = Object.freeze(['maxWakePerMinute', 'maxWakePerHour', 'speakCooldownMs']);
+
+// 从旧配置里挑出主人配的、不该被重置抹掉的部分。
+// 规则从严：anyMessage 只在严格 true 时保留；三个节流字段只接受有限且 >= 0 的数（取整），
+// 脏值一律丢弃、宁可退回全局默认 —— 兜底重置是最不该被脏数据影响的一条路径。
+// 不认识的字段一律不带出来：默认值结构由 defaultWakeConfigV2() 负责。
+export function preservedOwnerOverrides(oldConfig) {
+  const old = oldConfig && typeof oldConfig === 'object' ? oldConfig : {};
+  const anyMessage = old.triggers && typeof old.triggers === 'object' ? old.triggers.anyMessage === true : false;
+  const fields = {};
+  for (const field of THROTTLE_OVERRIDE_FIELDS) {
+    const value = old[field];
+    if (Number.isFinite(value) && value >= 0) fields[field] = Math.round(value);
+  }
+  return { anyMessage, fields };
+}

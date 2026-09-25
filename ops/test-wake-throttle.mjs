@@ -46,7 +46,9 @@ import {
   lastSpeakAtFrom,
   wakeRateVerdict,
   speakCooldownVerdict,
-  wakeThrottleVerdict
+  wakeThrottleVerdict,
+  preservedOwnerOverrides,
+  THROTTLE_OVERRIDE_FIELDS
 } from '../src/wake-throttle.js';
 
 const ROOT = path.resolve(import.meta.dirname, '..');
@@ -175,6 +177,36 @@ check('U6.4 ★冷却期内闲聊全部被挡、@ 她照常通过', ambB.every((
 check('U6.5 冷却=0 时同一批闲聊恢复通过（可一键关闭）', [T0 + 10000, T0 + 40000].every((t) => wakeThrottleVerdict({ reason: 'anyMessage', wakeTimes: [], sendTimes: sheSpoke, now: t, maxPerMinute: 2, maxPerHour: 30, speakCooldownMs: 0 }).ok === true));
 check('U6.6 导出常量：默认冷却 120s', WAKE_SPEAK_COOLDOWN_MS === 120000);
 
+// ── U7：永眠兜底重置时「该保留什么」────────────────────────────────────
+// 三处兜底重置原本是整个对象换成默认值，于是开了「每条消息都看」的大群只要她连续 3 个回合
+// 不说话（常态，不是卡死），主人的 anyMessage 与成本闸门就被抹掉。这个纯函数决定保留什么。
+// 注：本组没有「改前基线」—— 函数是本次新加的，而 ESM 的具名 import 在模块链接期就会
+// 失败，缺函数会直接让整个测试文件加载失败，不可能只红这一组。行为覆盖靠下面这些边界穷举。
+say(`   THROTTLE_OVERRIDE_FIELDS = ${JSON.stringify(THROTTLE_OVERRIDE_FIELDS)}`);
+check('U7.1 空/脏配置一律不保留（退回默认，不猜）',
+  [[undefined, {}], [null, {}], ['abc', {}], [42, {}]].every(([input]) => {
+    const k = preservedOwnerOverrides(input);
+    return k.anyMessage === false && Object.keys(k.fields).length === 0;
+  }));
+check('U7.2 anyMessage 只在严格 true 时保留（字符串 "true" / 1 都不算）',
+  preservedOwnerOverrides({ triggers: { anyMessage: true } }).anyMessage === true
+    && preservedOwnerOverrides({ triggers: { anyMessage: 'true' } }).anyMessage === false
+    && preservedOwnerOverrides({ triggers: { anyMessage: 1 } }).anyMessage === false
+    && preservedOwnerOverrides({ triggers: null }).anyMessage === false
+    && preservedOwnerOverrides({}).anyMessage === false);
+const keptF = preservedOwnerOverrides({ maxWakePerMinute: 2, maxWakePerHour: 30, speakCooldownMs: 120000.4 });
+say(`   三字段保留结果 = ${JSON.stringify(keptF.fields)}`);
+check('U7.3 三关节流值保留且取整（0 = 不限，也必须保留，那是主人的明确选择）',
+  keptF.fields.maxWakePerMinute === 2 && keptF.fields.maxWakePerHour === 30 && keptF.fields.speakCooldownMs === 120000
+    && preservedOwnerOverrides({ maxWakePerMinute: 0 }).fields.maxWakePerMinute === 0
+    && Object.keys(preservedOwnerOverrides({ maxWakePerMinute: 0 }).fields).length === 1);
+check('U7.4 脏值一律丢弃（负数/NaN/Infinity/字符串/null/undefined）',
+  ['-5', 'abc', '2'].every((v) => preservedOwnerOverrides({ maxWakePerMinute: v }).fields.maxWakePerMinute === undefined)
+    && [NaN, Infinity, -Infinity, -1, null, undefined, {}].every((v) => preservedOwnerOverrides({ maxWakePerMinute: v }).fields.maxWakePerMinute === undefined));
+check('U7.5 只认识这三样，其它字段不带出来（默认值结构归 defaultWakeConfigV2）',
+  Object.keys(preservedOwnerOverrides({ mode: 'active', infinite: true, sleepUntil: '2026-01-01', batchWindowMs: 3000, noActionCount: 5, triggers: { anyMessage: true, atMention: true, keywords: ['x'] } }).fields).length === 0
+    && preservedOwnerOverrides({ triggers: { anyMessage: true, atMention: true, keywords: ['x'] } }).anyMessage === true);
+
 // ══════════════════════════════════════════════════════════════════
 section('S 段：源码接线检查（只证明代码还在，不是行为验证）');
 // ══════════════════════════════════════════════════════════════════
@@ -226,6 +258,24 @@ check('S16 anyMessage 只当兜底，不抢 @/提问/名字/关键词/指定群�
   [iAt, iName, iKw, iQ, iSpk, iProb].every((i) => i >= 0)
     && iAny > iAt && iAny > iName && iAny > iKw && iAny > iQ && iAny > iSpk && iAny < iProb,
   `anyMessage@${iAny} at@${iAt} name@${iName} kw@${iKw} question@${iQ} speaker@${iSpk} probability@${iProb}`);
+// ★★ 三处「把她从永眠里捞出来」的兜底重置（ensureWakeableV2 / 连续无行动 / 连续未设置唤醒条件）
+//    原来都是 `st.wakeConfig = defaultWakeConfigV2()` —— 把整个会话配置换成默认值。
+//    而 defaultWakeConfigV2() 里 anyMessage 是 `defaultMode === 'active'`（diving 时 = false），
+//    三关节流参数也不在里面。于是：开了「每条消息都看」的群，只要她**连续 3 个回合选择不说话**
+//    （在这种群里这是常态，不是卡死），主人的 anyMessage 与成本闸门就被无声抹掉 ——
+//    退回「只看被 @ 的」+ 全局默认 20 次/分、200 次/时。
+//    重置的目的只是「别再永眠」，而 anyMessage 与频率帽都只会让她更容易被唤醒 / 限制频率，
+//    不可能造成永眠，所以它们不该在重置范围内。
+const resetRegion = src.slice(src.indexOf('function resetWakeConfigV2'), src.indexOf('function getSocialV2State'));
+const bareResets = (src.match(/st\.wakeConfig = defaultWakeConfigV2\(\);/g) ?? []).length;
+const helperResets = (src.match(/resetWakeConfigV2\(st, \{ key/g) ?? []).length;
+check('S17 三处永眠兜底重置都保留 anyMessage 与按会话节流参数（不再裸重置）',
+  /function resetWakeConfigV2/.test(src)
+    && bareResets === 0 && helperResets >= 3
+    && /preservedOwnerOverrides\(st\.wakeConfig\)/.test(resetRegion)
+    && /THROTTLE_OVERRIDE_FIELDS/.test(resetRegion)
+    && /next\.triggers = \{ \.\.\.next\.triggers, anyMessage: true \}/.test(resetRegion),
+  `裸重置=${bareResets} 次、走 helper=${helperResets} 次、helper 区长度=${resetRegion.length}`);
 
 // ══════════════════════════════════════════════════════════════════
 section('A 段：活体配置面（真路由 / 真落盘 / 不冲掉既有配置）');
