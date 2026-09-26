@@ -339,16 +339,36 @@ async function waitFor(pred, timeoutMs = 6000) {
 }
 // 一次「必然命中节流」的活体探测：改配置 → POST /wake → 读日志。
 // 被拦下时 sendWakePromptV2 直接 return，她**不会被唤醒**，所以这个探测是零副作用的。
-async function probeThrottle({ key, reason, config, expectStage, expectPark }) {
-  const t0 = Date.now() - 2000; // 留 2 秒余量：日志行只精确到秒
+async function probeThrottle({ key, reason, config, expectStage, expectPark, attempts = 3 }) {
   const r = await setWakeConfig({ key, config });
-  const post = await req('/api/socialV2/wake', { method: 'POST', body: { key, reason } });
   const hitRe = new RegExp(`唤醒节流命中（${expectStage}）${expectPark ? '暂存' : '跳过'} ${esc(key)}（${esc(reason)}）`);
-  let text = '';
-  const hit = await waitFor(() => { text = linesSince(t0); return hitRe.test(text); });
+  // ★「会话繁忙」这一支在桥接里排在节流判定**前面**（src/bridge.js:9621 → 9632）：
+  // 她这个回合还没结束时，唤醒会被暂存并打 `会话繁忙，暂存唤醒原因` 就返回，
+  // **根本走不到节流**。所以这时候"没有节流日志"不代表节流失效，只代表会话正忙 ——
+  // 没有区分开的话，A9/A10 会变成随她忙不忙而随机红绿的假失败
+  // （线上打开 L0「每条消息都看」之后她更常处于回合中，这个坑就更容易踩到）。
+  const busyRe = new RegExp(`会话繁忙，暂存唤醒原因 ${esc(key)}（${esc(reason)}@`);
   // 9638 行那句「[reserved2] 唤醒 <key>（<reason>）」只有真投递了才会出现，与节流命中互斥。
-  const delivered = new RegExp(`\\[reserved2\\] 唤醒 ${esc(key)}（${esc(reason)}）`).test(text);
-  return { hit, delivered, cfgStatus: r.status, postStatus: post.status, text };
+  const deliveredRe = new RegExp(`\\[reserved2\\] 唤醒 ${esc(key)}（${esc(reason)}）`);
+  let hit = false;
+  let delivered = false;
+  let busy = false;
+  let postStatus = 0;
+  for (let i = 0; i < attempts; i += 1) {
+    const t0 = Date.now() - 2000; // 留 2 秒余量：日志行只精确到秒
+    const post = await req('/api/socialV2/wake', { method: 'POST', body: { key, reason } });
+    postStatus = post.status;
+    let text = '';
+    await waitFor(() => { text = linesSince(t0); return hitRe.test(text) || busyRe.test(text); });
+    hit = hitRe.test(text);
+    delivered = deliveredRe.test(text);
+    busy = !hit && busyRe.test(text);
+    // 走到节流判定就结束；既没节流也没忙（说明别的地方断了）也结束，交给断言去报失败，
+    // 不要用重试把真问题盖过去。
+    if (hit || !busy) break;
+    await new Promise((resolve) => setTimeout(resolve, 15000)); // 她还在回合里，等一会儿再试
+  }
+  return { hit, delivered, busy, cfgStatus: r.status, postStatus };
 }
 const timesOf = (key, field) => {
   try {
@@ -422,24 +442,36 @@ if (!alive) {
       skipped(`A9（${gateOff || `${TARGET_KEY} 最近 1 小时没发过言，冷却前提不成立`}）`);
     } else {
       const a9 = await probeThrottle({ key: TARGET_KEY, reason: 'anyMessage', config: { ...FINAL, maxWakePerMinute: 0, maxWakePerHour: 0, speakCooldownMs: 3600000 }, expectStage: 'speak-cooldown', expectPark: false });
-      check('A9 ★发言后冷却真的拦住了闲聊类唤醒（stage=speak-cooldown，她确实没被唤醒）',
-        a9.hit && !a9.delivered, `命中=${a9.hit} 被投递=${a9.delivered} HTTP cfg=${a9.cfgStatus} wake=${a9.postStatus}`);
+      if (a9.busy) {
+        skipped(`A9（${TARGET_KEY} 的会话正在回合中，唤醒被「会话繁忙」暂存、没走到节流判定；稍后重跑即可）`);
+      } else {
+        check('A9 ★发言后冷却真的拦住了闲聊类唤醒（stage=speak-cooldown，她确实没被唤醒）',
+          a9.hit && !a9.delivered, `命中=${a9.hit} 被投递=${a9.delivered} HTTP cfg=${a9.cfgStatus} wake=${a9.postStatus}`);
+      }
     }
     // A10 频率帽拦住闲聊类，且必须标记「跳过」（park=false）—— 被限流时丢掉闲聊正是节流目的。
     if (gateOff || recentCount(tgtWakes, 3600000) === 0) {
       skipped(`A10（${gateOff || `${TARGET_KEY} 最近 1 小时没被唤醒过，频率帽前提不成立`}）`);
     } else {
       const a10 = await probeThrottle({ key: TARGET_KEY, reason: 'anyMessage', config: { ...FINAL, maxWakePerMinute: 0, maxWakePerHour: 1, speakCooldownMs: 0 }, expectStage: 'rate', expectPark: false });
-      check('A10 ★频率帽真的拦住了闲聊类唤醒，且是「跳过」而不是暂存',
-        a10.hit && !a10.delivered, `命中=${a10.hit} 被投递=${a10.delivered}`);
+      if (a10.busy) {
+        skipped(`A10（${TARGET_KEY} 的会话正在回合中，唤醒被「会话繁忙」暂存、没走到节流判定；稍后重跑即可）`);
+      } else {
+        check('A10 ★频率帽真的拦住了闲聊类唤醒，且是「跳过」而不是暂存',
+          a10.hit && !a10.delivered, `命中=${a10.hit} 被投递=${a10.delivered}`);
+      }
     }
     // A11 同一次频率帽拦截，原因换成非闲聊类 → 必须**暂存**（回合结束补发），不能丢。
     if (gateOff || recentCount(mutedWakes, 3600000) === 0) {
       skipped(`A11（${gateOff || `${MUTED_KEY} 最近 1 小时没被唤醒过，频率帽前提不成立`}）`);
     } else {
       const a11 = await probeThrottle({ key: MUTED_KEY, reason: 'poke', config: { maxWakePerMinute: 0, maxWakePerHour: 1, speakCooldownMs: 3600000 }, expectStage: 'rate', expectPark: true });
-      check('A11 ★非闲聊类（拍一拍）被频率帽拦下时是「暂存」而不是「跳过」',
-        a11.hit && !a11.delivered, `命中=${a11.hit} 被投递=${a11.delivered}`);
+      if (a11.busy) {
+        skipped(`A11（${MUTED_KEY} 的会话正在回合中，唤醒被「会话繁忙」暂存、没走到节流判定；稍后重跑即可）`);
+      } else {
+        check('A11 ★非闲聊类（拍一拍）被频率帽拦下时是「暂存」而不是「跳过」',
+          a11.hit && !a11.delivered, `命中=${a11.hit} 被投递=${a11.delivered}`);
+      }
       // 收尾（尽力而为）：mark-read 清空 unread 后，补发逻辑 10664 行的 stillRelevant
       // 判定必为假，暂存项就不会再补一次唤醒。若 mark-read 被 400 挡下（她刚被唤醒、
       // 还没等够沉睡前观察窗口），残留项也只是躺在内存里没有持久化，等她下次在那个
