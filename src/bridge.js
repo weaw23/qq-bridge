@@ -15,7 +15,7 @@ import { SnowLumaWebSocketClient, text } from '@snowluma/sdk';
 import { DatabaseSync } from 'node:sqlite';
 import { NodeApiClient, unwrap, createTurnCollector, discoverDshLaunchToken } from './dsh-client.js';
 import { mdToPlain, splitForQQ } from './md-to-plain.js';
-import { SENSITIVE_RE } from './sensitive.js';
+import { SENSITIVE_RE, sensitiveVerdict, maskTokens } from './sensitive.js';
 import { looksLikeUnfinished } from './v2-wait.js';
 import { safeFetchBuffer, looksLikeImageBuffer } from './safe-fetch.js';
 import { extractForwardIds, forwardIdFromData, sanitizeForwardId, formatForwardResponse } from './forward.js';
@@ -190,10 +190,8 @@ function redactSensitiveText(text) {
     const flags = SENSITIVE_RE.flags.includes('g') ? SENSITIVE_RE.flags : SENSITIVE_RE.flags + 'g';
     raw = raw.replace(new RegExp(SENSITIVE_RE.source, flags), '***');
   } catch {}
-  for (const token of KNOWN_AGENT_TOKENS) {
-    if (token && raw.includes(token)) raw = raw.split(token).join('***');
-  }
-  return raw;
+  // 令牌同样要脱敏；与出站打码共用 maskTokens，别在这里另写一份替换循环（ops/test-sensitive.mjs 的 S10）。
+  return maskTokens(raw, KNOWN_AGENT_TOKENS).text;
 }
 
 // 防止底层网关把文本中的 [CQ: 当作 CQ 码解析：替换为全角冒号。
@@ -2608,7 +2606,9 @@ async function main() {
           const message = String(body.message ?? '').trim();
           if (!Number.isFinite(id) || id <= 0) { sendJson({ ok: false, error: '目标 id 无效' }, 400); return; }
           if (!message) { sendJson({ ok: false, error: '消息不能为空' }, 400); return; }
-          if (SENSITIVE_RE.test(message)) { sendJson({ ok: false, error: '消息含敏感信息，已阻止发送' }, 403); return; }
+          // 令牌一律打码放行（真正出站前本来就会打码），只有路径/凭据关键词才拦。详见 ops/test-sensitive.mjs。
+          const testGuard = sensitiveVerdict(message, KNOWN_AGENT_TOKENS);
+          if (testGuard.blocked) { sendJson({ ok: false, error: '消息含敏感信息，已阻止发送' }, 403); return; }
           if (!allowed(kind, id, cfg)) { sendJson({ ok: false, error: `目标不在白名单内（${kind} ${id}），请先加入白名单` }, 403); return; }
           if (!modeAllowed(`${kind}:${id}`, kind, id, cfg, currentMode)) { sendJson({ ok: false, error: `当前模式（${currentMode}）不允许向 ${kind}:${id} 发送测试消息` }, 403); return; }
           try {
@@ -3430,15 +3430,18 @@ async function main() {
             sendJson({ ok: false, error: `最多发送 ${maxMsgs} 条` }, 400);
             return;
           }
-          for (const msg of messages) {
-            if (msg.length > maxChars) {
+          for (let i = 0; i < messages.length; i += 1) {
+            if (messages[i].length > maxChars) {
               sendJson({ ok: false, error: `单条消息不能超过 ${maxChars} 字` }, 400);
               return;
             }
-            if (SENSITIVE_RE.test(msg)) {
+            // 令牌打码后放行，路径/凭据关键词仍拦；打码后的文本才是真正发出去的那份（ops/test-sensitive.mjs）。
+            const burstGuard = sensitiveVerdict(messages[i], KNOWN_AGENT_TOKENS);
+            if (burstGuard.blocked) {
               sendJson({ ok: false, error: '消息含敏感信息，已阻止发送' }, 403);
               return;
             }
+            messages[i] = burstGuard.text;
           }
           try {
             const st = getSocialV2State(key);
@@ -3558,15 +3561,18 @@ async function main() {
             sendJson({ ok: false, error: `最多发送 ${maxMsgs} 条` }, 400);
             return;
           }
-          for (const msg of messages) {
-            if (msg.length > maxChars) {
+          for (let i = 0; i < messages.length; i += 1) {
+            if (messages[i].length > maxChars) {
               sendJson({ ok: false, error: `单条消息不能超过 ${maxChars} 字` }, 400);
               return;
             }
-            if (SENSITIVE_RE.test(msg)) {
+            // 令牌打码后放行，路径/凭据关键词仍拦；打码后的文本才是真正发出去的那份（ops/test-sensitive.mjs）。
+            const burstGuard = sensitiveVerdict(messages[i], KNOWN_AGENT_TOKENS);
+            if (burstGuard.blocked) {
               sendJson({ ok: false, error: '消息含敏感信息，已阻止发送' }, 403);
               return;
             }
+            messages[i] = burstGuard.text;
           }
           const delays = computeGapsV2(messages, gapMode, gapMs, gaps, sendCfg);
           // 先做发送频率检查并预占额度，再解析引用目标，避免未限流的引用查询打爆 OneBot。
@@ -5872,7 +5878,7 @@ async function main() {
           const isPrivate = url.pathname === '/api/send/private';
           const isReply = url.pathname === '/api/send/reply';
           const targetId = isPrivate ? String(body.userId ?? '').trim() : String(body.groupId ?? '').trim();
-          const message = unquoteJsonString(String(body.message ?? '').trim());
+          let message = unquoteJsonString(String(body.message ?? '').trim());
           const replyToMessageId = isReply ? body.replyToMessageId : body.replyToMessageId;
           const atUserId = body.atUserId ?? null;
           const key = isPrivate ? `private:${targetId}` : `group:${targetId}`;
@@ -5927,7 +5933,12 @@ async function main() {
           const sendCfg = cfg.socialV2?.send ?? {};
           const maxChars = Math.max(1, Number(sendCfg.maxMessageChars) || 500);
           if (message.length > maxChars) { sendJson({ ok: false, error: `单条消息不能超过 ${maxChars} 字` }, 400); return; }
-          if (SENSITIVE_RE.test(message)) { sendJson({ ok: false, error: '消息含敏感信息，已阻止发送' }, 403); return; }
+          // 令牌打码后放行，路径/凭据关键词仍拦；后面发送用的就是打码后的文本（ops/test-sensitive.mjs）。
+          {
+            const oneGuard = sensitiveVerdict(message, KNOWN_AGENT_TOKENS);
+            if (oneGuard.blocked) { sendJson({ ok: false, error: '消息含敏感信息，已阻止发送' }, 403); return; }
+            message = oneGuard.text;
+          }
           try {
             const st = getSocialV2State(key);
             const now = Date.now();
@@ -6137,12 +6148,10 @@ async function main() {
 
   // QQ 发送队列（顺序发送 + 间隔，避免触发频率限制）
   let sendChain = Promise.resolve();
+  // 第 1 道防线：所有真正出站的文本（含系统通知、含 MCP 侧发送）在 sendToQQ 里先打码。
+  // 打码实现与审计共用 sensitive.js 的 maskTokens，别在这里另写一份字面量替换。
   function redactKnownTokensOnly(text) {
-    let s = String(text ?? '');
-    for (const token of KNOWN_AGENT_TOKENS) {
-      if (token && s.includes(token)) s = s.split(token).join('***');
-    }
-    return s;
+    return maskTokens(text, KNOWN_AGENT_TOKENS).text;
   }
 
   function sendToQQ(key, msg) {
@@ -6331,12 +6340,11 @@ async function main() {
       if (!/^\d+$/.test(at)) throw new Error('atUserId 必须是正整数 QQ 号，且不能为 all');
       segments.push({ type: 'at', data: { qq: at } });
     }
-    const rawMessage = String(message ?? '');
-    const hasKnownToken = [...KNOWN_AGENT_TOKENS].some((t) => t && rawMessage.includes(t));
-    if (hasKnownToken) {
-      log(`发送内容包含会话令牌，已阻止发送 (${kind}:${id})`);
-      throw new Error('发送内容包含会话令牌，已阻止发送');
-    }
+    // 令牌打码后照发。这里原来写的是「命中令牌就 throw」—— 抛错会把整条消息吃掉，
+    // 而打码同样保证令牌不落地，还不会毁掉这次发送（见 ops/test-sensitive.mjs）。
+    const rawTokenGuard = maskTokens(message, KNOWN_AGENT_TOKENS);
+    if (rawTokenGuard.masked) log(`发送内容含会话令牌，已打码后照发 (${kind}:${id})`);
+    const rawMessage = rawTokenGuard.text;
     segments.push({ type: 'text', data: { text: escapeCqText(rawMessage) } });
     const action = kind === 'private' ? 'send_private_msg' : 'send_group_msg';
     const params = kind === 'private' ? { user_id: Number(id), message: segments } : { group_id: Number(id), message: segments };
@@ -7084,17 +7092,20 @@ async function main() {
   }
 
   // 统一出站消息：先完整文本审计，再发送。返回是否真的发出。
+  // 策略：令牌打码后照发（出站前本来就会打码，拦掉只会白吃掉整条回复），
+  //      路径/真实凭据关键词仍然整条拦。详见 src/sensitive.js 的 sensitiveVerdict 与 ops/test-sensitive.mjs。
   async function auditAndSend(key, text) {
-    const hasKnownToken = [...KNOWN_AGENT_TOKENS].some((t) => t && String(text ?? '').includes(t));
-    if (shouldAuditKey(key) && (SENSITIVE_RE.test(text) || hasKnownToken)) {
-      log(`⚠️ 回复被安全策略拦截 (${key})，疑似包含敏感信息${hasKnownToken ? '（含会话令牌）' : ''}`);
-      appendActivity(`${key} agent 回复被拦截（疑似敏感信息${hasKnownToken ? '/会话令牌' : ''}）`);
+    const guard = sensitiveVerdict(text, KNOWN_AGENT_TOKENS);
+    if (guard.masked) log(`⚠️ 出站文本含会话令牌，已打码后照发 (${key})`);
+    if (shouldAuditKey(key) && guard.blocked) {
+      log(`⚠️ 回复被安全策略拦截 (${key})，疑似包含敏感信息（路径/凭据）`);
+      appendActivity(`${key} agent 回复被拦截（疑似敏感信息）`);
       if (cfg.security?.interceptNotify !== false) {
-        await sendToQQ(key, '⚠️ 本条回复因疑似包含敏感信息（路径/凭据/会话令牌）被安全策略拦截，已记录并通知管理员。');
+        await sendToQQ(key, '⚠️ 本条回复因疑似包含敏感信息（路径/凭据）被安全策略拦截，已记录并通知管理员。');
       }
       return false;
     }
-    await sendToQQ(key, text);
+    await sendToQQ(key, guard.text);
     return true;
   }
 
@@ -10721,7 +10732,10 @@ async function main() {
                 }
               }
               if (ended.reason.kind === 'completed' && ended.text.trim()) {
-                const plain = mdToPlain(ended.text);
+                // 令牌先打码：审计与后面所有发送用的都是打码后的文本（含 planSocialTimeline 的分段）。
+                // 这样她复述自己的 API 调用时不会再被整条吃掉（见 ops/test-sensitive.mjs）。
+                const plainGuard = sensitiveVerdict(mdToPlain(ended.text), KNOWN_AGENT_TOKENS);
+                const plain = plainGuard.text;
                 // 纯 Markdown/空白输出按“无文本”处理，避免后续 planSocialTimeline 拿空串崩溃。
                 if (!plain.trim()) {
                   log(`agent 回复为空（仅格式/空白）(${key})`);
@@ -10765,12 +10779,13 @@ async function main() {
                   continue;
                 }
                 // 审计（对完整文本执行，避免截断漏判；这里只判断，不发送，避免双重发送）
-                const hasKnownToken = [...KNOWN_AGENT_TOKENS].some((t) => t && plain.includes(t));
-                if (shouldAuditKey(key) && (SENSITIVE_RE.test(plain) || hasKnownToken)) {
-                  log(`⚠️ 回复被安全策略拦截 (${key})，疑似包含敏感信息${hasKnownToken ? '（含会话令牌）' : ''}`);
-                  appendActivity(`${key} agent 回复被拦截（疑似敏感信息${hasKnownToken ? '/会话令牌' : ''}）`);
+                // 令牌已在上面打码，所以这里只可能因路径/凭据关键词被拦。
+                if (plainGuard.masked) log(`⚠️ 回复含会话令牌，已打码后照发 (${key})`);
+                if (shouldAuditKey(key) && plainGuard.blocked) {
+                  log(`⚠️ 回复被安全策略拦截 (${key})，疑似包含敏感信息（路径/凭据）`);
+                  appendActivity(`${key} agent 回复被拦截（疑似敏感信息）`);
                   if (cfg.security?.interceptNotify !== false) {
-                    await sendToQQ(key, '⚠️ 本条回复因疑似包含敏感信息（路径/凭据/会话令牌）被安全策略拦截，已记录并通知管理员。');
+                    await sendToQQ(key, '⚠️ 本条回复因疑似包含敏感信息（路径/凭据）被安全策略拦截，已记录并通知管理员。');
                   }
                   if (isFarewell) {
                     const st = socialState(key);
