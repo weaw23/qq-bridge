@@ -37,12 +37,32 @@ const SAFE_PREFIXES = [
   'mcp__web-search-safe__',
 ]
 
-// 无害模型侧工具：ask_user_question 用于把问题转给管理员/用户，
-// todo_write 仅维护任务列表。若后续 preset 不再挂载这些工具，保留无害。
+// 无害模型侧工具：
+//   ask_user_question 用于把问题转给管理员/用户，todo_write 仅维护任务列表；
+//   ACP 上下文管理五件套（compress / decompress / search_context / acp_status / acp_cache）
+//   只操作**当前会话自己的上下文**：压缩、按需取回、按关键词检索、查用量与缓存统计。
+//   它们不碰文件、不执行命令、不对外发消息，权限上不比 ask_user_question 更大。
+//   拦掉的后果很实在：线上真实报错 `工具 "compress" 不在 QQ 桥接白名单内，已拒绝`，
+//   而她上下文涨满时压缩是唯一的自救手段。所以放行。
+//   若后续 preset 不再挂载这些工具，保留无害。
 const SAFE_EXACT = new Set([
   'ask_user_question',
   'todo_write',
+  'compress',
+  'decompress',
+  'search_context',
+  'acp_status',
+  'acp_cache',
 ])
+
+// 执行期判据：单一实现，守卫与回归测试（ops/test-preset-tools.mjs）共用，
+// 避免两处各写一份规则之后漂移。返回 true 表示允许执行。
+export function isToolAllowed(name) {
+  if (typeof name !== 'string' || name.length === 0) return false
+  if (SAFE_EXACT.has(name)) return true
+  if (SAFE_PREFIXES.some((prefix) => name.startsWith(prefix))) return true
+  return false
+}
 
 export function apply(ctx) {
   // 1) 把已知危险全局工具从 schema 隐藏（restrict 只影响继承的全局层，
@@ -62,8 +82,7 @@ export function apply(ctx) {
   ctx.tools.guard((exec) => {
     const name = exec?.name
     if (typeof name !== 'string' || name.length === 0) return '工具名无效，已拒绝'
-    if (SAFE_EXACT.has(name)) return
-    if (SAFE_PREFIXES.some((prefix) => name.startsWith(prefix))) return
+    if (isToolAllowed(name)) return
     return `工具 "${name}" 不在 QQ 桥接白名单内，已拒绝（仅允许 QQ MCP 工具与无害模型侧工具）`
   })
 }
