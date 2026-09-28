@@ -2,13 +2,12 @@
 chcp 65001 >nul
 title 哦鲸鲸 · 一键启动
 setlocal
+rem ── 注意：本文件必须是 CRLF 行尾。用 LF 写的话 cmd 会从行中间开始执行，
+rem    报一堆 “… is not recognized as an internal or external command”。
 set NODE=C:\Users\HCK\AppData\Local\Programs\nodejs\node.exe
 if not exist "%NODE%" set NODE=node
 
-echo ══════════════════════════════════════════════
-echo    🐳 哦鲸鲸 · 一键启动
-echo ══════════════════════════════════════════════
-
+rem 真正的启动逻辑在 start-chain.mjs 里（它自己会打印横幅，这里不再重复）
 "%NODE%" "D:\qqbot\qq-bridge\ops\start-chain.mjs"
 set RC=%ERRORLEVEL%
 
@@ -18,5 +17,4 @@ if not "%RC%"=="0" (
 ) else (
   echo ✓ 全部就绪。可以关掉这个窗口了。
 )
-echo ───────────────────────────────────────────────
 pause

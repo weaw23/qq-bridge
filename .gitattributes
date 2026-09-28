@@ -1,0 +1,10 @@
+# Windows 批处理必须 CRLF 行尾。
+#
+# cmd.exe 解析纯 LF 的 .cmd/.bat 时会从行中间开始执行，实测报出一串
+#   '...' is not recognized as an internal or external command
+# （一键启动.cmd 就因此整整坏了一阵：双击后提示文字变成了「不是内部或外部命令」）。
+# 成因是某个工具按 LF 写了文件，而 git 的 core.autocrlf 只在 checkout 时补 CRLF，
+# 对「工作区里已经被写坏的文件」无能为力。这条属性让 checkout 一定还原成 CRLF，
+# 与 core.autocrlf 的取值无关。
+*.cmd text eol=crlf
+*.bat text eol=crlf
