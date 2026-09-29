@@ -14,6 +14,8 @@
 //   node ops/persona-sample.mjs --key group:471975044 # 只看某个会话
 //   node ops/persona-sample.mjs --limit 30 --json     # 只输出 JSON（给打分表用）
 //   node ops/persona-sample.mjs --out                # 额外写 outbox/persona-sample-<日期>.json
+//   node ops/persona-sample.mjs --out --label post   # 写 outbox/persona-sample-<日期>-post.json（对比时别覆盖基线）
+//   node ops/persona-sample.mjs --out D:\path\任意.json  # 指定完整路径
 import fs from 'node:fs';
 import path from 'node:path';
 
@@ -26,13 +28,18 @@ const SEND_TOOLS = new Set([
 ]);
 
 function parseArgs(argv) {
-  const out = { limit: 20, key: '', json: false, write: false, source: 'state/tool-calls.jsonl' };
+  const out = { limit: 20, key: '', json: false, write: false, outPath: '', label: '', source: 'state/tool-calls.jsonl' };
   for (let i = 0; i < argv.length; i += 1) {
     const a = argv[i];
     if (a === '--limit') out.limit = Number(argv[++i]) || 20;
     else if (a === '--key') out.key = String(argv[++i] ?? '');
     else if (a === '--json') out.json = true;
-    else if (a === '--out') out.write = true;
+    else if (a === '--out') {
+      out.write = true;
+      // 可选跟一个路径；不跟就落到 outbox 的日期文件名（--label 可加后缀）。
+      const next = argv[i + 1];
+      if (next && !String(next).startsWith('--')) out.outPath = String(argv[++i]);
+    } else if (a === '--label') out.label = String(argv[++i] ?? '').replace(/[^\w-]/g, '');
     else if (a === '--source') out.source = String(argv[++i] ?? out.source);
   }
   return out;
@@ -121,7 +128,9 @@ if (isMain || process.argv[1]?.endsWith('persona-sample.mjs')) {
     const dir = path.join(process.cwd(), '..', 'outbox');
     fs.mkdirSync(dir, { recursive: true });
     const stamp = new Date().toISOString().slice(0, 10);
-    const file = path.join(dir, `persona-sample-${stamp}.json`);
+    const file = opt.outPath
+      ? path.resolve(opt.outPath)
+      : path.join(dir, `persona-sample-${stamp}${opt.label ? '-' + opt.label : ''}.json`);
     fs.writeFileSync(file, JSON.stringify({ generatedAt: new Date().toISOString(), filter: opt.key || '(全部会话)', stats, samples }, null, 2), 'utf8');
     console.error(`已写出 ${file}`);
   }
