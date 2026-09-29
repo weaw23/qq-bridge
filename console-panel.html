@@ -80,6 +80,64 @@
   .log { max-height: 260px; overflow: auto; font: 12px/1.5 Consolas, "Cascadia Mono", monospace; color: var(--dim); white-space: pre-wrap; }
   code { background: #0e1830; padding: 1px 6px; border-radius: 6px; color: #a9d8ff; font-size: 12px; }
   .sep { height: 1px; background: var(--line); margin: 12px 0; }
+
+  /* ── 面板完善①：她此刻 ── */
+  .hernow { display: flex; gap: 26px; flex-wrap: wrap; }
+  .hn-left { flex: 1 1 340px; min-width: 300px; }
+  .hn-right { flex: 1 1 420px; min-width: 300px; display: flex; align-items: center; }
+  .gauge { margin: 4px 0 14px; }
+  .ghead { display: flex; align-items: baseline; gap: 10px; margin-bottom: 6px; }
+  .ghead b { font-size: 21px; color: var(--aqua); }
+  .ghead .hint { font-size: 12px; }
+  .bar { height: 12px; border-radius: 999px; background: #0e1830; border: 1px solid var(--line); overflow: hidden; }
+  .bar i { display: block; height: 100%; width: 0; border-radius: 999px;
+    background: linear-gradient(90deg, #1aa8a3, #35d7d0); transition: width .6s ease; }
+  .bar.energy i { background: linear-gradient(90deg, #b4651a, #ffb454); }
+  .hn-cols { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 22px; }
+  .saylist, .mindlist { max-height: 300px; overflow: auto; }
+  .say { display: flex; gap: 8px; align-items: baseline; background: rgba(255,255,255,.03);
+    border-radius: 9px; padding: 7px 10px; font-size: 12.5px; margin-bottom: 6px; }
+  .say .t { color: var(--dim2); font-size: 11.5px; flex: none; font-family: Consolas, "Cascadia Mono", monospace; }
+  .say .k { color: var(--aqua); flex: none; font-size: 11.5px; }
+  .say .ok { flex: none; font-size: 12px; }
+  .say .ok.y { color: var(--good); } .say .ok.n { color: var(--bad); } .say .ok.u { color: var(--dim2); }
+  .say .txt { word-break: break-all; }
+  .mind { padding: 8px 10px; border-radius: 9px; background: rgba(255,255,255,.03); margin-bottom: 8px; font-size: 12.5px; }
+  .mind .mk { color: var(--aqua); font-size: 11.5px; margin-right: 8px; }
+  .chip { display: inline-flex; align-items: center; background: rgba(255,180,84,.12); border: 1px solid rgba(255,180,84,.35);
+    color: var(--warn); padding: 2px 9px; border-radius: 999px; font-size: 11.5px; margin: 2px 6px 2px 0; }
+  .chip.good { background: rgba(74,222,128,.1); border-color: rgba(74,222,128,.35); color: var(--good); }
+  .chip.bad { background: rgba(255,107,129,.1); border-color: rgba(255,107,129,.4); color: var(--bad); }
+
+  /* ── 面板完善③：会话与唤醒 ── */
+  .scard { background: rgba(255,255,255,.03); border: 1px solid var(--line); border-radius: 12px;
+    padding: 12px 14px; margin-bottom: 12px; }
+  .shead { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; font-size: 12.5px; }
+  .shead b { font-size: 14px; }
+  .shead .muted { font-size: 11.5px; }
+  .weditor summary { cursor: pointer; color: var(--aqua); font-size: 12.5px; padding: 6px 0; user-select: none; }
+  .weditor summary:hover { text-decoration: underline; }
+  .wform { padding-top: 6px; }
+  .wform .row input[type=number] { width: 130px; }
+  .wform .row input[type=text] { flex: 1; max-width: 460px; }
+
+  /* ── 面板完善④：健康与成本 ── */
+  .tile { background: rgba(255,255,255,.03); border: 1px solid var(--line); border-radius: 12px; padding: 12px 14px; }
+  .tile h3 { margin: 0 0 10px; font-size: 13px; color: var(--aqua); font-weight: 600; }
+  .tile .kv { font-size: 12.5px; }
+  .healthgrid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 16px; }
+  .wlog { font: 11px/1.5 Consolas, monospace; color: var(--dim2); margin-top: 8px; white-space: pre-wrap;
+    max-height: 90px; overflow: auto; }
+  .num { color: var(--aqua); font-weight: 600; }
+  .num.bad { color: var(--bad); }
+
+  /* ── 面板完善②：数据面板美化 ── */
+  .tabbody { max-height: 460px; overflow: auto; font-size: 12.5px; border: 1px solid var(--line);
+    border-radius: 10px; padding: 8px; background: rgba(0,0,0,.14); }
+  .tabbody table { font-size: 12.5px; }
+  .dsearch { display: flex; gap: 10px; align-items: center; margin-bottom: 8px; }
+  .dsearch input { width: 300px; }
+  .dsearch .muted { font-size: 12px; }
 </style>
 </head>
 <body>
@@ -93,6 +151,41 @@
 </div>
 
 <div class="grid">
+  <!-- 她此刻 -->
+  <div class="card wide" id="herNowCard">
+    <h2>她此刻</h2>
+    <div class="hernow">
+      <div class="hn-left">
+        <div class="gauge">
+          <div class="ghead"><span>心情</span><b id="moodVal">–</b><span class="hint" id="moodLabel"></span></div>
+          <div class="bar"><i id="moodBar"></i></div>
+        </div>
+        <div class="gauge">
+          <div class="ghead"><span>精力</span><b id="energyVal">–</b><span class="hint" id="energyLabel"></span></div>
+          <div class="bar energy"><i id="energyBar"></i></div>
+        </div>
+        <div class="kv" style="margin-top:8px">
+          <div class="k">此刻状态</div><div id="herStateLine">读取中…</div>
+          <div class="k">在忙吗</div><div id="herBusy">…</div>
+          <div class="k">为什么安静</div><div id="herQuiet">…</div>
+          <div class="k">行为建议</div><div id="herAdvice" class="muted">…</div>
+        </div>
+      </div>
+      <div class="hn-right"><div id="sparkWrap" style="width:100%"><div class="muted">读取中…</div></div></div>
+    </div>
+    <div class="sep"></div>
+    <div class="hn-cols">
+      <div>
+        <h2>她最近说的话</h2>
+        <div class="saylist" id="herSay"><div class="muted">读取中…</div></div>
+      </div>
+      <div>
+        <h2>她惦记的事</h2>
+        <div class="mindlist" id="herMind"><div class="muted">读取中…</div></div>
+      </div>
+    </div>
+  </div>
+
   <!-- 状态总览 -->
   <div class="card">
     <h2>状态总览</h2>
@@ -180,11 +273,35 @@
     <div class="btns" style="margin-top:10px"><button class="primary" onclick="saveWake()">保存</button></div>
   </div>
 
+  <!-- 会话与唤醒 -->
+  <div class="card wide" id="sessionsCard">
+    <h2>会话与唤醒</h2>
+    <div class="btns" style="margin-bottom:10px">
+      <button class="sm" onclick="loadSessions(true)">⟳ 刷新会话列表</button>
+      <span class="muted" style="align-self:center">编辑器展开时不会自动刷新；保存走 /api/socialV2/wake-config（控制台令牌=管理员直通）</span>
+    </div>
+    <div id="sessList"><div class="muted">读取中…</div></div>
+  </div>
+
   <!-- 数据面板 -->
   <div class="card wide">
     <h2>数据面板</h2>
     <div class="tabs" id="tabs"></div>
-    <div id="tabBody" class="log" style="max-height:420px">…</div>
+    <div class="dsearch">
+      <input type="text" id="dataSearch" placeholder="🔍 在当前表里筛选行（回填后自动应用）" oninput="filterDataRows()">
+      <span class="muted" id="dataCount"></span>
+    </div>
+    <div id="tabBody" class="tabbody">…</div>
+  </div>
+
+  <!-- 健康与成本 -->
+  <div class="card wide" id="healthCard">
+    <h2>健康与成本</h2>
+    <div class="btns" style="margin-bottom:10px">
+      <button class="sm" onclick="refreshHealth()">⟳ 立即体检</button>
+      <span class="muted" style="align-self:center" id="healthAt"></span>
+    </div>
+    <div class="healthgrid" id="healthBody"><div class="muted">读取中…</div></div>
   </div>
 </div>
 
@@ -201,6 +318,7 @@ const urlTok = qs.get('token');
 let TOKEN = (urlTok && urlTok.length >= 16 ? urlTok : (localStorage.getItem('whaleToken') || (INJECTED_OK ? INJECTED : ''))).trim();
 $('token').value = TOKEN;
 let S = null;
+let HER = null;   // 她此刻 / 会话数据（/api/panel/her-now）
 function showAuthBanner(show) {
   let el = $('authBanner');
   if (!show) { if (el) el.remove(); return; }
@@ -244,6 +362,11 @@ async function api(path, opt = {}) {
   return body;
 }
 const val = (id) => $(id).value.trim();
+const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const keyLabel = (k) => String(k || '').startsWith('group:') ? '群 ' + String(k).slice(6) : String(k || '').startsWith('private:') ? '私聊 ' + String(k).slice(8) : String(k || '');
+const fmtTime = (ms) => ms ? new Date(ms).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' }) : '–';
+const fmtHM = (t) => t ? new Date(t).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' }) : '--:--';
+const ago = (ms) => { if (!ms) return '从未'; const s = Math.max(0, Math.round((Date.now() - ms) / 1000)); if (s < 60) return s + ' 秒前'; if (s < 3600) return Math.round(s / 60) + ' 分钟前'; if (s < 86400) return Math.round(s / 3600) + ' 小时前'; return Math.round(s / 86400) + ' 天前'; };
 async function act(action, extra = {}) {
   try { const r = await api('/api/panel/control', { method: 'POST', body: JSON.stringify({ action, ...extra }) });
     toast(typeof r.note === 'string' ? r.note : ('已执行：' + action)); setTimeout(refresh, 900); }
@@ -346,7 +469,25 @@ async function showTab(k) {
   try {
     const r = await api('/api/panel/data?kind=' + k);
     $('tabBody').innerHTML = r.html ?? '<pre>' + JSON.stringify(r.data, null, 2) + '</pre>';
+    filterDataRows();
   } catch (e) { $('tabBody').textContent = '读取失败：' + e.message; }
+}
+// 数据面板美化：客户端行过滤（服务端表格不用动，任何 kind 都能用）
+function filterDataRows() {
+  const q = String($('dataSearch').value || '').trim().toLowerCase();
+  const body = $('tabBody');
+  const rows = body.querySelectorAll('tr');
+  if (!rows.length) { $('dataCount').textContent = ''; return; }
+  let shown = 0;
+  rows.forEach((tr, i) => {
+    // 表头行（第一个 tr 且全是 th，或处于 thead 内）不参与过滤
+    const inHead = tr.closest('thead') != null || (i === 0 && tr.querySelectorAll('th').length && !tr.querySelectorAll('td').length);
+    if (inHead) return;
+    const hit = !q || tr.textContent.toLowerCase().includes(q);
+    tr.style.display = hit ? '' : 'none';
+    if (hit) shown++;
+  });
+  $('dataCount').textContent = q ? `匹配 ${shown} / ${rows.length} 行` : `${rows.length} 行`;
 }
 
 async function refresh(allowRetry = true) {
@@ -419,6 +560,283 @@ async function refresh(allowRetry = true) {
     $('pills').innerHTML = `<span class="pill"><span class="dot off"></span>${needAuth ? '需要令牌（右上角填入）' : e.message}</span>`;
   }
 }
+
+// ══ 面板完善①：她此刻（GET /api/panel/her-now，6 秒一轮）══
+const moodLabel = (v) => v < 25 ? '有点蔫、不太想理人' : v < 45 ? '情绪一般' : v < 78 ? '还算平静' : '心情很好';
+const energyLabel = (v) => v < 18 ? '很困、脑子转不动' : v < 35 ? '有点累' : v >= 65 ? '精神不错' : '还行';
+function sparkline(curve) {
+  if (!curve || curve.length < 2) return '<div class="muted">近 6 小时曲线要至少 2 个主动性决策点（她安静时每 ~5 分钟记一条；刚重启的话还没有）</div>';
+  const w = 560, h = 150, pad = 10;
+  const t0 = curve[0].ts, t1 = curve[curve.length - 1].ts || (t0 + 1);
+  const x = (ts) => pad + (w - 2 * pad) * ((ts - t0) / Math.max(1, t1 - t0));
+  const y = (v) => h - pad - (h - 2 * pad - 14) * (Math.max(0, Math.min(100, v)) / 100);
+  const pts = (f) => curve.map((p) => `${x(p.ts).toFixed(1)},${y(f(p)).toFixed(1)}`).join(' ');
+  return `<svg viewBox="0 0 ${w} ${h}" style="width:100%;height:auto">
+    <line x1="${pad}" y1="${y(60)}" x2="${w - pad}" y2="${y(60)}" stroke="#263353" stroke-dasharray="4 4" stroke-width="1"/>
+    <text x="${w - pad}" y="${y(60) - 4}" fill="#6b7ea8" font-size="9" text-anchor="end">基准 60</text>
+    <polyline points="${pts((p) => p.mood)}" fill="none" stroke="#35d7d0" stroke-width="2" stroke-linejoin="round"/>
+    <polyline points="${pts((p) => p.energy)}" fill="none" stroke="#ffb454" stroke-width="2" stroke-linejoin="round"/>
+    <text x="${pad}" y="14" fill="#35d7d0" font-size="10">心情</text>
+    <text x="${pad + 30}" y="14" fill="#ffb454" font-size="10">精力</text>
+    <text x="${pad}" y="${h - 2}" fill="#6b7ea8" font-size="9">${fmtHM(t0)}</text>
+    <text x="${w - pad}" y="${h - 2}" fill="#6b7ea8" font-size="9" text-anchor="end">${fmtHM(t1)}</text>
+  </svg>`;
+}
+async function refreshHer(allowRetry = true) {
+  try {
+    HER = await api('/api/panel/her-now');
+    const p = HER.persona || {};
+    $('moodVal').textContent = p.mood ?? '–';
+    $('energyVal').textContent = p.energy ?? '–';
+    $('moodBar').style.width = Math.max(0, Math.min(100, p.mood ?? 0)) + '%';
+    $('energyBar').style.width = Math.max(0, Math.min(100, p.energy ?? 0)) + '%';
+    $('moodLabel').textContent = moodLabel(p.mood ?? 60);
+    $('energyLabel').textContent = energyLabel(p.energy ?? 70);
+    $('herStateLine').innerHTML = esc(p.stateLine || '–') + `<div class="muted" style="font-size:11.5px">上次状态更新：${ago(p.updatedAtMs)}</div>`;
+    $('herBusy').innerHTML = HER.busy
+      ? '<span class="dot warn" style="display:inline-block;vertical-align:-1px"></span> 正忙着（3 分钟内在调工具，上次 ' + esc(fmtHM(HER.lastToolAt)) + '）'
+      : '<span class="dot on" style="display:inline-block;vertical-align:-1px"></span> 闲着';
+    // 为什么安静：最近一条主动性决策
+    const d = HER.lastDecision;
+    if (!d) $('herQuiet').innerHTML = '<span class="muted">还没有主动性决策记录（她刚重启，或还没到决策周期）</span>';
+    else {
+      const t = fmtHM(d.ts);
+      if (d.action && d.action !== 'none') {
+        $('herQuiet').innerHTML = `<span class="chip good">${t} 主动开了口（${esc(d.action)}）</span>`
+          + (d.wasIgnored ? '<span class="chip">没人接话</span>' : '');
+      } else {
+        const blocked = (d.blocked || []).map((b) => (b && typeof b === 'object' ? (b.reason || b.text || b.message || JSON.stringify(b)) : String(b)));
+        const thoughts = (d.blockedThoughts || []).map((b) => String(b));
+        const probPct = Math.round((Number(d.prob) || 0) * 100);
+        $('herQuiet').innerHTML =
+          (blocked.length ? blocked.map((b) => `<span class="chip">${esc(b)}</span>`).join('') : '<span class="chip">没什么拦着，只是概率没到</span>')
+          + `<div class="muted" style="font-size:11.5px;margin-top:4px">${t} 决策：想开口的概率 ${probPct}%${thoughts.length ? '；压下的念头：' + esc(thoughts.join('；')) : ''}${d.unread ? `；未读 ${d.unread} 条` : ''}</div>`;
+      }
+    }
+    $('herAdvice').textContent = (p.tendency && (p.tendency.initiativeAdvice || p.tendency.advice))
+      ? `${p.tendency.initiativeAdvice || ''}${p.tendency.advice ? '；' + p.tendency.advice : ''}` : '–';
+    $('sparkWrap').innerHTML = sparkline(HER.curve);
+    // 她最近说的话
+    const say = HER.recentSay || [];
+    $('herSay').innerHTML = say.length ? say.map((it) => {
+      const okCls = it.ok === true ? 'y' : it.ok === false ? 'n' : 'u';
+      const okTxt = it.ok === true ? '✓' : it.ok === false ? '✗' : '·';
+      return `<div class="say"><span class="t">${esc(fmtHM(it.time))}</span><span class="k">${esc(keyLabel(it.key))}</span><span class="ok ${okCls}">${okTxt}</span><span class="txt">${esc(it.text || '（无文本）')}</span></div>`;
+    }).join('') : '<div class="muted">她最近没说过话（安静回血或没人聊天）</div>';
+    // 她惦记的事
+    const mind = (HER.sessions || []).filter((s) => (s.activeTopics || []).length || (s.pendingThoughts || []).length);
+    $('herMind').innerHTML = mind.length ? mind.map((s) => {
+      const rows = [
+        ...(s.activeTopics || []).map((t) => `<div class="mind"><span class="mk">话题</span>${esc(String(t).slice(0, 80))}</div>`),
+        ...(s.pendingThoughts || []).map((t) => `<div class="mind"><span class="mk">念头</span>${esc(String(t).slice(0, 80))}</div>`),
+      ].join('');
+      return `<div><div class="muted" style="font-size:11.5px;margin:6px 0 4px">${esc(keyLabel(s.key))}</div>${rows}</div>`;
+    }).join('') : '<div class="muted">心里没搁什么事</div>';
+  } catch (e) {
+    if (e.message === 'NETDOWN') return;   // 横幅由 refresh() 负责
+    const needAuth = /未授权|令牌/.test(e.message);
+    if (needAuth && allowRetry && INJECTED_OK && TOKEN !== INJECTED) {
+      TOKEN = INJECTED; localStorage.setItem('whaleToken', TOKEN); $('token').value = TOKEN;
+      return refreshHer(false);
+    }
+    $('herStateLine').innerHTML = '<span class="muted">读取失败：' + esc(e.message) + '</span>';
+  }
+}
+
+// ══ 面板完善③：会话与唤醒 ══
+function sessionEditorOpen() {
+  return Array.from(document.querySelectorAll('#sessList details.weditor')).some((d) => d.open);
+}
+async function loadSessions(force) {
+  if (!force && sessionEditorOpen()) return;   // 用户正在编辑：别把表单冲掉
+  let data = HER;
+  if (!data) {
+    try { data = await api('/api/panel/her-now'); HER = data; }
+    catch (e) { $('sessList').innerHTML = '<div class="muted">读取失败：' + esc(e.message) + '</div>'; return; }
+  } else if (force) {
+    try { data = HER = await api('/api/panel/her-now'); } catch (e) { /* 用旧数据渲染 */ }
+  }
+  const list = data.sessions || [];
+  if (!list.length) { $('sessList').innerHTML = '<div class="muted">还没有任何会话（她还没被任何白名单里的人触发过）</div>'; return; }
+  $('sessList').innerHTML = list.map((s) => {
+    const wc = s.wakeConfig || {};
+    const tr = wc.triggers || {};
+    const ws = s.wakeSafety || {};
+    const modeTxt = wc.mode === 'active' ? 'active 活跃' : 'diving 潜水';
+    const sleepTxt = wc.mode === 'active' ? '每条消息都处理'
+      : (wc.infinite ? '无限期潜水' : (wc.sleepUntil ? '醒于 ' + fmtTime(Date.parse(wc.sleepUntil)) : '有限时长'));
+    const safety = ws.guaranteed === false
+      ? '<span class="chip bad">⚠ 无唤醒途径（兜底会自动重置）</span>'
+      : '<span class="chip good">✓ 有唤醒途径</span>';
+    const stale = ws.stale ? '<span class="chip">配置超 24 小时未确认</span>' : '';
+    const priv = String(s.key).startsWith('private:');
+    const speakerIds = (tr.speakerIds || []).join(', ');
+    return `<div class="scard" data-sess="${esc(s.key)}">
+      <div class="shead">
+        <b>${esc(keyLabel(s.key))}</b>
+        <span class="pill">${modeTxt}</span>
+        <span class="muted">${esc(sleepTxt)}</span>
+        <span class="pill">未读 ${s.unread ?? 0}</span>
+        <span class="muted">今日唤醒 ${s.wakeCountToday ?? 0} · 发言 ${s.sendCountToday ?? 0}</span>
+        <span class="muted">上次唤醒原因：${esc(s.lastWakeReason || '–')}</span>
+        <span class="muted">最近消息 ${ago(s.lastIncomingAt)} · 她上次回话 ${ago(s.lastAiReplyAt)}</span>
+        ${s.initiativeIgnoredCount ? `<span class="chip">主动开口被无视 ${s.initiativeIgnoredCount} 次</span>` : ''}
+        ${safety}${stale}
+      </div>
+      <details class="weditor"><summary>编辑唤醒配置（保存前会弹确认框）</summary>
+        <div class="wform">
+          <div class="row"><span class="lbl">模式<span class="hint">diving=按触发条件醒；active=每条都看（会强制 anyMessage）</span></span>
+            <select name="mode"><option value="diving" ${wc.mode !== 'active' ? 'selected' : ''}>diving 潜水</option><option value="active" ${wc.mode === 'active' ? 'selected' : ''}>active 活跃</option></select></div>
+          <div class="row"><span class="lbl">无限期潜水<span class="hint">关闭=有限时长（用下面的分钟数）</span></span>
+            <label class="switch"><input type="checkbox" name="infinite" ${wc.infinite !== false ? 'checked' : ''}><span></span></label></div>
+          <div class="row"><span class="lbl">有限沉睡时长（分钟）<span class="hint">仅无限期关闭时生效；留空=保持现状</span></span>
+            <input type="number" name="sleepMin" placeholder="留空 = 不变" min="1"></div>
+          <div class="row"><span class="lbl">被 @ 唤醒</span><label class="switch"><input type="checkbox" name="atMention" ${tr.atMention === true ? 'checked' : ''}><span></span></label></div>
+          <div class="row"><span class="lbl">被叫名字/昵称唤醒</span><label class="switch"><input type="checkbox" name="nameMention" ${tr.nameMention === true ? 'checked' : ''}><span></span></label></div>
+          <div class="row"><span class="lbl">被直接提问唤醒</span><label class="switch"><input type="checkbox" name="question" ${tr.question === true ? 'checked' : ''}><span></span></label></div>
+          <div class="row"><span class="lbl">任意消息都唤醒<span class="hint">主人给大群配的「每条都看」</span></span><label class="switch"><input type="checkbox" name="anyMessage" ${tr.anyMessage === true ? 'checked' : ''}><span></span></label></div>
+          <div class="row"><span class="lbl">拍一拍唤醒</span><label class="switch"><input type="checkbox" name="poke" ${tr.poke === true ? 'checked' : ''}><span></span></label></div>
+          <div class="row"><span class="lbl">关键词唤醒<span class="hint">逗号分隔，最多 50 个、每个 ≤100 字</span></span>
+            <input type="text" name="keywords" value="${esc((tr.keywords || []).join(', '))}" placeholder="如：鲸鲸, 小鲸"></div>
+          <div class="row"><span class="lbl">指定成员唤醒<span class="hint">QQ 号逗号分隔（仅群聊，最多 20 个）</span></span>
+            <input type="text" name="speakerIds" value="${esc(speakerIds)}" placeholder="如：1918594889" ${priv ? 'disabled title="私聊不适用"' : ''}></div>
+          <div class="row"><span class="lbl">概率唤醒（0~1）<span class="hint">普通消息按概率随机醒；留空=不改</span></span>
+            <input type="number" name="probability" step="0.05" min="0" max="1" value="${tr.probability != null ? esc(tr.probability) : ''}" placeholder="留空 = 不改"></div>
+          <div class="row"><span class="lbl">每分钟最多唤醒<span class="hint">留空=不改；0=不限</span></span>
+            <input type="number" name="maxWakePerMinute" min="0" value="${wc.maxWakePerMinute != null ? esc(wc.maxWakePerMinute) : ''}" placeholder="留空 = 不改"></div>
+          <div class="row"><span class="lbl">每小时最多唤醒<span class="hint">留空=不改；0=不限</span></span>
+            <input type="number" name="maxWakePerHour" min="0" value="${wc.maxWakePerHour != null ? esc(wc.maxWakePerHour) : ''}" placeholder="留空 = 不改"></div>
+          <div class="row"><span class="lbl">发言冷却（毫秒）<span class="hint">留空=不改</span></span>
+            <input type="number" name="speakCooldownMs" min="0" value="${wc.speakCooldownMs != null ? esc(wc.speakCooldownMs) : ''}" placeholder="留空 = 不改"></div>
+          <div class="row"><span class="lbl">批量窗口（毫秒）<span class="hint">多条消息合并唤醒的窗口；留空=不改</span></span>
+            <input type="number" name="batchWindowMs" min="1000" value="${wc.batchWindowMs != null ? esc(wc.batchWindowMs) : ''}" placeholder="留空 = 不改"></div>
+          <div class="btns" style="margin-top:12px">
+            <button class="primary" onclick="saveWakeConfig('${esc(s.key)}')">保存唤醒配置</button>
+            <button class="danger" onclick="resetWakeOverride('${esc(s.key)}')">清除覆盖 · 恢复全局默认</button>
+            <span class="muted" style="align-self:center">「恢复全局默认」保留主人手配的 anyMessage 与节流参数</span>
+          </div>
+        </div>
+      </details>
+    </div>`;
+  }).join('');
+}
+async function saveWakeConfig(key) {
+  const box = document.querySelector(`[data-sess="${key}"]`);
+  if (!box) { toast('找不到该会话的编辑器', true); return; }
+  const numOpt = (name) => {
+    const v = String(box.querySelector(`[name="${name}"]`).value || '').trim();
+    if (v === '') return undefined;
+    const n = Math.round(Number(v));
+    return Number.isFinite(n) && n >= 0 ? n : undefined;
+  };
+  const cfg = {
+    mode: box.querySelector('[name="mode"]').value,
+    infinite: box.querySelector('[name="infinite"]').checked,
+    triggers: {
+      atMention: box.querySelector('[name="atMention"]').checked,
+      nameMention: box.querySelector('[name="nameMention"]').checked,
+      question: box.querySelector('[name="question"]').checked,
+      anyMessage: box.querySelector('[name="anyMessage"]').checked,
+      poke: box.querySelector('[name="poke"]').checked,
+      keywords: String(box.querySelector('[name="keywords"]').value || '').split(/[,，]/).map((x) => x.trim()).filter(Boolean),
+      speakerIds: String(key).startsWith('private:') ? [] : String(box.querySelector('[name="speakerIds"]').value || '').split(/[,，\s]+/).map((x) => x.trim()).filter(Boolean),
+    },
+    maxWakePerMinute: numOpt('maxWakePerMinute'),
+    maxWakePerHour: numOpt('maxWakePerHour'),
+    speakCooldownMs: numOpt('speakCooldownMs'),
+    batchWindowMs: numOpt('batchWindowMs'),
+  };
+  const prob = String(box.querySelector('[name="probability"]').value || '').trim();
+  if (prob !== '') cfg.triggers.probability = Math.min(1, Math.max(0, Number(prob) || 0));
+  if (!cfg.infinite) {
+    const m = numOpt('sleepMin');
+    if (m != null && m > 0) cfg.sleepMs = m * 60 * 1000;
+  }
+  const t = cfg.triggers;
+  const trigTxt = ['@' + (t.atMention ? '✓' : '✗'), '名字' + (t.nameMention ? '✓' : '✗'), '提问' + (t.question ? '✓' : '✗'), '每条' + (t.anyMessage ? '✓' : '✗'), '拍一拍' + (t.poke ? '✓' : '✗'), '词' + t.keywords.length + '个', '人' + t.speakerIds.length + '个'].join(' ');
+  if (!confirm(`保存 ${key} 的唤醒配置？\n\n模式 ${cfg.mode} · 无限期 ${cfg.infinite ? '开' : '关'}\n触发：${trigTxt}\n节流：${cfg.maxWakePerMinute ?? '不变'}/分，${cfg.maxWakePerHour ?? '不变'}/时\n\n提示：active 会强制 anyMessage=开、清除沉睡时间。`)) return;
+  try {
+    const r = await api('/api/socialV2/wake-config', { method: 'POST', body: JSON.stringify({ key, config: cfg }) });
+    const ws = r.wakeSafety || {};
+    toast(ws.guaranteed === false
+      ? '已保存，但当前没有任何唤醒途径（兜底会在下个周期自动重置为默认）'
+      : '唤醒配置已保存（有唤醒途径）');
+    await loadSessions(true);
+  } catch (e) { toast('失败：' + e.message, true); }
+}
+async function resetWakeOverride(key) {
+  if (!confirm(`清除 ${key} 的唤醒覆盖、恢复全局默认？\n\n她/系统动过的部分退回默认；主人手配的 anyMessage（“每条都看”）与节流参数会保留。`)) return;
+  try {
+    const r = await api('/api/socialV2/wake-config', { method: 'POST', body: JSON.stringify({ key, config: null }) });
+    toast(r.reset ? '已恢复全局默认（保留主人配置）' : '已处理');
+    await loadSessions(true);
+  } catch (e) { toast('失败：' + e.message, true); }
+}
+
+// ══ 面板完善④：健康与成本（GET /api/panel/health，30 秒一轮）══
+const fmtBytes = (b) => b == null ? '–' : b < 1024 ? b + ' B' : b < 1048576 ? (b / 1024).toFixed(1) + ' KB' : (b / 1048576).toFixed(2) + ' MB';
+async function refreshHealth(allowRetry = true) {
+  let h;
+  try { h = await api('/api/panel/health'); }
+  catch (e) {
+    if (e.message === 'NETDOWN') return;
+    const needAuth = /未授权|令牌/.test(e.message);
+    if (needAuth && allowRetry && INJECTED_OK && TOKEN !== INJECTED) {
+      TOKEN = INJECTED; localStorage.setItem('whaleToken', TOKEN); $('token').value = TOKEN;
+      return refreshHealth(false);
+    }
+    $('healthBody').innerHTML = '<div class="muted">读取失败：' + esc(e.message) + '</div>';
+    return;
+  }
+  $('healthAt').textContent = '体检于 ' + new Date().toLocaleTimeString('zh-CN');
+  const fts = h.fts || {};
+  const ftsOk = fts.orphans != null && fts.orphans === 0;
+  const wd = h.watchdog || {};
+  const today = h.today || {};
+  const st = h.storage || {};
+  const proactive = (today.proactive || []).map((p) =>
+    `<div class="k">${esc(keyLabel(p.key))}</div><div>${p.used} / ${p.quota}（今日主动配额${p.allowed === false ? '，已满' : ''}）</div>`).join('');
+  $('healthBody').innerHTML = `
+    <div class="tile">
+      <h3>全文索引一致性</h3>
+      <div class="kv">
+        <div class="k">长期记忆</div><div><span class="num">${fts.facts ?? '–'}</span> 条</div>
+        <div class="k">FTS 索引</div><div><span class="num">${fts.indexed ?? '–'}</span> 条</div>
+        <div class="k">孤儿索引</div><div><span class="num ${ftsOk ? '' : 'bad'}">${fts.orphans ?? '–'}</span> ${ftsOk ? '条（干净）' : '条 ⚠ 每晚 01:00 维护会自愈'}</div>
+        ${fts.error ? `<div class="k">错误</div><div class="num bad">${esc(fts.error)}</div>` : ''}
+      </div>
+    </div>
+    <div class="tile">
+      <h3>看门狗</h3>
+      <div class="kv">
+        <div class="k">实例</div><div><span class="num ${wd.count > 0 ? '' : 'bad'}">${wd.count ?? 0}</span> 个在跑（互相守护：桥接每 3 分钟也会确认一次）</div>
+        <div class="k">探活</div><div>${wd.checkedAt ? ago(wd.checkedAt) : '未探过'}</div>
+      </div>
+      ${(wd.recentLog || []).length ? `<div class="wlog">${(wd.recentLog || []).slice(-3).map(esc).join('\n')}</div>` : '<div class="muted" style="margin-top:6px">看门狗日志暂无重启记录（好事）</div>'}
+    </div>
+    <div class="tile">
+      <h3>今日开销</h3>
+      <div class="kv">
+        <div class="k">工具调用</div><div><span class="num">${today.callCount ?? 0}</span> 次</div>
+        <div class="k">发送</div><div><span class="num">${today.sendOk ?? 0}</span> 成 / <span class="num ${today.sendFail ? 'bad' : ''}">${today.sendFail ?? 0}</span> 败</div>
+        <div class="k">唤醒</div><div><span class="num">${today.wakeCount ?? 0}</span> 次</div>
+        <div class="k">她发言</div><div><span class="num">${today.sendTimes ?? 0}</span> 次</div>
+        <div class="k">主动性决策</div><div><span class="num">${today.initiativeToday ?? 0}</span> 次（其中开口 ${today.initiativeSpoken ?? 0}）</div>
+        ${proactive}
+      </div>
+    </div>
+    <div class="tile">
+      <h3>存储体积</h3>
+      <div class="kv">
+        <div class="k">记忆库 memory.db</div><div>${fmtBytes(st.memoryDb)}</div>
+        <div class="k">工具日志 tool-calls</div><div>${fmtBytes(st.toolLog)}（封顶 2000 行自动滚）</div>
+        <div class="k">社交状态 social-v2</div><div>${fmtBytes(st.socialV2)}</div>
+        <div class="k">主动性日志 initiative</div><div>${fmtBytes(st.initiativeLog)}</div>
+        <div class="k">DSH 会话数</div><div><span class="num">${st.sessionCount ?? '–'}</span> 个</div>
+      </div>
+    </div>`;
+}
+
 async function saveWhitelist() {
   try {
     await api('/api/whitelist', { method: 'POST', body: JSON.stringify({
@@ -451,7 +869,13 @@ async function resetAllSessions() {
 }
 renderTabs();
 refresh();
+refreshHer();
+loadSessions();
+refreshHealth();
 setInterval(refresh, 6000);
+setInterval(refreshHer, 6000);
+setInterval(() => loadSessions(false), 60000);
+setInterval(refreshHealth, 30000);
 </script>
 </body>
 </html>

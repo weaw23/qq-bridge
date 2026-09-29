@@ -14,6 +14,8 @@ import * as safeFetch from '../src/safe-fetch.js';
 import * as forward from '../src/forward.js';
 import * as slang from '../src/slang-learner.js';
 import * as sticker from '../src/sticker-lib.js';
+import * as expressions from '../src/expression-learner.js';
+import * as personaState from '../src/persona-state.js';
 import { unwrap, createTurnCollector } from '../src/dsh-client.js';
 
 const root = fileURLToPath(new URL('..', import.meta.url));
@@ -66,13 +68,14 @@ export async function bridgeHarness({ config = {}, savedState, globals = {} } = 
   const timers = new Set();
   const context = vm.createContext({
     fs, path, http, crypto, fileURLToPath, URL, Buffer, AbortSignal, console: { log() {}, error() {} },
-    process: { pid: process.pid, platform: process.platform, kill: process.kill, exit: (code) => { throw new Error('unexpected exit ' + code); } },
+    process: { pid: process.pid, platform: process.platform, kill: process.kill, exit: (code) => { throw new Error('unexpected exit ' + code); }, on() {}, once() {}, removeAllListeners() {}, env: {} },
     setTimeout: (fn, ms) => { const timer = setTimeout(fn, ms); timers.add(timer); return timer; },
     clearTimeout, setInterval: () => ({ unref() {} }), clearInterval: () => {},
     NodeApiClient: class { constructor() { return api; } },
     SnowLumaWebSocketClient: FakeBot, text: (s) => s,
     discoverDshLaunchToken: () => '', unwrap, createTurnCollector,
     ...markdown, ...sensitive, ...wait, ...safeFetch, ...forward, ...slang, ...sticker,
+    ...expressions, ...personaState,
     ...globals,
   });
   vm.runInContext(source + '\nglobalThis.auditReady = main();', context);

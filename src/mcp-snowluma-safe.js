@@ -985,7 +985,7 @@ if (cfg.socialV2?.sticker?.enabled !== false && cfg.socialV2?.tools?.getStickerI
 if (cfg.socialV2?.sticker?.enabled !== false && cfg.socialV2?.tools?.sendSticker !== false) {
   server.tool(
     'qq_send_sticker',
-    '发一张收藏表情（单独一条，不能带文字）。',
+    '发一张收藏表情（单独一条，不能在同一气泡里附带文字）。',
     {
       key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
       token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),

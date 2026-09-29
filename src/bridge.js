@@ -32,6 +32,7 @@ import {
   newState,
   renderStateLine,
   serializeState,
+  stateTendency,
 } from './persona-state.js';
 // 阶段 4：主动开口决策引擎（注意力加权概率 + 七重闸门 + 念头白名单）
 import { planInitiative } from './initiative.js';
@@ -3185,6 +3186,20 @@ async function main() {
           if (req.headers['x-agent-token'] && !v2SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
           if (req.headers['x-agent-token'] && !v2ToolEnabled('setWakeConfig')) { sendJson({ ok: false, error: '工具未启用：qq_set_wake_config' }, 403); return; }
           const st = getSocialV2State(key);
+          // 控制台「恢复全局默认」：整份 config 传 null = 清除该会话的覆盖。
+          // resetWakeConfigV2 会刻意保留主人手配的 anyMessage 与节流三参数（见其注释），
+          // 所以这里不是"一键清光"，是"把她自己动过的部分退回默认、主人的配置不动"。
+          if (body.config === null) {
+            resetWakeConfigV2(st, { key, why: '控制台：恢复全局默认' });
+            st.wakeConfig.confirmedAt = Date.now();
+            st.wakeConfig.confirmedBy = 'set_wake_config';
+            st.lastActionAt = Date.now();
+            saveSocialV2State();
+            setupSleepTimerV2(key);
+            log(`[reserved2] 控制台清除唤醒覆盖 ${key}，已恢复默认（保留主人配置）`);
+            sendJson({ ok: true, key, reset: true, wakeConfig: st.wakeConfig, wakeSafety: computeWakeSafetyV2(st.wakeConfig) });
+            return;
+          }
           const agentCall = Boolean(req.headers['x-agent-token']);
           let input = body.config && typeof body.config === 'object' && !Array.isArray(body.config) ? body.config : {};
           // 阶段 6：她自己改（带 agent token）时先过白名单 / 区间 / 每日 3 次额度；
@@ -5427,6 +5442,166 @@ async function main() {
             // P0-3：出箱概况（只读）。pending>0 说明有消息正在等重投 —— 以前这种状态在外部完全看不到。
             outbox: outboxStats(),
             sessions
+          });
+          return;
+        }
+        // ── 面板完善①：「她此刻」状态卡（心情/精力 + 为什么安静 + 她最近说的话 + 她惦记的事）──
+        if (req.method === 'GET' && url.pathname === '/api/panel/her-now') {
+          const now = Date.now();
+          // 心情/精力：全局 personaState，按真实 updatedAtMs 衰减到当前时刻展示。
+          const state = deserializeState(socialV2.personaState, now);
+          const decayed = decayState(state, { fromMs: state.updatedAtMs || now, toMs: now });
+          const hour = new Date(now).getHours();
+          // 主动性曲线：近 6h 的决策记录（每 ~5 分钟一条，带 mood/energy 快照）。
+          let curve = [];
+          let lastDecision = null;
+          try {
+            const lines = fs.readFileSync(INITIATIVE_LOG_FILE, 'utf8').split('\n').filter(Boolean);
+            const entries = lines.slice(-240).map((l) => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+            const cutoff = now - 6 * 3600 * 1000;
+            curve = entries.filter((e) => e.type === 'decision' && Number(e.ts) >= cutoff)
+              .map((e) => ({ ts: Number(e.ts), mood: e.mood, energy: e.energy }));
+            lastDecision = [...entries].reverse().find((e) => e.type === 'decision') || null;
+          } catch {}
+          // 她最近说的话：tool-calls 里发送类工具的 call 条目（args 落盘前已脱敏）。
+          const toolEntries = readToolLog(400);
+          const sendCalls = [];
+          for (let i = 0; i < toolEntries.length; i++) {
+            const e = toolEntries[i];
+            if (e?.type !== 'call' || !isSendToolName(String(e.tool || ''))) continue;
+            let parsed = null;
+            try { parsed = JSON.parse(String(e.args ?? '{}')); } catch {}
+            const texts = [];
+            if (Array.isArray(parsed?.messages)) texts.push(...parsed.messages.map(String));
+            else if (typeof parsed?.messages === 'string' && parsed.messages) texts.push(parsed.messages);
+            if (typeof parsed?.message === 'string' && parsed.message) texts.push(parsed.message);
+            if (typeof parsed?.caption === 'string' && parsed.caption) texts.push(parsed.caption);
+            const toolName = String(e.tool || '');
+            if (toolName.includes('sticker')) texts.push('（表情包）');
+            if (toolName.includes('poke')) texts.push('（拍一拍）');
+            if (toolName.includes('image')) texts.push('（图片）');
+            // 邻近配对：后面第一条同工具同会话的 result 判断成败（找不到就当"无回执"）。
+            let ok = null;
+            for (let j = i + 1; j < Math.min(i + 6, toolEntries.length); j++) {
+              const r = toolEntries[j];
+              if (r?.type === 'result' && r.tool === e.tool && r.sessionId === e.sessionId) { ok = !!r.ok; break; }
+            }
+            sendCalls.push({ time: e.time, key: e.key, tool: toolName, ok, text: texts.filter(Boolean).join(' / ').slice(0, 120) });
+          }
+          const recentSay = sendCalls.slice(-30).reverse();
+          const lastToolAt = toolEntries.length ? new Date(toolEntries[toolEntries.length - 1].time).getTime() : 0;
+          const busy = lastToolAt > 0 && now - lastToolAt < 3 * 60 * 1000;
+          // 每会话的活动摘要 + 她惦记的事（activeTopics/pendingThoughts 落的是 qq_memory_append 的原文）。
+          const dayStart = new Date(); dayStart.setHours(0, 0, 0, 0);
+          const dayStartMs = dayStart.getTime();
+          const pickText = (x) => (typeof x === 'string' ? x : (x && typeof x === 'object' && typeof x.content === 'string' ? x.content : ''));
+          const sessions = [];
+          for (const [key, st] of socialV2.conversations) {
+            sessions.push({
+              key,
+              unread: Array.isArray(st.unread) ? st.unread.length : 0,
+              lastWakeReason: st.lastWakeReason ?? null,
+              lastIncomingAt: Number(st.lastIncomingAt) || 0,
+              lastAiReplyAt: Number(st.lastAiReplyAt) || 0,
+              lastActionAt: Number(st.lastActionAt) || 0,
+              wakeCountToday: (st.wakeTimes || []).filter((t) => t >= dayStartMs).length,
+              sendCountToday: (st.sendTimes || []).filter((t) => t >= dayStartMs).length,
+              activeTopics: (st.activeTopics || []).map(pickText).filter(Boolean).slice(0, 4),
+              pendingThoughts: (st.pendingThoughts || []).map(pickText).filter(Boolean).slice(0, 4),
+              initiativeIgnoredCount: Number(st.initiativeIgnoredCount) || 0,
+              wakeConfig: st.wakeConfig ?? null,
+              wakeSafety: computeWakeSafetyV2(st.wakeConfig)
+            });
+          }
+          sendJson({
+            ok: true,
+            now,
+            persona: {
+              mood: Math.round(decayed.mood * 10) / 10,
+              energy: Math.round(decayed.energy * 10) / 10,
+              updatedAtMs: state.updatedAtMs || 0,
+              stateLine: renderStateLine(decayed, { hour }),
+              tendency: stateTendency(decayed, { hour })
+            },
+            busy,
+            lastToolAt,
+            curve,
+            lastDecision,
+            recentSay,
+            sessions
+          });
+          return;
+        }
+        // ── 面板完善④：健康与成本（FTS 一致性 / 看门狗 / 今日开销 / 存储体积）──
+        if (req.method === 'GET' && url.pathname === '/api/panel/health') {
+          const now = Date.now();
+          const dayStart = new Date(); dayStart.setHours(0, 0, 0, 0);
+          const dayStartMs = dayStart.getTime();
+          // FTS 一致性：facts 条数 / 索引条数 / 孤儿索引（夜间 01:00 维护会自愈）。
+          let fts = null;
+          try {
+            const db = getMemoryDb();
+            fts = {
+              facts: db.prepare('SELECT COUNT(*) AS c FROM facts').get().c,
+              indexed: db.prepare('SELECT COUNT(*) AS c FROM facts_fts').get().c,
+              orphans: db.prepare('SELECT COUNT(*) AS c FROM facts_fts WHERE rowid NOT IN (SELECT id FROM facts)').get().c
+            };
+          } catch (error) { fts = { error: error?.message ?? String(error) }; }
+          // 看门狗：缓存探活（过期就现场探一次）+ 重启日志尾 5 行。
+          if (!watchdogStatusCache.at || now - watchdogStatusCache.at > 90 * 1000) watchdogAlive();
+          const watchdog = { count: watchdogStatusCache.count, checkedAt: watchdogStatusCache.at, recentLog: [] };
+          try {
+            const wl = fs.readFileSync(path.join(ROOT, '..', 'logs', 'watchdog.log'), 'utf8').split('\n').map((s) => s.trim()).filter(Boolean);
+            watchdog.recentLog = wl.slice(-5);
+          } catch {}
+          // 今日开销：工具调用 / 发送成败 / 唤醒次数 / 主动性决策与开口 / 主动配额。
+          const toolEntries = readToolLog(400);
+          const localDay = (t) => { const d = new Date(t); return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0'); };
+          const todayKey = localDay(now);
+          const todayCalls = toolEntries.filter((e) => e?.time && localDay(e.time) === todayKey);
+          const callCount = todayCalls.filter((e) => e.type === 'call').length;
+          let sendOk = 0, sendFail = 0;
+          for (const e of todayCalls) {
+            if (e.type === 'result' && isSendToolName(String(e.tool || ''))) { if (e.ok) sendOk++; else sendFail++; }
+          }
+          let wakeCount = 0, sendTimesCount = 0;
+          const quota = proactiveQuotaPerDay();
+          const proactive = [];
+          for (const [key, st] of socialV2.conversations) {
+            wakeCount += (st.wakeTimes || []).filter((t) => t >= dayStartMs).length;
+            sendTimesCount += (st.sendTimes || []).filter((t) => t >= dayStartMs).length;
+            const used = proactiveUsedToday(key);
+            proactive.push({ key, used, quota, allowed: used < quota });
+          }
+          let initiativeToday = 0, initiativeSpoken = 0;
+          try {
+            const lines = fs.readFileSync(INITIATIVE_LOG_FILE, 'utf8').split('\n').filter(Boolean);
+            const entries = lines.slice(-400).map((l) => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+            for (const e of entries) {
+              if (e?.type === 'decision' && e.ts && localDay(e.ts) === todayKey) {
+                initiativeToday++;
+                if (e.action && e.action !== 'none') initiativeSpoken++;
+              }
+            }
+          } catch {}
+          // 存储体积：memory.db / tool-calls.jsonl / social-v2.json / initiative-log.jsonl + 会话数。
+          const sizeOf = (p) => { try { return fs.statSync(p).size; } catch { return null; } };
+          let sessionCount = null;
+          try { sessionCount = Object.keys(JSON.parse(fs.readFileSync(STATE_FILE, 'utf8')).sessions || {}).length; } catch {}
+          const storage = {
+            memoryDb: sizeOf(path.join(STATE_DIR, 'memory.db')),
+            toolLog: sizeOf(TOOL_LOG_FILE),
+            socialV2: sizeOf(SOCIAL_V2_FILE),
+            initiativeLog: sizeOf(INITIATIVE_LOG_FILE),
+            sessionCount
+          };
+          sendJson({
+            ok: true,
+            now,
+            fts,
+            watchdog,
+            today: { callCount, sendOk, sendFail, wakeCount, sendTimes: sendTimesCount, initiativeToday, initiativeSpoken, proactive },
+            storage
           });
           return;
         }
@@ -9222,10 +9397,16 @@ async function main() {
   // 看门狗负责把桥接/SnowLuma 拉起来；桥接负责把看门狗拉起来 —— 双向兜底，
   // 从而不需要"每分钟跑一次计划任务"（那会每分钟弹一次黑窗口）。
   const WATCHDOG_PATH = path.join(ROOT, '..', 'watchdog.mjs');
+  // 面板「健康」页用：最近一次看门狗探活结果（个数 + 时间）。ensureWatchdog 每 3 分钟刷一次缓存，
+  // 健康接口优先读缓存；缓存从未填过或已过期 90s 就现场探一次（面板请求是管理员手动触发，
+  // 频率极低，同步一秒可以接受）。
+  let watchdogStatusCache = { count: 0, at: 0 };
   function watchdogAlive() {
     try {
       const out = execFileSync('powershell.exe', ['-NoProfile', '-Command', 'Get-CimInstance Win32_Process -Filter "Name=\'node.exe\'" | Where-Object { $_.CommandLine -like "*watchdog.mjs*" } | Measure-Object | Select-Object -ExpandProperty Count'], { encoding: 'utf8', timeout: 20000, windowsHide: true });
-      return Number(String(out).trim()) > 0;
+      const count = Number(String(out).trim()) || 0;
+      watchdogStatusCache = { count, at: Date.now() };
+      return count > 0;
     } catch { return false; }
   }
   function ensureWatchdog() {
