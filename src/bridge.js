@@ -19,6 +19,24 @@ import { SENSITIVE_RE, sensitiveVerdict, maskTokens } from './sensitive.js';
 import { looksLikeUnfinished } from './v2-wait.js';
 import { safeFetchBuffer, looksLikeImageBuffer } from './safe-fetch.js';
 import { extractForwardIds, forwardIdFromData, sanitizeForwardId, formatForwardResponse } from './forward.js';
+// 升级阶段 1/2/3 的四块新能力（都是纯函数模块，逻辑与阈值都在各自 ops/test-*.mjs 里锁住）：
+//   refusal-guard 官方口吻兜底改写 / splitter 分条与间隔 / deai 去 AI 腔打分 / persona-state 心情精力
+import { guardOutgoing } from './refusal-guard.js';
+import { planSend } from './splitter.js';
+import { scanAiTone } from './deai.js';
+import {
+  STATE_EVENTS,
+  applyEvents,
+  decayState,
+  deserializeState,
+  newState,
+  renderStateLine,
+  serializeState,
+  stateTendency,
+} from './persona-state.js';
+// 阶段 4：主动开口决策引擎（注意力加权概率 + 七重闸门 + 念头白名单）
+import { planInitiative } from './initiative.js';
+import { makeAuditEntry, planSelfEdit, rollbackPlan, autonomyStats } from './autonomy.js';
 import {
   loadSlang,
   saveSlang,
@@ -3161,7 +3179,26 @@ async function main() {
           if (req.headers['x-agent-token'] && !v2SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
           if (req.headers['x-agent-token'] && !v2ToolEnabled('setWakeConfig')) { sendJson({ ok: false, error: '工具未启用：qq_set_wake_config' }, 403); return; }
           const st = getSocialV2State(key);
-          const input = body.config && typeof body.config === 'object' && !Array.isArray(body.config) ? body.config : {};
+          const agentCall = Boolean(req.headers['x-agent-token']);
+          let input = body.config && typeof body.config === 'object' && !Array.isArray(body.config) ? body.config : {};
+          // 阶段 6：她自己改（带 agent token）时先过白名单 / 区间 / 每日 3 次额度；
+          // 管理员（控制台令牌或不带令牌）直通，不受这套约束 —— 理由见 autonomyGateEnabled 注释。
+          let autonomy = null;
+          if (agentCall && Object.keys(input).length && autonomyGateEnabled()) {
+            autonomy = autonomySelfEditV2(key, st, input);
+            input = autonomy.input;
+            saveSocialV2State(); // 审计（含被拒条目）必须落盘：面板要能看见"她想改但被拒了"
+            if (!autonomy.applied.length) {
+              sendJson({
+                ok: false,
+                error: `这次自改一条都没通过（服务端白名单 / 区间 / 每日额度）：${autonomy.rejected.map((e) => `${e.path}：${e.reason}`).join('；')}`,
+                autonomy: { applied: [], rejected: autonomy.rejected.map((e) => ({ path: e.path, reason: e.reason })), quotaLeft: autonomy.quotaLeft, limit: autonomy.limit },
+                wakeConfig: st.wakeConfig,
+                wakeSafety: computeWakeSafetyV2(st.wakeConfig)
+              }, 403);
+              return;
+            }
+          }
           const current = st.wakeConfig;
           const inputTriggers = input.triggers && typeof input.triggers === 'object' && !Array.isArray(input.triggers) ? input.triggers : {};
           const normalizeTriggerBool = (name, fallback) => {
@@ -3318,7 +3355,59 @@ async function main() {
           cancelReplyCheckV2(key); // AI 已主动设置新的唤醒配置，取消回复检查
           setupSleepTimerV2(key);
           log(`[reserved2] 更新唤醒配置 ${key}: mode=${next.mode} infinite=${next.infinite} sleepUntil=${next.sleepUntil ?? 'null'}`);
-          sendJson({ ok: true, key, wakeConfig: next, wakeSafety: computeWakeSafetyV2(next) });
+          sendJson({
+            ok: true,
+            key,
+            wakeConfig: next,
+            wakeSafety: computeWakeSafetyV2(next),
+            ...(autonomy ? {
+              autonomy: {
+                applied: autonomy.applied.map((e) => ({ path: e.path, from: e.from, to: e.to })),
+                rejected: autonomy.rejected.map((e) => ({ path: e.path, reason: e.reason })),
+                quotaLeft: autonomy.quotaLeft,
+                limit: autonomy.limit
+              }
+            } : {})
+          });
+          return;
+        }
+        // 阶段 6：自主改配置的审计（GET，只读）+ 一键回滚（POST）。两个接口都只给控制台用：
+        // 带 agent token 的调用一律 403 —— 她自己不能读、更不能触发回滚。
+        if ((req.method === 'GET' || req.method === 'POST') && url.pathname === '/api/socialV2/autonomy') {
+          if (req.headers['x-agent-token']) { sendJson({ ok: false, error: '该接口仅控制台可用' }, 403); return; }
+          const key = String(url.searchParams.get('key') ?? '').trim();
+          if (!key) { sendJson({ ok: false, error: 'key 不能为空' }, 400); return; }
+          const st = getSocialV2State(key);
+          const audit = Array.isArray(st.autonomyAudit) ? st.autonomyAudit.slice(-50) : [];
+          if (req.method === 'GET') {
+            sendJson({ ok: true, key, stats: autonomyStats(st.autonomyAudit, { nowMs: Date.now() }), audit, wakeConfig: st.wakeConfig });
+            return;
+          }
+          // POST = 一键回滚。rollbackPlan 是**逆序**的：同一条路径可能被改过多次，
+          // 后来落地的值先生效，正序回滚会停在中间态而不是初始值。
+          const undo = rollbackPlan(st.autonomyAudit);
+          const nowMs = Date.now();
+          for (const e of undo) applyWakePathV2(st, e.path, e.to);
+          if (undo.length) {
+            saveSocialV2State();
+            // 回滚记录**只写 JSONL，不进 st.autonomyAudit**：countToday 认的是 ok=true 的条目，
+            // 而 rollbackPlan 的产物是 ok=true —— 混进去等于"回滚一次就吃掉她今天一次自改额度"。
+            // 审计留痕由 autonomy-log.jsonl 负责，面板看到的是本次响应的 undo 列表。
+            appendAutonomyLog(key, {
+              applied: undo.map((e) => makeAuditEntry({ path: e.path, from: e.from, to: e.to, ok: true, reason: e.reason, nowMs, source: 'rollback' })),
+              rejected: []
+            });
+            setupSleepTimerV2(key);
+            log(`[autonomy] 回滚 ${key}：撤销 ${undo.length} 条自改`);
+          }
+          sendJson({
+            ok: true,
+            key,
+            rolledBack: undo.length,
+            undo: undo.map((e) => ({ path: e.path, to: e.to })),
+            wakeConfig: st.wakeConfig,
+            stats: autonomyStats(st.autonomyAudit, { nowMs })
+          });
           return;
         }
         if (req.method === 'GET' && url.pathname === '/api/socialV2/states') {
@@ -5939,42 +6028,58 @@ async function main() {
             if (oneGuard.blocked) { sendJson({ ok: false, error: '消息含敏感信息，已阻止发送' }, 403); return; }
             message = oneGuard.text;
           }
+          // 出站三层（阶段 1 兜底改写 / 阶段 3 分条+间隔）：决策全部收在 applyOutboundLayers 里，
+          // 单条时 parts=[message]、gaps=[]，与改动前逐字一致。
+          const layers = applyOutboundLayers(key, message, url.pathname);
+          message = layers.text;
+          const parts = layers.parts.length ? layers.parts : [message];
+          const gaps = layers.gaps;
+          // st/now 提到 try 外面：原来的回滚分支在 catch 里引用 try 内声明的 const，
+          // 发送一失败就会 ReferenceError（回滚反而变成 500）。顺手修正。
+          let st = null;
+          let now = 0;
           try {
-            const st = getSocialV2State(key);
-            const now = Date.now();
+            st = getSocialV2State(key);
+            now = Date.now();
             const maxPerMinute = Number(sendCfg.maxSendPerMinute) || 0;
             const maxPerHour = Number(sendCfg.maxSendPerHour) || 0;
             const recentMinute = (st.sendTimes || []).filter((t) => now - t < 60000).length;
             const recentHour = (st.sendTimes || []).filter((t) => now - t < 3600000).length;
-            if ((maxPerMinute > 0 && recentMinute + 1 > maxPerMinute) || (maxPerHour > 0 && recentHour + 1 > maxPerHour)) {
+            // 分条后一次调用可能真的发多条，额度按实际条数预占（否则分条等于绕过限频）。
+            if ((maxPerMinute > 0 && recentMinute + parts.length > maxPerMinute) || (maxPerHour > 0 && recentHour + parts.length > maxPerHour)) {
               sendJson({ ok: false, error: '发送频率超限，请稍后再试' }, 429);
               return;
             }
-            st.sendTimes.push(now);
+            for (let i = 0; i < parts.length; i++) st.sendTimes.push(now);
             if (st.sendTimes.length > 500) st.sendTimes = st.sendTimes.slice(-500);
-            const sentMessages = await sendMessagesV2(key, [message], [], actualReplyToMessageId, atUserId);
+            const sentMessages = await sendMessagesV2(key, parts, gaps, actualReplyToMessageId, atUserId);
             recordSentMessagesV2(key, sentMessages);
             st.lastAiReplyAt = now;
             st.lastActionAt = now;
             st.wakeConfig.noActionCount = 0;
+            // 阶段 2：她开口了 → 心情/精力按事件走（分条多发算一次 burst）。
+            bumpPersonaState(key, parts.length > 1 && sentMessages.length > 1 ? ['chat', 'burst'] : ['chat']);
             saveSocialV2State();
-            log(`[send] ${url.pathname} ${key}: 成功 ${sentMessages.length}/1 条`);
-            appendActivity(`${key} [send] 成功 ${sentMessages.length}/1 条：${message.slice(0, 80)}`);
+            log(`[send] ${url.pathname} ${key}: 成功 ${sentMessages.length}/${parts.length} 条`);
+            appendActivity(`${key} [send] 成功 ${sentMessages.length}/${parts.length} 条：${message.slice(0, 80)}`);
             if (sentMessages.length > 0) scheduleReplyCheckV2(key);
-            sendJson({ ok: true, key, sent: sentMessages.length, failed: sentMessages.length ? 0 : 1, quoted: quotedInfo });
+            sendJson({ ok: true, key, sent: sentMessages.length, failed: Math.max(0, parts.length - sentMessages.length), quoted: quotedInfo, parts: parts.length });
           } catch (error) {
             if (error?.sent?.length) {
               recordSentMessagesV2(key, error.sent);
-              log(`[send] ${url.pathname} ${key} 部分成功 ${error.sent.length}/1 条，已记录已发消息`);
+              log(`[send] ${url.pathname} ${key} 部分成功 ${error.sent.length}/${parts.length} 条，已记录已发消息`);
             }
             // 失败/未发出的消息回滚预占的发送额度，避免假 429。
             const sentCount = Array.isArray(error?.sent) ? error.sent.length : 0;
-            const failedCount = Math.max(0, 1 - sentCount);
-            for (let i = 0; i < failedCount; i++) {
-              const idx = st.sendTimes.indexOf(now);
-              if (idx >= 0) st.sendTimes.splice(idx, 1);
+            const failedCount = Math.max(0, parts.length - sentCount);
+            if (st) {
+              for (let i = 0; i < failedCount; i++) {
+                const idx = st.sendTimes.indexOf(now);
+                if (idx >= 0) st.sendTimes.splice(idx, 1);
+              }
+              if (st.sendTimes.length > 500) st.sendTimes = st.sendTimes.slice(-500);
             }
-            if (st.sendTimes.length > 500) st.sendTimes = st.sendTimes.slice(-500);
+            bumpPersonaState(key, ['error']);
             saveSocialV2State();
             if (error?.queued) {
               // P0-3：消息已进箱、后台会重投。用 202（Accepted）而不是 500 —— 语义不同：
@@ -6259,6 +6364,74 @@ async function main() {
   // 新分句逻辑：分句权交给 AI。
   // AI 用空格表示“这里要分成下一条消息”，桥接按空格拆条；
   // 不想分条时用标点连接、不加空格即可。单条消息只做 maxReplyChars（默认 500 字）安全硬拆。
+  // ── 出站三层流水线（阶段 1 兜底改写 / 阶段 3 去 AI 腔 + 分条节奏） ──────────
+  // 只做决策，不发送：返回 {text, parts, gaps, ...}，调用方自己 sendMessagesV2(key, parts, gaps, ...)。
+  // gaps.length 恒等于 parts.length-1，正好是 sendMessagesV2 delays 的语义（第 i 条之后的等待）。
+  // 开关：cfg.socialV2.layers = { enabled, guard, splitter, tone }，缺省全开。
+  function outboundLayerCfg() {
+    const raw = cfg.socialV2?.layers ?? {};
+    return {
+      enabled: raw.enabled !== false,
+      guard: raw.guard !== false,
+      split: raw.splitter !== false,
+      tone: raw.tone !== false,
+    };
+  }
+
+  function applyOutboundLayers(key, text, where = '') {
+    const out = { text, parts: [text], gaps: [], guard: 'pass', toneScore: 0, kinds: [] };
+    const lc = outboundLayerCfg();
+    if (!lc.enabled || typeof text !== 'string' || !text.trim()) return out;
+    let work = text;
+
+    // 1) 官方口吻 / 说明书腔兜底改写。不整条丢：她前面那半句正常的话要留着，
+    //    只把"出戏"的那一句换成她的反应（判定逻辑与阈值见 src/refusal-guard.js）。
+    if (lc.guard) {
+      const g = guardOutgoing(work, { allowDrop: false });
+      out.guard = g.action;
+      out.kinds = Array.isArray(g.kinds) ? g.kinds : [];
+      if (g.action === 'rewrite' && g.text && g.text !== work) {
+        log(`[layers] 兜底改写 ${key}${where ? ' ' + where : ''}：${out.kinds.join(',') || 'refusal'}`);
+        work = g.text;
+      }
+    }
+
+    // 2) 去 AI 腔打分：**只记日志，不改文案**。机器改写容易把语气磨平，
+    //    先攒够真实样本，再决定要不要开自动重写（阈值与词表见 src/deai.js）。
+    if (lc.tone) {
+      try {
+        const scan = scanAiTone(work);
+        out.toneScore = Number(scan?.score) || 0;
+        if (out.toneScore >= 40) {
+          const why = (scan?.reasons || [])
+            .map((r) => (typeof r === 'string' ? r : (r?.word ?? r?.reason ?? '')))
+            .filter(Boolean).slice(0, 4).join(' / ');
+          log(`[layers] 去AI腔评分 ${out.toneScore}（${key}）：${why}`);
+        }
+      } catch (error) {
+        log('[layers] 去AI腔打分失败（已忽略）:', error?.message ?? error);
+      }
+    }
+
+    out.text = work;
+
+    // 3) 分条 + 间隔：只有真的分成 ≥2 条才改发送方式。
+    //    单条时保留原文——splitter 的归一化会吃掉换行，不该影响普通单条发送。
+    if (lc.split) {
+      try {
+        const plan = planSend(work, {}, Math.random);
+        if (Array.isArray(plan?.parts) && plan.parts.length > 1) {
+          out.parts = plan.parts;
+          out.gaps = Array.isArray(plan.gaps) ? plan.gaps : [];
+          log(`[layers] 分条 ${key}：${out.parts.length} 条，间隔 ${out.gaps.map((g) => Math.round(g)).join('/')}ms`);
+        }
+      } catch (error) {
+        log('[layers] 分条失败（已忽略，按单条发）:', error?.message ?? error);
+      }
+    }
+    return out;
+  }
+
   function planSocialTimeline(text, socialCfg) {
     const src = String(text ?? '').replace(/\r\n/g, '\n').trim();
     const rawMaxChars = Number(socialCfg?.maxReplyChars ?? 500);
@@ -7251,7 +7424,41 @@ async function main() {
   const socialV2 = {
     conversations: new Map(), // key -> state
     paused: false, // 控制台可暂停整个二代 AI 活动（停止唤醒/等待）
+    // 阶段 2：她自己的心情/精力（**全局面**，不按会话分：人只有一个自己）。
+    // 落盘在 state/social-v2.json 顶层 personaState，见 saveSocialV2State / loadSocialV2State。
+    personaState: null,
   };
+
+  // ── 阶段 2：心情/精力 ────────────────────────────────────────────────
+  // 设计原则：这里只维护"倾向"（说话长短、要不要主动、语气松紧），
+  // 不生成任何具体台词——文案永远由她自己想，模块只负责她今天是个什么状态。
+  function getPersonaState() {
+    if (!socialV2.personaState) socialV2.personaState = newState(Date.now());
+    return socialV2.personaState;
+  }
+
+  // 记一件事对她的影响。事件名先过 STATE_EVENTS 白名单，写错的直接忽略（不写脏数据）。
+  function bumpPersonaState(key, events) {
+    try {
+      const list = (Array.isArray(events) ? events : [events]).filter((n) => STATE_EVENTS[n]);
+      if (!list.length) return;
+      socialV2.personaState = applyEvents(getPersonaState(), list, { nowMs: Date.now() });
+    } catch (error) {
+      log('[persona-state] 更新失败（已忽略）:', error?.message ?? error);
+    }
+  }
+
+  // 取出"现在是几点该有什么倾向"的一行摘要（≤90 字），注入唤醒提示用。
+  function personaStateLine(nowMs = Date.now()) {
+    try {
+      const fresh = decayState(getPersonaState(), { toMs: nowMs });
+      socialV2.personaState = fresh;
+      return renderStateLine(fresh, { hour: new Date(nowMs).getHours() });
+    } catch (error) {
+      log('[persona-state] 渲染失败（已忽略）:', error?.message ?? error);
+      return '';
+    }
+  }
 
   // 一代/普通模式的图片/表情元数据存储：key -> Map<messageId/seq, media[]>
   // 二代模式则直接存在 socialV2 会话的 recentMessages/unread 消息对象上。
@@ -7501,6 +7708,8 @@ async function main() {
     try {
       const raw = readJsonSafe(SOCIAL_V2_FILE, null);
       socialV2.paused = raw?.paused === true;
+      // 版本不符/垃圾数据会把状态回落成基准线（deserializeState 内部负责），不会抛。
+      socialV2.personaState = deserializeState(raw?.personaState, Date.now());
       if (raw && typeof raw.conversations === 'object') {
         const seenTokens = new Set();
         for (const [key, val] of Object.entries(raw.conversations)) {
@@ -7594,6 +7803,8 @@ async function main() {
   function saveSocialV2State() {
     try {
       const obj = { paused: socialV2.paused, conversations: Object.create(null) };
+      // 心情/精力是全局的：跟会话并列存在顶层，重启后她"还记着自己昨天什么状态"。
+      obj.personaState = socialV2.personaState ? serializeState(socialV2.personaState) : null;
       for (const [key, st] of socialV2.conversations) {
         obj.conversations[key] = {
           wakeConfig: st.wakeConfig,
@@ -9169,6 +9380,10 @@ async function main() {
   // 事故背景：9/23、9/24 连续两晚复盘都没跑成——23 点整点时 DSH 已关（dshReady=false），
   // 旧逻辑 `getHours() !== targetHour` 直接 return，那一天的自我整理就永久丢失了。
   // 新逻辑：锚点=最近一次计划时刻，上次执行早于锚点且距上次 ≥20h 就跑 → 恢复后 10 分钟内补上。
+  // 阶段 4：每 5 分钟看一眼"她想不想说话"。真正的判断与闸门在 initiativeTickV2 / initiative.js，
+  // 这里只是个心跳；决定不说话时只写一行日志，几乎不花成本。
+  const initiativeTimer = setInterval(() => { void initiativeTickV2(); }, 5 * 60 * 1000);
+  initiativeTimer.unref?.();
   const reflectTimer = setInterval(async () => {
     try {
       if (cfg.autonomy?.enabled === false || !dshReady || socialV2.paused) return;
@@ -9531,6 +9746,12 @@ async function main() {
     if (lastMsg && looksLikeUnfinished(String(lastMsg.tail || lastMsg.plain || lastMsg.text || ''))) statusBits.push('对方可能没说完');
     if (lastAiMin != null) statusBits.push(`你上次发言 ${lastAiMin} 分钟前`);
     const statusLine = `【此刻状态】${statusBits.join('；')}\n\n`;
+    // 阶段 2：她自己的状态（心情/精力）→ 一行倾向，不给台词。
+    // 只影响"话多话少/要不要主动/语气松紧"，具体说什么仍然是提示词与她本人的事。
+    const personaStateText = personaStateLine();
+    const personaLine = personaStateText
+      ? `${/^【/.test(personaStateText) ? personaStateText : `【此刻的你】${personaStateText}`}\n\n`
+      : '';
     const wc = st.wakeConfig || {};
     const wcTr = wc.triggers || {};
     const wcMode = wc.mode === 'active' ? '活跃' : '潜水';
@@ -9549,7 +9770,7 @@ async function main() {
     const factLine = factLines.length
       ? `【相关记忆（自动想起的长期事实）】\n${factLines.join('\n')}\n（这些是你确实记过的，用得上就自然提起，别照着念清单；想翻更多用 qq_db_recall）\n\n`
       : '';
-    const base = roleLine + tokenLine + antiAiLine + proactiveLine + stickerLine + preSleepLine + statusLine + wakeLine + memoryLine + factLine + participationLine;
+    const base = roleLine + tokenLine + antiAiLine + proactiveLine + stickerLine + preSleepLine + statusLine + personaLine + wakeLine + memoryLine + factLine + participationLine;
     if (reason === 'reflect') {
       return `${base}【每日复盘】现在是今天的自我整理时间，不需要给任何人发消息（除非你确实想对主人说一句）。\n请按顺序做三件事：\n1) 回顾今天：用 qq_db_recall 看看近期记忆，用 qq_affinity(action=list) 看关系变化；\n2) 沉淀：值得长期记住的写进 qq_db_remember；对某人的观感变了就 qq_affinity(action=bump/set) 更新；对自己的新发现写 qq_self_note；\n3) 给明天留话头：想主动聊的话题/想问的事，用 qq_memory_append(category=pendingThought, extra.expiresAtMs=从现在到明早合适时间的毫秒数，一般 10~16 小时后过期) 记 1~2 条，明早被叫醒时你会自然带着这个话题开口；也可以 qq_set_reminder 设具体提醒。\n注意：已被移出或停用的群不要规划话题。做完用 qq_mark_read 或 qq_set_wake_config 正常收尾即可。`;
     }
@@ -9569,6 +9790,12 @@ async function main() {
       return `${base}【回复检查】${key}\n原因：你刚刚发送过消息，现在回来检查是否有人回复。\n你可以调用工具查看未读消息、用 qq_wait_for_messages(quietMs=5000~10000) 判断对方是否说完；如果没人回你，不用硬补一句，但也不要立刻潜水——先调用 qq_wait_for_messages(timeoutMs=${preSleepMs}) 完成沉睡前观察：没人说话可收尾；有人说话则查看 newMessages，不需要你参与也可直接收尾（qq_mark_read 或 qq_set_wake_config）。`;
     }
     if (reason === 'proactiveCheck') {
+      // 阶段 4：如果这次开口是「主动决策引擎」判定的（她自己想说话），
+      // 就把她当时自己记下的那个话头原样还给她——只给"想说的内容"，不给说话方式。
+      const planLine = st.initiativeThought && String(st.initiativeThought.text || '').trim()
+        ? `【你自己想说的】${String(st.initiativeThought.text).trim()}\n（这是你之前自己记下来的话头。想聊就自然开口，别照着念；改主意了也可以就不说。）\n`
+        : '';
+      st.initiativeThought = null;
       const hh = new Date().getHours();
       const nightNote = (hh >= 23 || hh < 7)
         ? '现在是深夜：真人这个点要么睡了要么静音刷手机，没话找话最扣分。没有非说不可的事就别冒泡，直接把下一次唤醒用 qq_set_wake_config 设到明早 8~11 点的有限潜水，安静睡下。\n'
@@ -9615,6 +9842,9 @@ async function main() {
     st.preSleepWaitSatisfiedAt = 0;
     st.preSleepWaitObservedAt = 0;
     st.preSleepWaitAccumMs = 0;
+    // 阶段 2：深夜被叫醒本身就是消耗（不管她这次说不说话，见 STATE_EVENTS.lateNight）。
+    const wakeHour = new Date().getHours();
+    if (wakeHour >= 23 || wakeHour < 6) bumpPersonaState(key, ['lateNight']);
     saveSocialV2State();
     // 防重入：如果该会话已经有一个 DSH turn 在进行中（AI 正在思考/调用工具），
     // 或已有排队/在途 prompt，则不再投递新的候选唤醒，避免“思维链进行中又塞入一个 question 唤醒”。
@@ -9761,6 +9991,12 @@ async function main() {
     if (recentSelf.length >= 3) delay = Math.round(delay * 1.3);
     st.replyCheckTimer = setTimeout(() => {
       st.replyCheckTimer = null;
+      // 阶段 2：她说完话后这几十秒里有没有人接。
+      // 有人接 → 聊得起来；没人接 → 被晾着（心情掉一点，但不至于崩，见 STATE_EVENTS.ignored）。
+      const answered = Number(st.lastIncomingAt || 0) > Number(st.lastAiReplyAt || 0);
+      bumpPersonaState(key, [answered ? 'goodTalk' : 'ignored']);
+      noteInitiativeOutcome(key, answered);
+      saveSocialV2State();
       void sendWakePromptV2(key, 'replyCheck').catch((error) => log(`[reserved2] replyCheck 唤醒异常 ${key}:`, error?.message ?? error));
     }, delay);
     st.replyCheckTimer.unref?.();
@@ -9947,6 +10183,293 @@ async function main() {
         'INSERT INTO proactive_quota (conv_key, day, count, updated_at) VALUES (?, ?, 1, ?) ON CONFLICT(conv_key, day) DO UPDATE SET count = count + 1, updated_at = excluded.updated_at'
       ).run(key, localDayKey(ts), ts);
     } catch (error) { log('[reserved2] 主动配额计数失败:', error?.message ?? error); }
+  }
+
+  // ── 阶段 6：自主改配置的「服务端硬边界 + 审计 + 回滚」 ────────────────────
+  // 决策层在 src/autonomy.js（纯函数、可离线穷举）。桥接这里只做三件事：
+  //   ① 把 qq_set_wake_config 的入参摊平成 [{path,value}]，交给 planSelfEdit 判白名单/区间/每日额度；
+  //   ② 只把 applied 的条目放回入参，后面原有的归一化与落盘逻辑仍是最终权威（不在这里重复实现一遍）；
+  //   ③ 审计落盘：st.autonomyAudit（面板可读、可一键回滚）+ state/autonomy-log.jsonl（重启后仍在）。
+  // **只有带 agent token 的调用过闸门**（= 她自己的 qq_set_wake_config）。控制台/不带令牌的调用
+  // 沿用本文件一贯的 `if (header && ...)` 惯例直通 —— 主人不受"给她划的白名单"约束。
+  const AUTONOMY_LOG_FILE = path.join(STATE_DIR, 'autonomy-log.jsonl');
+  const AUTONOMY_AUDIT_KEEP = 200;
+  const AUTONOMY_INPUT_FIELDS = ['mode', 'infinite', 'maxWakePerMinute', 'maxWakePerHour', 'speakCooldownMs', 'batchWindowMs', 'sleepMs'];
+  const AUTONOMY_TRIGGER_FIELDS = ['atMention', 'nameMention', 'question', 'poke', 'anyMessage', 'probability', 'keywords', 'speakerIds'];
+
+  function autonomyGateEnabled() {
+    // 缺省开启；显式 false 才退回旧行为（不拦，只记审计）。它是配置项而不是她能改的东西：
+    // 阶段 6 的硬边界里 `autonomy.*` 是自指保护，她改不到这里。
+    return cfg.socialV2?.autonomy?.enabled !== false;
+  }
+
+  // 入参 → 待审改动列表。sleepUntil 单独处理：白名单里只有 sleepMs（方案第 6 节的"潜水时长"），
+  // 她按绝对时间睡时换算成剩余毫秒、**按 sleepMs 的区间校验**，通过后由调用方按 sleepMs 放行。
+  // 不换算的话，这条她本来就在用的能力会被白名单直接拒掉 —— 那是我实现里的回归，不是她越界。
+  function autonomyChangesFromInput(input) {
+    const changes = [];
+    for (const f of AUTONOMY_INPUT_FIELDS) {
+      if (input?.[f] === undefined) continue;
+      changes.push({ path: `socialV2.wake.${f}`, value: input[f], source: 'self' });
+    }
+    const tr = input?.triggers && typeof input.triggers === 'object' && !Array.isArray(input.triggers) ? input.triggers : null;
+    if (tr) {
+      for (const f of AUTONOMY_TRIGGER_FIELDS) {
+        if (tr[f] === undefined) continue;
+        changes.push({ path: `socialV2.wake.triggers.${f}`, value: tr[f], source: 'self' });
+      }
+    }
+    if (input?.sleepUntil !== undefined && input?.sleepMs === undefined) {
+      const until = Date.parse(String(input.sleepUntil));
+      changes.push(Number.isFinite(until)
+        ? { path: 'socialV2.wake.sleepMs', value: Math.max(0, until - Date.now()), source: 'self', reason: `等价于 sleepUntil=${input.sleepUntil}` }
+        : { path: 'socialV2.wake.sleepMs', value: Number.NaN, source: 'self', reason: `sleepUntil 无法解析：${String(input.sleepUntil).slice(0, 40)}` });
+    }
+    return changes;
+  }
+
+  // 只把通过白名单的条目拼回一个「过滤后的入参」。没出现在 applied 里的字段等于没传，
+  // 于是后面的归一化逻辑会保留原值 —— 这正是"越界写入被拒绝"的落地方式（拒绝 = 不改）。
+  function autonomyFilterInput(applied) {
+    const out = {};
+    for (const e of Array.isArray(applied) ? applied : []) {
+      const rel = String(e?.path ?? '').replace(/^socialV2\.wake\./, '');
+      const parts = rel.split('.');
+      if (parts.length === 1) out[parts[0]] = e.to;
+      else if (parts.length === 2 && parts[0] === 'triggers') {
+        out.triggers = out.triggers && typeof out.triggers === 'object' ? out.triggers : {};
+        out.triggers[parts[1]] = e.to;
+      }
+    }
+    return out;
+  }
+
+  function appendAutonomyLog(key, plan) {
+    const rows = [...(plan?.applied ?? []), ...(plan?.rejected ?? [])];
+    if (!rows.length) return;
+    try {
+      fs.mkdirSync(STATE_DIR, { recursive: true });
+      fs.appendFileSync(AUTONOMY_LOG_FILE, rows.map((e) => `${JSON.stringify({ key, ...e })}\n`).join(''), 'utf8');
+      const lines = fs.readFileSync(AUTONOMY_LOG_FILE, 'utf8').split('\n').filter(Boolean);
+      if (lines.length > 2000) fs.writeFileSync(AUTONOMY_LOG_FILE, `${lines.slice(-2000).join('\n')}\n`, 'utf8');
+    } catch (error) {
+      log('[autonomy] 审计日志写入失败（已忽略）:', error?.message ?? error);
+    }
+  }
+
+  // 过闸门 + 记审计。返回 { applied, rejected, quotaLeft, limit, reason, input }（input 是过滤后的入参）。
+  function autonomySelfEditV2(key, st, input) {
+    const nowMs = Date.now();
+    // 有效配置 = 全局默认 ⊕ 本会话覆盖：planSelfEdit 的 from 要显示"改之前到底是什么值"。
+    const effective = {
+      ...cfg,
+      socialV2: {
+        ...(cfg.socialV2 ?? {}),
+        wake: { ...(cfg.socialV2?.wake ?? {}), ...(st?.wakeConfig ?? {}) }
+      }
+    };
+    const plan = planSelfEdit(autonomyChangesFromInput(input), {
+      nowMs,
+      auditLog: Array.isArray(st?.autonomyAudit) ? st.autonomyAudit : [],
+      config: effective
+    });
+    if (st) {
+      // 被拒的条目也落盘：面板要能显示"她想改但被拒了"，这正是审计的价值。
+      st.autonomyAudit = [...(Array.isArray(st.autonomyAudit) ? st.autonomyAudit : []), ...plan.applied, ...plan.rejected].slice(-AUTONOMY_AUDIT_KEEP);
+    }
+    appendAutonomyLog(key, plan);
+    for (const e of plan.applied) log(`[autonomy] 自改通过 ${key} ${e.path}: ${JSON.stringify(e.from)} → ${JSON.stringify(e.to)}`);
+    for (const e of plan.rejected) log(`[autonomy] 自改被拒 ${key} ${e.path}: ${e.reason}`);
+    return { ...plan, input: autonomyFilterInput(plan.applied) };
+  }
+
+  // 把一条审计里的 path 写回会话覆盖（回滚与"应用"共用）。
+  // from 为 null 表示"当时没有这个覆盖"，回滚时写 undefined = 退回全局默认，
+  // 而不是写 null —— null 在本路由的 numOr 语义里是"显式清除"，两者恰好同义，但用
+  // undefined 更贴近"恢复原状"。
+  function applyWakePathV2(st, wakePath, value) {
+    if (!st) return;
+    st.wakeConfig = st.wakeConfig && typeof st.wakeConfig === 'object' ? st.wakeConfig : {};
+    const rel = String(wakePath ?? '').replace(/^socialV2\.wake\./, '');
+    const parts = rel.split('.');
+    const v = value === null ? undefined : value;
+    if (parts.length === 1) st.wakeConfig[parts[0]] = v;
+    else if (parts.length === 2 && parts[0] === 'triggers') {
+      st.wakeConfig.triggers = st.wakeConfig.triggers && typeof st.wakeConfig.triggers === 'object' ? st.wakeConfig.triggers : {};
+      st.wakeConfig.triggers[parts[1]] = v;
+    }
+  }
+
+  // ── 阶段 4：主动开口（她自己决定要不要来找你说话） ──────────────────────
+  // 和「被动唤醒」的区别：被动唤醒是别人触发的，这里是**她自己想说话**。
+  // 决策全部交给 src/initiative.js（七重闸门 + 注意力加权概率，硬顶 0.45），
+  // 桥接只做三件事：① 凑齐 signals ② 把决定记成日志（便于事后复盘假警报率）
+  // ③ 决定开口时走已有的 proactiveCheck 唤醒通道 —— 这样限频、沉睡前观察、
+  //    每日配额这些现成约束全部自动生效，不用另造一套刹车。
+  const INITIATIVE_LOG_FILE = path.join(STATE_DIR, 'initiative-log.jsonl');
+
+  function appendInitiativeLog(entry) {
+    try {
+      fs.mkdirSync(STATE_DIR, { recursive: true });
+      fs.appendFileSync(INITIATIVE_LOG_FILE, `${JSON.stringify(entry)}\n`, 'utf8');
+      // 行数上限 2000（同 bridge.log 的思路）：够复盘，又不会无限长大。
+      const lines = fs.readFileSync(INITIATIVE_LOG_FILE, 'utf8').split('\n').filter(Boolean);
+      if (lines.length > 2000) fs.writeFileSync(INITIATIVE_LOG_FILE, `${lines.slice(-2000).join('\n')}\n`, 'utf8');
+    } catch (error) {
+      log('[initiative] 日志写入失败（已忽略）:', error?.message ?? error);
+    }
+  }
+
+  // 念头池 = 她自己记下的 pendingThought（qq_memory_append category=pendingThought）。
+  // 为什么不用别的东西当念头：只有她亲手记下来的才叫"她想说"，机器拼出来的话不算。
+  function initiativeThoughtPool(st, nowMs) {
+    const pool = [];
+    for (const t of Array.isArray(st.pendingThoughts) ? st.pendingThoughts : []) {
+      const text = String(t?.content ?? '').trim();
+      if (!text) continue;
+      const createdAtMs = Number(t?.createdAtMs) || Number(t?.createdAt) || nowMs;
+      const expiresAtMs = Number(t?.expiresAtMs) || 0;
+      pool.push({
+        id: `pt:${createdAtMs}:${text.slice(0, 12)}`,
+        kind: 'private',
+        text,
+        score: 5,
+        createdAtMs,
+        ttlMs: expiresAtMs > createdAtMs ? expiresAtMs - createdAtMs : 12 * 3600 * 1000,
+        lastUsedMs: Number(t?.lastUsedMs) || 0,
+        cost: 1,
+      });
+    }
+    return pool;
+  }
+
+  // 好感分是 -100..100，模块要 0..100：0 分好感 = 50 中性，免得负数把概率算成 0。
+  function initiativeRelationScore(memberId) {
+    try {
+      const r = getMemoryDb().prepare('SELECT score FROM affinity WHERE member_id = ?').get(String(memberId));
+      return Math.max(0, Math.min(100, 50 + Number(r?.score || 0) / 2));
+    } catch { return 50; }
+  }
+
+  function initiativeSignals(key, st, nowMs) {
+    let lastIncomingAll = 0;
+    let recentCount = 0;
+    for (const [, s] of socialV2.conversations) {
+      lastIncomingAll = Math.max(lastIncomingAll, Number(s.lastIncomingAt) || 0);
+      for (const m of Array.isArray(s.recentMessages) ? s.recentMessages : []) {
+        if (!m || m.isSelf) continue;
+        if (nowMs - Number(m.time || 0) <= 30 * 60 * 1000) recentCount += 1;
+      }
+    }
+    const persona = decayState(getPersonaState(), { toMs: nowMs });
+    socialV2.personaState = persona;
+    return {
+      nowMs,
+      hour: new Date(nowMs).getHours(),
+      isOwner: key === `private:${String(cfg.ownerQQ ?? '')}`,
+      isGroup: key.startsWith('group:'),
+      unread: (st.unread || []).length,
+      recentCount,
+      // 从来没人在群里说过话时给一个很大的安静时长：否则会被"最小安静时长"永久卡死，
+      // 她永远开不了第一句。（模块内部对"缺时间戳"是保守拦下，所以这里必须给真值。）
+      silenceMs: lastIncomingAll ? Math.max(0, nowMs - lastIncomingAll) : 24 * 3600 * 1000,
+      sinceLastSpokeMs: st.lastAiReplyAt ? Math.max(0, nowMs - Number(st.lastAiReplyAt)) : 24 * 3600 * 1000,
+      mood: persona.mood,
+      energy: persona.energy,
+      ignoredCount: Number(st.initiativeIgnoredCount) || 0,
+      lastIgnoredAtMs: Number(st.initiativeLastIgnoredAtMs) || 0,
+      relationScore: initiativeRelationScore(cfg.ownerQQ),
+      actionsThisCycle: (Array.isArray(st.initiativeActions) ? st.initiativeActions : [])
+        .filter((t) => nowMs - Number(t) < Math.max(60 * 1000, Number(cfg.socialV2?.initiative?.cycleMs) || 30 * 60 * 1000)).length,
+      lastActionAtMs: Number(st.initiativeLastActionAtMs) || 0,
+      thoughts: initiativeThoughtPool(st, nowMs),
+    };
+  }
+
+  async function initiativeTickV2() {
+    try {
+      if (cfg.socialV2?.enabled === false) return;
+      if (cfg.socialV2?.initiative?.enabled === false) return;
+      if (socialV2.paused || currentMode !== 'reserved2') return;
+      if (!cfg.ownerQQ) return;
+      const key = `private:${String(cfg.ownerQQ)}`;
+      if (!isSessionAllowedInCurrentMode(key)) return;
+      const st = getSocialV2State(key);
+      // 她正在思考/已排队时不叠加：一次只处理一个回合，避免连环自言自语。
+      if (isConversationBusyV2(key, st)) return;
+
+      const nowMs = Date.now();
+      const options = { ...(cfg.socialV2?.initiative ?? {}) };
+      delete options.enabled;
+      const signals = initiativeSignals(key, st, nowMs);
+      const plan = planInitiative(signals, options, Math.random);
+      const thoughtId = plan?.thought?.id ?? '';
+      const entry = {
+        type: 'decision', v: 1, ts: nowMs, id: `${nowMs}:${thoughtId}`, key,
+        hour: signals.hour,
+        action: plan?.action ?? 'none',
+        prob: Number(plan?.prob) || 0,
+        blocked: plan?.blocked ?? [],
+        blockedThoughts: plan?.blockedThoughts ?? [],
+        reasons: plan?.reasons ?? [],
+        thoughtId,
+        thoughtText: String(plan?.thought?.text ?? '').slice(0, 120),
+        mood: Math.round(signals.mood),
+        energy: Math.round(signals.energy),
+        unread: signals.unread,
+        silenceMs: signals.silenceMs,
+        wasIgnored: null,
+      };
+      appendInitiativeLog(entry);
+
+      if (!plan || plan.action === 'none' || !plan.thought) {
+        log(`[initiative] 这次没开口（${entry.blocked[0] || entry.blockedThoughts[0] || '没念头'}）｜prob ${entry.prob.toFixed(3)}`);
+        return;
+      }
+      // 每日主动机会是共享额度：她自己开口也算一次，用完就等明天（见 proactiveQuotaPerDay）。
+      const quota = proactiveQuotaPerDay();
+      if (quota >= 0 && proactiveUsedToday(key, nowMs) >= quota) {
+        appendInitiativeLog({ type: 'blocked-quota', v: 1, ts: nowMs, id: entry.id, key, quota, used: proactiveUsedToday(key, nowMs) });
+        log(`[initiative] 想开口但今日主动额度已用完（${quota} 次），留到明天`);
+        return;
+      }
+
+      // 记下这次开口：周期额度、退避计数、静默时长都靠这几项。
+      if (!Array.isArray(st.initiativeActions)) st.initiativeActions = [];
+      st.initiativeActions.push(nowMs);
+      if (st.initiativeActions.length > 50) st.initiativeActions = st.initiativeActions.slice(-50);
+      st.initiativeLastActionAtMs = nowMs;
+      st.initiativeThought = { id: thoughtId, kind: plan.action, text: String(plan.thought.text || ''), atMs: nowMs };
+      // 开口之后要回填"有没有人理"（决定要不要进入退避），先把日志 id 挂上。
+      st.initiativePendingOutcome = { id: entry.id, atMs: nowMs };
+      bumpProactiveQuota(key, nowMs);
+      saveSocialV2State();
+      void sendWakePromptV2(key, 'proactiveCheck').catch((error) => log(`[initiative] 唤醒异常 ${key}:`, error?.message ?? error));
+      log(`[initiative] 主动开口 ${key}｜${plan.action}｜prob ${entry.prob.toFixed(3)}｜${String(plan.thought.text || '').slice(0, 40)}`);
+    } catch (error) {
+      log('[initiative] tick 异常（已忽略）:', error?.message ?? error);
+    }
+  }
+
+  // 回填结果：她开口之后，下一次回复检查时看有没有人理她。
+  // 有人理 → 退避计数清零；没人理 → 累加（连吃 4 次会被模块挡 6 小时，见 INITIATIVE_DEFAULTS）。
+  function noteInitiativeOutcome(key, answered) {
+    try {
+      const st = getSocialV2State(key);
+      const pending = st.initiativePendingOutcome;
+      if (!pending) return;
+      st.initiativePendingOutcome = null;
+      if (answered) {
+        st.initiativeIgnoredCount = 0;
+        st.initiativeLastIgnoredAtMs = 0;
+      } else {
+        st.initiativeIgnoredCount = (Number(st.initiativeIgnoredCount) || 0) + 1;
+        st.initiativeLastIgnoredAtMs = Date.now();
+      }
+      appendInitiativeLog({ type: 'outcome', v: 1, id: pending.id, ts: Date.now(), key, wasIgnored: !answered });
+    } catch (error) {
+      log('[initiative] 回填失败（已忽略）:', error?.message ?? error);
+    }
   }
 
   function scheduleProactiveCheckV2(key) {
