@@ -188,7 +188,7 @@ group('T7 常量契约（以后调参只动这一张表）');
 group('S 段 源码级接线检查（只证明写法还在，不是行为验证）');
 
 {
-  ok('S1 bridge 导入了抽取器', /import \{ extractTriples, renderTriple \} from '\.\/triple-extract\.js'/.test(bridgeSrc));
+  ok('S1 bridge 导入了抽取器', /import \{ extractTriples, normalize, renderTriple \} from '\.\/triple-extract\.js'/.test(bridgeSrc));
   ok('S2 bridge 导入了三元组模块四个函数',
     /import \{ deserializeTriples, recallTriples, serializeTriples, upsertTriple \} from '\.\/memory-triples\.js'/.test(bridgeSrc));
   ok('S3 facts 写入路径挂上抽取（新增分支）',
@@ -205,6 +205,12 @@ group('S 段 源码级接线检查（只证明写法还在，不是行为验证�
   ok('S12 抽取失败不影响 facts 落库', /\[triples\] 抽取失败（已忽略，不影响 facts 落库）/.test(bridgeSrc));
   const cfg = JSON.parse(fs.readFileSync(path.join(ROOT, 'config.json'), 'utf8'));
   ok('S13 config.json 有 socialV2.triples 开关', cfg.socialV2?.triples?.enabled === true && Number(cfg.socialV2?.triples?.recallMax) === 3);
+  ok('S14 忘掉事实时三元组跟着忘（按 id 删就按内容比对）',
+    /if \(rowF\?\.content\) tf = forgetTriplesBy\(\(t\) => tripleMatchesFact\(t, rowF\.content\)\)/.test(bridgeSrc));
+  ok('S15 忘掉事实时三元组跟着忘（按 query 删就按渲染句/主客体比对）',
+    /tf2 = forgetTriplesBy\(\(t\) => renderTriple\(t\)\.includes\(queryF\)/.test(bridgeSrc));
+  ok('S16 删除结果回带 triplesForgotten（面板/调用方看得见删了几条）',
+    (bridgeSrc.match(/triplesForgotten: tf/g) || []).length === 2);
 }
 
 console.log(`\n═══ 汇总：通过 ${pass} / 失败 ${fail} / 跳过 ${skip} ═══`);

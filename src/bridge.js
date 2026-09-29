@@ -37,7 +37,7 @@ import {
 // 阶段 4：主动开口决策引擎（注意力加权概率 + 七重闸门 + 念头白名单）
 import { planInitiative } from './initiative.js';
 import { deserializeTriples, recallTriples, serializeTriples, upsertTriple } from './memory-triples.js';
-import { extractTriples, renderTriple } from './triple-extract.js';
+import { extractTriples, normalize, renderTriple } from './triple-extract.js';
 import { makeAuditEntry, mergeTuningInput, planSelfEdit, rollbackPlan, autonomyStats, splitTuningInput } from './autonomy.js';
 import {
   loadSlang,
@@ -5080,11 +5080,20 @@ async function main() {
             return;
           }
           const fid = Number(body.id);
-          if (Number.isFinite(fid) && fid > 0) { const dDel = db.prepare('DELETE FROM facts WHERE id = ?').run(fid); sendJson({ ok: true, deleted: dDel.changes }); return; }
+          if (Number.isFinite(fid) && fid > 0) {
+            const rowF = db.prepare('SELECT content FROM facts WHERE id = ?').get(fid);
+            const dDel = db.prepare('DELETE FROM facts WHERE id = ?').run(fid);
+            let tf = 0;
+            try { if (rowF?.content) tf = forgetTriplesBy((t) => tripleMatchesFact(t, rowF.content)); } catch {}
+            sendJson({ ok: true, deleted: dDel.changes, triplesForgotten: tf });
+            return;
+          }
           const queryF = String(body.query ?? '').trim();
           if (!queryF) { sendJson({ ok: false, error: '需要 id 或 query' }, 400); return; }
           const dDel2 = db.prepare('DELETE FROM facts WHERE content LIKE ?').run('%' + queryF + '%');
-          sendJson({ ok: true, deleted: dDel2.changes });
+          let tf2 = 0;
+          try { tf2 = forgetTriplesBy((t) => renderTriple(t).includes(queryF) || String(t.object ?? '').includes(queryF) || String(t.subject ?? '').includes(queryF)); } catch {}
+          sendJson({ ok: true, deleted: dDel2.changes, triplesForgotten: tf2 });
           return;
         }
 
@@ -9427,6 +9436,30 @@ async function main() {
     saveTriples(true);
     if (merged || dropped) log(`[triples] 周合并：${before} → ${kept.length} 条（合并 ${merged}，淘汰 ${dropped}）`);
     return { before, after: kept.length, merged, dropped };
+  }
+
+  // 事实被忘掉时，**从它派生出来的三元组必须一起忘**。
+  // 为什么非做不可：facts 删了、关系还在的话，她照样会在召回里说出这条"已经忘了"的事
+  // —— 主人删掉一条错记忆，看到的却是她下一轮又提一遍，这比不删更糟。
+  // 判据用「渲染后的人读句子」比对：facts 的 content 与三元组本来就是同一句话的两种形态。
+  function tripleMatchesFact(triple, factContent) {
+    const rendered = renderTriple(triple).replace('（已作废）', '');
+    const normalized = normalize(factContent);
+    return rendered === normalized || normalized.includes(rendered) || rendered.includes(normalized);
+  }
+
+  function forgetTriplesBy(match) {
+    if (!triplesEnabled()) return 0;
+    const list = loadTriples();
+    if (!list.length) return 0;
+    const kept = list.filter((t) => !match(t));
+    const dropped = list.length - kept.length;
+    if (!dropped) return 0;
+    triplesCache = kept;
+    triplesDirty = true;
+    saveTriples(true);
+    log(`[triples] 随事实一起忘掉 ${dropped} 条`);
+    return dropped;
   }
 
   async function ensureMemorySession() {
