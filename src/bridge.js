@@ -3574,6 +3574,8 @@ async function main() {
             st.lastAiReplyAt = now;
             st.lastActionAt = now;
             st.wakeConfig.noActionCount = 0;
+            // 说话本身就是消耗：统一发送路由（她最常用）以前不碰心情/精力，补上。
+            bumpPersonaState(key, messages.length > 1 && sentMessages.length > 1 ? ['chat', 'burst'] : ['chat']);
             saveSocialV2State();
             log(`[reserved2] 工具分条发送 ${key}: 成功 ${sentMessages.length}/${messages.length} 条`);
             appendActivity(`${key} [reserved2] 工具分条发送：成功 ${sentMessages.length}/${messages.length} 条`);
@@ -3595,6 +3597,9 @@ async function main() {
               if (idx >= 0) st.sendTimes.splice(idx, 1);
             }
             if (st.sendTimes.length > 500) st.sendTimes = st.sendTimes.slice(-500);
+            // 发送失败同样要影响心情/精力：这两条统一路由是她最常用的发送路径，
+            // 漏掉这里的话「发失败了也不难受」，而只挂在 /api/send/* 的旧写法正是老 bug。
+            bumpPersonaState(key, ['error']);
             saveSocialV2State();
             sendJson({ ok: false, error: error?.message ?? String(error) }, 500);
           }
@@ -3731,6 +3736,8 @@ async function main() {
             st.lastAiReplyAt = now;
             st.lastActionAt = now;
             st.wakeConfig.noActionCount = 0;
+            // 同 /api/socialV2/send-burst：说话要真的影响她的心情/精力。
+            bumpPersonaState(key, messages.length > 1 && sentMessages.length > 1 ? ['chat', 'burst'] : ['chat']);
             saveSocialV2State();
             log(`[reserved2] 工具统一发送 ${key}: 成功 ${sentMessages.length}/${messages.length} 条`);
             appendActivity(`${key} [reserved2] 工具统一发送：成功 ${sentMessages.length}/${messages.length} 条`);
@@ -3752,6 +3759,9 @@ async function main() {
               if (idx >= 0) st.sendTimes.splice(idx, 1);
             }
             if (st.sendTimes.length > 500) st.sendTimes = st.sendTimes.slice(-500);
+            // 发送失败同样要影响心情/精力：这两条统一路由是她最常用的发送路径，
+            // 漏掉这里的话「发失败了也不难受」，而只挂在 /api/send/* 的旧写法正是老 bug。
+            bumpPersonaState(key, ['error']);
             saveSocialV2State();
             sendJson({ ok: false, error: error?.message ?? String(error) }, 500);
           }

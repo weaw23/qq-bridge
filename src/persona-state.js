@@ -175,7 +175,12 @@ export function renderStateLine(state, options = {}) {
 /** 落盘用。带版本号，以后改结构可以迁移。 */
 export function serializeState(state, nowMs = 0) {
   const s = clampState(state);
-  return { v: STATE_VERSION, mood: s.mood, energy: s.energy, updatedAtMs: num(nowMs, s.updatedAtMs) };
+  // nowMs 是"外部指定时间戳"；默认 0 表示"沿用状态自己的 updatedAtMs"。
+  // 早先直接写 num(nowMs, s.updatedAtMs)：num(0, x) 会返回 0（0 是有效数字），
+  // 于是每次落盘都把 updatedAtMs 写成 0 —— 重启读回后 decayState 的 dt = now - 0 ≈ 1.79e12ms，
+  // 半衰期幂趋近 0，一步就把心情/精力打回基准线 60/70，等于每次重启清空她的情绪。
+  const stamp = num(nowMs, 0) > 0 ? num(nowMs, 0) : num(s.updatedAtMs, 0);
+  return { v: STATE_VERSION, mood: s.mood, energy: s.energy, updatedAtMs: stamp };
 }
 
 /** 从 social-v2.json 读回来。任何脏数据都回落到基准线，绝不抛错。 */
@@ -183,7 +188,9 @@ export function deserializeState(raw, nowMs = 0) {
   if (!raw || typeof raw !== 'object' || raw.v !== STATE_VERSION) {
     return newState(num(raw && raw.updatedAtMs, nowMs));
   }
-  return clampState({ ...raw, updatedAtMs: num(raw.updatedAtMs, nowMs) });
+  // 同上：0 / 负数当成"没有时间戳"，补成 nowMs，别让历史脏数据把衰减算成"过了 57 年"。
+  const persisted = num(raw.updatedAtMs, 0);
+  return clampState({ ...raw, updatedAtMs: persisted > 0 ? persisted : num(nowMs, 0) });
 }
 
 /** 一批状态样本的极差/方差 —— 验收用（"日内方差应出现明显低频日"）。 */

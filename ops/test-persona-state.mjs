@@ -133,6 +133,16 @@ section('T6 序列化（要能落盘进 state/social-v2.json 并在重启后还�
   check('T6.4 垃圾输入（null/字符串/数字）不炸', [null, 'x', 7, [], undefined].every((x) => Number.isFinite(deserializeState(x, T0).mood)));
   check('T6.5 只丢了 updatedAtMs 也能读（其余字段保留）', deserializeState({ v: 1, mood: 20, energy: 30 }, T0).mood === 20);
   check('T6.6 落盘值不带 NaN / 不带多余字段', Object.keys(ser).sort().join(',') === 'energy,mood,updatedAtMs,v');
+  // T6.7~T6.9：回归 2026-09-29 线上自检发现的真 bug —— bridge 调 serializeState(s) 不带 nowMs，
+  // 默认 0 被 num(0, x) 当成有效值，每次落盘都把 updatedAtMs 写成 0；重启读回后
+  // decayState 的 dt ≈ 1.79e12ms，一步把心情/精力打回 60/70。
+  const stamped = serializeState({ mood: 33, energy: 71, updatedAtMs: T0 });
+  check('T6.7 不传 nowMs 时保留状态自己的 updatedAtMs（不再写成 0）', stamped.updatedAtMs === T0, JSON.stringify(stamped));
+  const bad = deserializeState({ v: 1, mood: 20, energy: 30, updatedAtMs: 0 }, T0);
+  check('T6.8 读回 updatedAtMs=0 的历史脏数据 → 补成 nowMs 而不是留 0', bad.updatedAtMs === T0, JSON.stringify(bad));
+  const roundTrip = deserializeState(serializeState(applyEvents(newState(T0), [{ type: 'error' }], { nowMs: T0 + 60000 })), T0 + 60000);
+  check('T6.9 落盘→重启读回：衰减不跳变（心情还是 54，不是被打回 60）',
+    Math.abs(roundTrip.mood - 54) < 0.5, JSON.stringify(roundTrip));
 }
 
 section('T7 随机游走压力测试（500 步，固定种子）');
