@@ -32,7 +32,6 @@ import {
   newState,
   renderStateLine,
   serializeState,
-  stateTendency,
 } from './persona-state.js';
 // 阶段 4：主动开口决策引擎（注意力加权概率 + 七重闸门 + 念头白名单）
 import { planInitiative } from './initiative.js';
@@ -1867,7 +1866,8 @@ async function main() {
     if (dshCheckStarted) return;
     dshCheckStarted = true;
     checkDsh();
-    setInterval(checkDsh, 5000);
+    // 唯一漏了 unref 的定时器（其余 12 处都有）：它只做健康检查，不该拖住进程退出。
+    setInterval(checkDsh, 5000).unref?.();
   }
 
   // ── 本地控制台（独立 Web 面板，不依赖 DSH WebUI） ───────────────────────────
@@ -3486,7 +3486,7 @@ async function main() {
               } catch {}
             }
           }
-          const messages = Array.isArray(rawMessages)
+          let messages = Array.isArray(rawMessages)
             ? rawMessages.map((m) => String(m ?? '').trim()).filter(Boolean)
             : (typeof rawMessages === 'string' ? [String(rawMessages).trim()].filter(Boolean) : []);
           const replyToMessageId = body.replyToMessageId;
@@ -3546,6 +3546,14 @@ async function main() {
             }
             messages[i] = burstGuard.text;
           }
+          // 出站三层：qq_send_burst 也是她常用的发送工具（显式分条），同样必须过兜底改写；
+          // 多条是她自己给的节奏，所以只有"单条"时才会被 splitter 再拆。
+          const layeredBurst = applyOutboundLayersToParts(key, messages, url.pathname);
+          messages = layeredBurst.messages;
+          if (messages.length > maxMsgs) {
+            sendJson({ ok: false, error: `最多发送 ${maxMsgs} 条` }, 400);
+            return;
+          }
           try {
             const st = getSocialV2State(key);
             const now = Date.now();
@@ -3560,7 +3568,7 @@ async function main() {
             // 先预占发送额度，避免并发绕过限频
             for (let i = 0; i < messages.length; i++) st.sendTimes.push(now);
             if (st.sendTimes.length > 500) st.sendTimes = st.sendTimes.slice(-500);
-            const delays = computeGapsV2(messages, 'auto', undefined, undefined, sendCfg);
+            const delays = layeredBurst.gaps ?? computeGapsV2(messages, 'auto', undefined, undefined, sendCfg);
             const sentMessages = await sendMessagesV2(key, messages, delays);
             recordSentMessagesV2(key, sentMessages);
             st.lastAiReplyAt = now;
@@ -3614,7 +3622,7 @@ async function main() {
             }
           }
           const isRawString = typeof rawMessages === 'string';
-          const messages = Array.isArray(rawMessages)
+          let messages = Array.isArray(rawMessages)
             ? rawMessages.map((m) => String(m ?? '').trim()).filter(Boolean)
             : (isRawString ? [String(rawMessages).trim()].filter(Boolean) : []);
           const replyToMessageId = body.replyToMessageId;
@@ -3677,7 +3685,15 @@ async function main() {
             }
             messages[i] = burstGuard.text;
           }
-          const delays = computeGapsV2(messages, gapMode, gapMs, gaps, sendCfg);
+          // 出站三层（阶段 1 兜底改写 / 阶段 3 分条）：MCP 的 qq_send_message 走的就是这条路，
+          // 三层原先只挂在 /api/send/* 上，等于她最常用的发送工具完全绕过破甲兜底与分条。
+          const layeredMsg = applyOutboundLayersToParts(key, messages, url.pathname);
+          messages = layeredMsg.messages;
+          if (messages.length > maxMsgs) {
+            sendJson({ ok: false, error: `最多发送 ${maxMsgs} 条` }, 400);
+            return;
+          }
+          const delays = layeredMsg.gaps ?? computeGapsV2(messages, gapMode, gapMs, gaps, sendCfg);
           // 先做发送频率检查并预占额度，再解析引用目标，避免未限流的引用查询打爆 OneBot。
           const st = getSocialV2State(key);
           const now = Date.now();
@@ -5083,6 +5099,9 @@ async function main() {
           if (Number.isFinite(fid) && fid > 0) {
             const rowF = db.prepare('SELECT content FROM facts WHERE id = ?').get(fid);
             const dDel = db.prepare('DELETE FROM facts WHERE id = ?').run(fid);
+            // FTS 是独立虚拟表（rowid 手动对齐 facts.id），删 facts 不会连带删索引行。
+            // 残留的孤儿索引行会让"facts 与 facts_fts 条数一致"的断言长期漂红，且无限增长。
+            try { db.prepare('DELETE FROM facts_fts WHERE rowid = ?').run(fid); } catch {}
             let tf = 0;
             try { if (rowF?.content) tf = forgetTriplesBy((t) => tripleMatchesFact(t, rowF.content)); } catch {}
             sendJson({ ok: true, deleted: dDel.changes, triplesForgotten: tf });
@@ -5090,10 +5109,18 @@ async function main() {
           }
           const queryF = String(body.query ?? '').trim();
           if (!queryF) { sendJson({ ok: false, error: '需要 id 或 query' }, 400); return; }
+          // LIKE 可能删多行：先取出 id 列表，再按 id 清对应的 FTS 索引行。
+          let ftsOrphans = 0;
+          let doomedIds = [];
+          try { doomedIds = db.prepare('SELECT id FROM facts WHERE content LIKE ?').all('%' + queryF + '%').map((r) => r.id); } catch {}
           const dDel2 = db.prepare('DELETE FROM facts WHERE content LIKE ?').run('%' + queryF + '%');
+          try {
+            const ftsDel = db.prepare('DELETE FROM facts_fts WHERE rowid = ?');
+            for (const rid of doomedIds) { try { ftsOrphans += ftsDel.run(rid)?.changes || 0; } catch {} }
+          } catch {}
           let tf2 = 0;
           try { tf2 = forgetTriplesBy((t) => renderTriple(t).includes(queryF) || String(t.object ?? '').includes(queryF) || String(t.subject ?? '').includes(queryF)); } catch {}
-          sendJson({ ok: true, deleted: dDel2.changes, triplesForgotten: tf2 });
+          sendJson({ ok: true, deleted: dDel2.changes, ftsOrphans, triplesForgotten: tf2 });
           return;
         }
 
@@ -5595,7 +5622,13 @@ async function main() {
             sendJson({ ok: true });
             return;
           }
-          if (kind === 'facts') { db.prepare('DELETE FROM facts WHERE id = ?').run(Number(body.id)); sendJson({ ok: true }); return; }
+          if (kind === 'facts') {
+          const fidPanel = Number(body.id);
+          db.prepare('DELETE FROM facts WHERE id = ?').run(fidPanel);
+          try { db.prepare('DELETE FROM facts_fts WHERE rowid = ?').run(fidPanel); } catch {}
+          sendJson({ ok: true });
+          return;
+        }
           if (kind === 'reminders') {
             db.prepare("UPDATE reminders SET status = 'cancelled' WHERE id = ?").run(Number(body.id));
             sendJson({ ok: true });
@@ -5636,6 +5669,9 @@ async function main() {
             const oldSessionId = state.sessions[k];
             delete state.sessions[k];
             delete state.sessionPolicies[k];
+            // 会话年龄一起归零：新会话是刚建的，如果留着旧年龄，下一次唤醒到达
+            // sessionRotation.maxAgeDays（默认 10 天）就会立刻把它轮换掉 —— 等于白重建一次。
+            if (state.sessionAges) delete state.sessionAges[k];
             reverse.delete(oldSessionId);
             collectors.delete(oldSessionId);
             sendToolSucceededSessions.delete(oldSessionId);
@@ -6450,6 +6486,28 @@ async function main() {
         }
       } catch (error) {
         log('[layers] 分条失败（已忽略，按单条发）:', error?.message ?? error);
+      }
+    }
+    return out;
+  }
+
+  // 出站三层落到"多条消息"通道（/api/socialV2/send-message、/api/socialV2/send-burst）。
+  // 为什么需要它：qq_send_message（工具描述里写着"统一发送…优先用它"）与 qq_send_burst 走的是这两条路由，
+  // 而三层原先只挂在 /api/send/group|private|reply 上 —— 她用最常用的那两个工具时兜底改写与分条全部失效。
+  // 语义差异：这条路她本来就可能给了 2~8 条，那是她自己的节奏，只有**单条**时才让 splitter 再拆。
+  function applyOutboundLayersToParts(key, messages, where = '') {
+    const list = Array.isArray(messages) ? messages.slice() : [];
+    const out = { messages: list, gaps: null };
+    if (!list.length) return out;
+    const multi = list.length > 1;
+    for (let i = 0; i < list.length; i += 1) {
+      const one = applyOutboundLayers(key, list[i], where);
+      if (one.parts.length > 1 && !multi) {
+        out.messages = one.parts;
+        out.gaps = one.gaps;
+      } else {
+        // 多条模式只采用改写后的整条文本；单条未拆分时同理。
+        out.messages[i] = one.text;
       }
     }
     return out;
@@ -7465,7 +7523,10 @@ async function main() {
     try {
       const list = (Array.isArray(events) ? events : [events]).filter((n) => STATE_EVENTS[n]);
       if (!list.length) return;
-      socialV2.personaState = applyEvents(getPersonaState(), list, { nowMs: Date.now() });
+      // applyEvents 只认对象事件（`ev.type` 取事件定义）——早先这里直接把事件名字符串数组喂进去，
+      // 于是每一条都走进 `if (!def) continue`，心情/精力从上线起就没变过（且不抛错、无日志）。
+      // 这里补上 {type} 包装：调用点继续传 ['chat','burst'] 这种好读的写法。
+      socialV2.personaState = applyEvents(getPersonaState(), list.map((type) => ({ type })), { nowMs: Date.now() });
     } catch (error) {
       log('[persona-state] 更新失败（已忽略）:', error?.message ?? error);
     }
@@ -9279,7 +9340,9 @@ async function main() {
     const r = db.prepare('INSERT INTO facts (content, category, source_key, importance, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)')
       .run(content, category, sourceKey, importance, now, now);
     const id = Number(r.lastInsertRowid);
-    try { db.prepare('INSERT INTO facts_fts (rowid, content, bigrams) VALUES (?, ?, ?)').run(id, content, toBigrams(content)); } catch {}
+    // 这里原本是 `catch {}`：FTS 写失败 → 这条事实永久搜不到，而且线上一点痕迹都没有。
+    try { db.prepare('INSERT INTO facts_fts (rowid, content, bigrams) VALUES (?, ?, ?)').run(id, content, toBigrams(content)); }
+    catch (error) { log('[memory] FTS 索引写入失败（该条事实暂时搜不到）:', error?.message ?? error); }
     ingestTriplesFromFact({ content, sourceKey, importance });
     return { id, deduped: false };
   }

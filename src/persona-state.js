@@ -165,7 +165,9 @@ export function renderStateLine(state, options = {}) {
   const t = stateTendency(state, options);
   const moodWord = t.toneHint === 'sulky' ? '有点蔫、不太想理人' : t.toneHint === 'low' ? '情绪一般' : t.toneHint === 'bright' ? '心情很好' : '还算平静';
   const energyWord = t.sleepyHard ? '很困、脑子转不动' : t.sleepy ? '有点累' : t.energy >= 65 ? '精神不错' : '还行';
-  const line = `【此刻状态】心情 ${t.mood}/100（${moodWord}），精力 ${t.energy}/100（${energyWord}）。`
+  // 标签必须与 src/bridge.js 的 statusLine（未读/最近一条来自/上次发言）区分开：
+  // 那边已经占了【此刻状态】，这里再用同名标签会让提示词里出现两个同名段、语义混淆。
+  const line = `【心情与精力】心情 ${t.mood}/100（${moodWord}），精力 ${t.energy}/100（${energyWord}）。`
     + `建议：${t.advice}；${t.initiativeAdvice}。`;
   return line.length > 90 ? `${line.slice(0, 88)}…` : line;
 }

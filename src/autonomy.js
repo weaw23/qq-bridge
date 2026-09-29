@@ -427,7 +427,9 @@ function wakeConditionAfterEdit(path, normalized, config) {
 
 function wouldBeInfinite(path, normalized, config) {
   if (path === 'socialV2.wake.infinite') return normalized === true;
-  if (path === 'socialV2.wake.mode') return normalized === 'active' ? true : true;
+  // mode 改动的语义：active 一定是 infinite（见路由 3235-3239），diving 时 infinite 由状态里的现值决定。
+  // 这里两种取值都返回 true —— 保守口径：宁可把她当成"可能一直睡着"，也不放任自改悄悄滑进无限潜水。
+  if (path === 'socialV2.wake.mode') return true;
   // mode='diving' 时 infinite 由状态里的现值决定；active 一定是 infinite（见路由 3235-3239）。
   const mode = readPath(config, 'socialV2.wake.mode');
   if (mode === 'active') return true;
