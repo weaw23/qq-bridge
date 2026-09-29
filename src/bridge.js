@@ -36,6 +36,8 @@ import {
 } from './persona-state.js';
 // 阶段 4：主动开口决策引擎（注意力加权概率 + 七重闸门 + 念头白名单）
 import { planInitiative } from './initiative.js';
+import { deserializeTriples, recallTriples, serializeTriples, upsertTriple } from './memory-triples.js';
+import { extractTriples, renderTriple } from './triple-extract.js';
 import { makeAuditEntry, mergeTuningInput, planSelfEdit, rollbackPlan, autonomyStats, splitTuningInput } from './autonomy.js';
 import {
   loadSlang,
@@ -1453,7 +1455,11 @@ async function main() {
             .map((row) => ({ row, score: 0.5, sig: sigOf(row.content) }));
         } catch {}
       }
-      return out.map((x) => '- ' + String(x.row.content).slice(0, 90) + (Number(x.row.importance) >= 4 ? '（重要）' : '') + (String(x.row.source_key) === String(key) ? '' : '（别的场合记下的）'));
+      const factLines = out.map((x) => '- ' + String(x.row.content).slice(0, 90) + (Number(x.row.importance) >= 4 ? '（重要）' : '') + (String(x.row.source_key) === String(key) ? '' : '（别的场合记下的）'));
+      // 阶段 5：三元组行排在最前 —— "谁喜欢什么 / 谁住哪"这类关系问题，它比原始事实句更直接。
+      let tripleLines = [];
+      try { tripleLines = tripleRecallLines(key, others, Number(cfg.socialV2?.triples?.recallMax) || 3); } catch {}
+      return [...tripleLines, ...factLines];
     } catch {
       return [];
     }
@@ -9258,13 +9264,169 @@ async function main() {
     const dup = db.prepare('SELECT id FROM facts WHERE content = ?').get(content);
     if (dup) {
       db.prepare('UPDATE facts SET importance = MAX(importance, ?), updated_at = ? WHERE id = ?').run(importance, now, dup.id);
+      ingestTriplesFromFact({ content, sourceKey, importance }); // 重复事实也再抽一次：同一句话在不同会话里出现是"又被确认了一次"
       return { id: dup.id, deduped: true };
     }
     const r = db.prepare('INSERT INTO facts (content, category, source_key, importance, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)')
       .run(content, category, sourceKey, importance, now, now);
     const id = Number(r.lastInsertRowid);
     try { db.prepare('INSERT INTO facts_fts (rowid, content, bigrams) VALUES (?, ?, ?)').run(id, content, toBigrams(content)); } catch {}
+    ingestTriplesFromFact({ content, sourceKey, importance });
     return { id, deduped: false };
+  }
+
+  // ── 阶段 5：记忆三元组（facts 三元组化 + 说话人绑定 + 时效失效 + 加权检索 + 周合并） ──
+  // 模块 memory-triples.js 是纯函数：不看钟、不读盘、不随机 —— 时间与 IO 全部由这里注入。
+  // 为什么挂 facts 而不是挂原始聊天：facts 是她自己整理下来的结论（谁是什么样的人），
+  // 从原始聊天硬抽三元组要多花一次 LLM 调用，且最容易记错人（群里多个说话人串味）。
+  const TRIPLES_FILE = path.join(STATE_DIR, 'memory-triples.json');
+  const TRIPLES_MAX = 2000;           // 上限截断，防无限增长
+  const TRIPLES_STALE_KEEP_DAYS = 90; // 已作废条目留档天数：留档是为了"她记得自己改过口"，过了就是噪声
+  let triplesCache = null;
+  let triplesDirty = false;
+
+  function triplesEnabled() { return cfg.socialV2?.triples?.enabled !== false; }
+
+  function loadTriples() {
+    if (triplesCache) return triplesCache;
+    if (!triplesEnabled()) { triplesCache = []; return triplesCache; }
+    try {
+      triplesCache = deserializeTriples(fs.readFileSync(TRIPLES_FILE, 'utf8')); // 收字符串或 {v,triples} 封套都行
+    } catch {
+      triplesCache = []; // 文件不存在/坏掉都从空库开始：绝不因为一个记忆文件让桥接起不来
+    }
+    return triplesCache;
+  }
+
+  function saveTriples(force) {
+    if (!triplesEnabled() || !triplesCache) return false;
+    if (!force && !triplesDirty) return false;
+    try {
+      fs.writeFileSync(TRIPLES_FILE, serializeTriples(triplesCache)); // serializeTriples 返回的是 JSON 字符串，别再自己 stringify
+      triplesDirty = false;
+      return true;
+    } catch (error) {
+      log('[triples] 落盘失败: ' + (error?.message ?? error));
+      return false;
+    }
+  }
+  // 召回每轮都会推进 accessCount（打分里 access 权重 0.1 就靠它），但每轮都写盘太重：
+  // 只标脏，交给 5 分钟心跳落盘，进程退出前再补一次。
+  const triplesFlushTimer = setInterval(() => saveTriples(false), 300000);
+  triplesFlushTimer.unref?.();
+  process.once('exit', () => { try { saveTriples(true); } catch {} });
+
+  // 抽取器本身在 src/triple-extract.js（纯函数、可离线回归）：这部分以前埋在 bridge 里，
+  // 判错一句就是"她记错人"，必须能脱离线上跑测试。
+
+  // 抽取只从「她已经写下来的事实」里长出来。挂 insertFactRow 的理由：那是 facts 唯一写入路径，
+  // 挂这里就自动覆盖了记忆整理、手动记、复盘等所有入口，不会有"某个入口忘了抽"的漏网。
+  function ingestTriplesFromFact({ content, sourceKey, importance }) {
+    if (!triplesEnabled()) return null;
+    const facts = extractTriples(content);
+    if (!facts.length) return null;
+    try {
+      const nowMs = Date.now();
+      const actions = [];
+      for (const t of facts) {
+        const r = upsertTriple(loadTriples(), {
+          ...t,
+          speakerId: String(sourceKey ?? ''),  // 说话人绑定用会话 key 近似：私聊=那个人，群=那个群
+          importance: Number(importance) || 3,
+          source: String(sourceKey ?? ''),
+          nowMs,
+        }, { nowMs });
+        if (Array.isArray(r?.list)) triplesCache = r.list; // 模块返回新数组，不原地改
+        actions.push(r?.action ?? 'added');
+      }
+      triplesDirty = true;
+      saveTriples(false);
+      log(`[triples] 抽到 ${actions.length} 条（${actions.join('/')}）：${facts.map(renderTriple).join('；')}`);
+      return actions;
+    } catch (error) {
+      log('[triples] 抽取失败（已忽略，不影响 facts 落库）: ' + (error?.message ?? error));
+      return null;
+    }
+  }
+
+  // 召回：三元组行排在 facts 行**前面** —— "谁喜欢什么"这种关系问题，它比原始事实句更直接。
+  function tripleRecallLines(key, others, limit) {
+    if (!triplesEnabled()) return [];
+    const list = loadTriples();
+    if (!list.length) return [];
+    const max = Math.max(0, Math.min(6, Number(limit) || 0));
+    if (!max) return [];
+    const msgs = Array.isArray(others) ? others : [];
+    const query = msgs.slice(-4).map((m) => String(m?.plain ?? m?.text ?? '')).join(' ').slice(0, 120);
+    if (query.replace(/\s+/g, '').length < 2) return [];
+    const nowMs = Date.now();
+    let hits = [];
+    try { hits = recallTriples(list, { query, nowMs, speakerId: String(key), limit: max * 2 }); } catch { hits = []; }
+    if (!hits.length) return [];
+    const isGroupKey = String(key).startsWith('group:');
+    const ownerQQ = String(cfg.ownerQQ ?? '');
+    const ownerPresent = isGroupKey && !!ownerQQ && msgs.some((m) => String(m?.userId ?? '') === ownerQQ);
+    const picked = [];
+    for (const h of hits) {
+      const t = h?.triple;
+      if (!t) continue;
+      // 与 facts 召回同一条分寸：私聊里记下的事默认不带进群，主人本人在场才带。
+      if (isGroupKey && !ownerPresent && String(t.source ?? '').startsWith('private:')) continue;
+      picked.push(t);
+      if (picked.length >= max) break;
+    }
+    if (!picked.length) return [];
+    for (const t of picked) {   // access 权重（0.1）靠这两个字段，不记就等于这项恒为 0
+      t.accessCount = (Number(t.accessCount) || 0) + 1;
+      t.lastAccessMs = nowMs;
+    }
+    triplesDirty = true;
+    return picked.map((t) => '- ' + renderTriple(t));
+  }
+
+  // 周合并（挂在凌晨的记忆维护班车上，不另开定时器）：
+  // ① 逐字重复合并（同槽位同客体只留一条，累加 accessCount、取最大重要度、保留最早生效时间）
+  // ② 已作废超 90 天的淘汰（留档期内的作废条还留着，只是打分乘 0.3 掉下去）
+  // ③ 超过 TRIPLES_MAX 按（重要度 → 访问次数 → 生效时间）截断
+  function mergeTriplesWeekly() {
+    if (!triplesEnabled()) return null;
+    const list = loadTriples();
+    if (!list.length) return { before: 0, after: 0, merged: 0, dropped: 0 };
+    const nowMs = Date.now();
+    const before = list.length;
+    const map = new Map();
+    let merged = 0;
+    for (const t of list) {
+      const k = `${t.subject}\u0001${t.predicate}\u0001${t.object}`;
+      const prev = map.get(k);
+      if (!prev) { map.set(k, { ...t }); continue; }
+      prev.accessCount = (Number(prev.accessCount) || 0) + (Number(t.accessCount) || 0);
+      prev.importance = Math.max(Number(prev.importance) || 0, Number(t.importance) || 0);
+      prev.validFromMs = Math.min(Number(prev.validFromMs) || nowMs, Number(t.validFromMs) || nowMs);
+      prev.lastAccessMs = Math.max(Number(prev.lastAccessMs) || 0, Number(t.lastAccessMs) || 0);
+      if (t.validToMs) prev.validToMs = t.validToMs;
+      merged++;
+    }
+    let dropped = 0;
+    const cutoff = nowMs - TRIPLES_STALE_KEEP_DAYS * 86400000;
+    let kept = [...map.values()].filter((t) => {
+      const stale = Number(t.validToMs) > 0 && Number(t.validToMs) < cutoff;
+      if (stale) dropped++;
+      return !stale;
+    });
+    if (kept.length > TRIPLES_MAX) {
+      kept.sort((a, b) =>
+        (Number(b.importance) || 0) - (Number(a.importance) || 0) ||
+        (Number(b.accessCount) || 0) - (Number(a.accessCount) || 0) ||
+        (Number(b.validFromMs) || 0) - (Number(a.validFromMs) || 0));
+      dropped += kept.length - TRIPLES_MAX;
+      kept = kept.slice(0, TRIPLES_MAX);
+    }
+    triplesCache = kept;
+    triplesDirty = true;
+    saveTriples(true);
+    if (merged || dropped) log(`[triples] 周合并：${before} → ${kept.length} 条（合并 ${merged}，淘汰 ${dropped}）`);
+    return { before, after: kept.length, merged, dropped };
   }
 
   async function ensureMemorySession() {
@@ -9562,7 +9724,11 @@ async function main() {
         for (const f of db.prepare('SELECT id, content FROM facts').all()) ins.run(f.id, f.content, toBigrams(f.content));
       } catch {}
     }
-    return { merged, decayed, archived };
+    // 6) 阶段 5：记忆三元组周合并（同槽位去重 + 作废淘汰 + 上限截断），跟 facts 维护同一班车，
+    //    不另开定时器 —— 三元组的合并争议（谁和谁是同一条）本来就该在低峰期一次算完。
+    let triples = null;
+    try { triples = mergeTriplesWeekly(); } catch (error) { log('[triples] 周合并失败: ' + (error?.message ?? error)); }
+    return { merged, decayed, archived, triples };
   }
   const maintainTimer = setInterval(() => {
     try {
@@ -9577,7 +9743,7 @@ async function main() {
       autoM.lastMaintainDate = sched.toISOString().slice(0, 10); // 兼容旧字段
       writeAutonomy(autoM);
       const r = runMemoryMaintenance();
-      log(`[memory] 夜间维护：合并重复 ${r.merged} 组，清理低价值 ${r.decayed} 条，归档跟进 ${r.archived} 条`);
+      log(`[memory] 夜间维护：合并重复 ${r.merged} 组，清理低价值 ${r.decayed} 条，归档跟进 ${r.archived} 条${r.triples ? `，三元组 ${r.triples.before} → ${r.triples.after} 条（合并 ${r.triples.merged}，淘汰 ${r.triples.dropped}）` : ''}`);
     } catch (error) { log('[memory] 夜间维护失败: ' + (error?.message ?? error)); }
   }, 10 * 60 * 1000);
   if (maintainTimer.unref) maintainTimer.unref();
@@ -10417,17 +10583,28 @@ async function main() {
     };
   }
 
+  // 心跳为什么没参与：只在**原因变化**时写一行，避免每 5 分钟刷屏。
+  // 没有这行的话，"主动性一直没动静"只能靠猜（是没到条件？还是被前置闸门挡了？）。
+  let initiativeSkipReason = '';
   async function initiativeTickV2() {
     try {
-      if (cfg.socialV2?.enabled === false) return;
-      if (cfg.socialV2?.initiative?.enabled === false) return;
-      if (socialV2.paused || currentMode !== 'reserved2') return;
-      if (!cfg.ownerQQ) return;
+      const skip = (why) => {
+        if (initiativeSkipReason !== why) {
+          initiativeSkipReason = why;
+          log(`[initiative] 心跳没参与：${why}`);
+        }
+      };
+      if (cfg.socialV2?.enabled === false) return skip('socialV2 总开关关闭');
+      if (cfg.socialV2?.initiative?.enabled === false) return skip('主动性开关关闭');
+      if (socialV2.paused) return skip('已暂停');
+      if (currentMode !== 'reserved2') return skip(`当前模式 ${currentMode} 不是 reserved2`);
+      if (!cfg.ownerQQ) return skip('没配置主人 QQ');
       const key = `private:${String(cfg.ownerQQ)}`;
-      if (!isSessionAllowedInCurrentMode(key)) return;
+      if (!isSessionAllowedInCurrentMode(key)) return skip(`${key} 不在当前模式白名单`);
       const st = getSocialV2State(key);
       // 她正在思考/已排队时不叠加：一次只处理一个回合，避免连环自言自语。
-      if (isConversationBusyV2(key, st)) return;
+      if (isConversationBusyV2(key, st)) return skip('她正忙（一个回合还没结束）');
+      initiativeSkipReason = '';
 
       const nowMs = Date.now();
       const options = { ...(cfg.socialV2?.initiative ?? {}) };
