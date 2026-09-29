@@ -36,7 +36,7 @@ import {
 } from './persona-state.js';
 // 阶段 4：主动开口决策引擎（注意力加权概率 + 七重闸门 + 念头白名单）
 import { planInitiative } from './initiative.js';
-import { makeAuditEntry, planSelfEdit, rollbackPlan, autonomyStats } from './autonomy.js';
+import { makeAuditEntry, mergeTuningInput, planSelfEdit, rollbackPlan, autonomyStats, splitTuningInput } from './autonomy.js';
 import {
   loadSlang,
   saveSlang,
@@ -3183,20 +3183,28 @@ async function main() {
           let input = body.config && typeof body.config === 'object' && !Array.isArray(body.config) ? body.config : {};
           // 阶段 6：她自己改（带 agent token）时先过白名单 / 区间 / 每日 3 次额度；
           // 管理员（控制台令牌或不带令牌）直通，不受这套约束 —— 理由见 autonomyGateEnabled 注释。
+          // **只把"节奏参数"送进闸门**（唤醒频率/冷却/概率这几个人能把她自己变成话痨的旋钮），
+          // 呼吸参数（mode/infinite/sleepMs/触发开关/keywords…）照旧直通：这个路由同时是她
+          // 每一轮的收尾口，要是连收尾都被额度卡成 403，她会收不了尾 —— 那是掐呼吸管，不是限权。
           let autonomy = null;
-          if (agentCall && Object.keys(input).length && autonomyGateEnabled()) {
-            autonomy = autonomySelfEditV2(key, st, input);
-            input = autonomy.input;
-            saveSocialV2State(); // 审计（含被拒条目）必须落盘：面板要能看见"她想改但被拒了"
-            if (!autonomy.applied.length) {
-              sendJson({
-                ok: false,
-                error: `这次自改一条都没通过（服务端白名单 / 区间 / 每日额度）：${autonomy.rejected.map((e) => `${e.path}：${e.reason}`).join('；')}`,
-                autonomy: { applied: [], rejected: autonomy.rejected.map((e) => ({ path: e.path, reason: e.reason })), quotaLeft: autonomy.quotaLeft, limit: autonomy.limit },
-                wakeConfig: st.wakeConfig,
-                wakeSafety: computeWakeSafetyV2(st.wakeConfig)
-              }, 403);
-              return;
+          if (agentCall && autonomyGateEnabled()) {
+            const split = splitTuningInput(input);
+            if (Object.keys(split.tuning).length) {
+              autonomy = autonomySelfEditV2(key, st, split.tuning);
+              input = mergeTuningInput(split.rest, autonomy.input);
+              saveSocialV2State(); // 审计（含被拒条目）必须落盘：面板要能看见"她想改但被拒了"
+              // 只有"这一整次调用都在动节奏参数、且一条都没过"才算拒绝；只要还有呼吸参数要写，
+              // 就照常放行（否则她的收尾调用会被额度连带打死）。
+              if (!autonomy.applied.length && Object.keys(split.rest).length === 0) {
+                sendJson({
+                  ok: false,
+                  error: `这次自改一条都没通过（服务端白名单 / 区间 / 每日额度）：${autonomy.rejected.map((e) => `${e.path}：${e.reason}`).join('；')}`,
+                  autonomy: { applied: [], rejected: autonomy.rejected.map((e) => ({ path: e.path, reason: e.reason })), quotaLeft: autonomy.quotaLeft, limit: autonomy.limit },
+                  wakeConfig: st.wakeConfig,
+                  wakeSafety: computeWakeSafetyV2(st.wakeConfig)
+                }, 403);
+                return;
+              }
             }
           }
           const current = st.wakeConfig;
@@ -6063,7 +6071,7 @@ async function main() {
             log(`[send] ${url.pathname} ${key}: 成功 ${sentMessages.length}/${parts.length} 条`);
             appendActivity(`${key} [send] 成功 ${sentMessages.length}/${parts.length} 条：${message.slice(0, 80)}`);
             if (sentMessages.length > 0) scheduleReplyCheckV2(key);
-            sendJson({ ok: true, key, sent: sentMessages.length, failed: Math.max(0, parts.length - sentMessages.length), quoted: quotedInfo, parts: parts.length });
+            sendJson({ ok: true, key, sent: sentMessages.length, failed: Math.max(0, parts.length - sentMessages.length), quoted: quotedInfo, parts: parts.length, segments: parts });
           } catch (error) {
             if (error?.sent?.length) {
               recordSentMessagesV2(key, error.sent);
@@ -7759,7 +7767,23 @@ async function main() {
                 clean[k] = v;
               }
               return clean;
-            })()
+            })(),
+            // 阶段 6 审计回读：面板 GET /api/socialV2/autonomy 与一键回滚都读这个数组，
+            // 只存在内存里的审计等于"重启即失忆"，所以加载时也必须有它。
+            autonomyAudit: Array.isArray(val.autonomyAudit)
+              ? val.autonomyAudit.filter((e) => e && typeof e === 'object').slice(-200).map((e) => ({ ...e, ok: e.ok === true }))
+              : [],
+            // 阶段 4 主动性状态回读（被冷落次数/上次动作/待定念头/待判结果）。
+            initiativeActions: Array.isArray(val.initiativeActions) ? val.initiativeActions.map(Number).filter(Number.isFinite).slice(-50) : [],
+            initiativeLastActionAtMs: Number(val.initiativeLastActionAtMs) || 0,
+            initiativeThought: (val.initiativeThought && typeof val.initiativeThought === 'object' && String(val.initiativeThought.text || '').trim())
+              ? val.initiativeThought
+              : null,
+            initiativePendingOutcome: (val.initiativePendingOutcome && typeof val.initiativePendingOutcome === 'object')
+              ? val.initiativePendingOutcome
+              : null,
+            initiativeIgnoredCount: Number(val.initiativeIgnoredCount) || 0,
+            initiativeLastIgnoredAtMs: Number(val.initiativeLastIgnoredAtMs) || 0
           };
           // 旧状态/异常状态里的指定成员名单也统一归一化，防止“null”/非法值污染。
           if (st.wakeConfig?.triggers && typeof st.wakeConfig.triggers === 'object') {
@@ -7829,6 +7853,18 @@ async function main() {
           memberImpressions: st.memberImpressions && typeof st.memberImpressions === 'object' ? st.memberImpressions : {},
           lastStickerId: String(st.lastStickerId || ''),
           lastStickerMd5: String(st.lastStickerMd5 || ''),
+          // 阶段 6 自改审计：**必须落盘**，否则桥接一重启面板就显示"今天一次都没改过"、
+          // 一键回滚也失去数据源（rollbackPlan 读的就是这个数组）。这里写字面量 200 而不是
+          // AUTONOMY_AUDIT_KEEP：那个 const 声明在文件更靠下的位置，启动期调用本函数时可能还在 TDZ。
+          autonomyAudit: Array.isArray(st.autonomyAudit) ? st.autonomyAudit.slice(-200) : [],
+          // 阶段 4 主动性状态：不回盘的话，每次重启她的"被无视次数"就清零，
+          // 退避策略等于形同虚设（刚被冷落完重启一下又开始冒泡）。
+          initiativeActions: Array.isArray(st.initiativeActions) ? st.initiativeActions.slice(-50) : [],
+          initiativeLastActionAtMs: Number(st.initiativeLastActionAtMs) || 0,
+          initiativeThought: st.initiativeThought && typeof st.initiativeThought === 'object' ? st.initiativeThought : null,
+          initiativePendingOutcome: st.initiativePendingOutcome && typeof st.initiativePendingOutcome === 'object' ? st.initiativePendingOutcome : null,
+          initiativeIgnoredCount: Number(st.initiativeIgnoredCount) || 0,
+          initiativeLastIgnoredAtMs: Number(st.initiativeLastIgnoredAtMs) || 0,
           seenForwardIds: Array.from(seenForwardIds.get(key) || []).slice(-1000)
         };
       }
@@ -10194,8 +10230,8 @@ async function main() {
   // 沿用本文件一贯的 `if (header && ...)` 惯例直通 —— 主人不受"给她划的白名单"约束。
   const AUTONOMY_LOG_FILE = path.join(STATE_DIR, 'autonomy-log.jsonl');
   const AUTONOMY_AUDIT_KEEP = 200;
-  const AUTONOMY_INPUT_FIELDS = ['mode', 'infinite', 'maxWakePerMinute', 'maxWakePerHour', 'speakCooldownMs', 'batchWindowMs', 'sleepMs'];
-  const AUTONOMY_TRIGGER_FIELDS = ['atMention', 'nameMention', 'question', 'poke', 'anyMessage', 'probability', 'keywords', 'speakerIds'];
+  const AUTONOMY_INPUT_FIELDS = ['speakCooldownMs', 'maxWakePerMinute', 'maxWakePerHour'];
+  const AUTONOMY_TRIGGER_FIELDS = ['probability'];
 
   function autonomyGateEnabled() {
     // 缺省开启；显式 false 才退回旧行为（不拦，只记审计）。它是配置项而不是她能改的东西：
@@ -10203,9 +10239,10 @@ async function main() {
     return cfg.socialV2?.autonomy?.enabled !== false;
   }
 
-  // 入参 → 待审改动列表。sleepUntil 单独处理：白名单里只有 sleepMs（方案第 6 节的"潜水时长"），
-  // 她按绝对时间睡时换算成剩余毫秒、**按 sleepMs 的区间校验**，通过后由调用方按 sleepMs 放行。
-  // 不换算的话，这条她本来就在用的能力会被白名单直接拒掉 —— 那是我实现里的回归，不是她越界。
+  // 入参 → 待审改动列表。**只接受节奏参数**（见 AUTONOMY_INPUT_FIELDS）：
+  // 送进来的入参已经被 splitTuningInput 切过，所以这里出现的每个字段都在白名单里。
+  // 早先版本还处理过 sleepUntil→sleepMs 的换算（因为当时白名单里有 sleepMs），
+  // 现在 sleepMs 属于呼吸参数、不走闸门，那段换算就是死代码，删掉更不容易误判。
   function autonomyChangesFromInput(input) {
     const changes = [];
     for (const f of AUTONOMY_INPUT_FIELDS) {
@@ -10218,12 +10255,6 @@ async function main() {
         if (tr[f] === undefined) continue;
         changes.push({ path: `socialV2.wake.triggers.${f}`, value: tr[f], source: 'self' });
       }
-    }
-    if (input?.sleepUntil !== undefined && input?.sleepMs === undefined) {
-      const until = Date.parse(String(input.sleepUntil));
-      changes.push(Number.isFinite(until)
-        ? { path: 'socialV2.wake.sleepMs', value: Math.max(0, until - Date.now()), source: 'self', reason: `等价于 sleepUntil=${input.sleepUntil}` }
-        : { path: 'socialV2.wake.sleepMs', value: Number.NaN, source: 'self', reason: `sleepUntil 无法解析：${String(input.sleepUntil).slice(0, 40)}` });
     }
     return changes;
   }

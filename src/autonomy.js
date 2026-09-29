@@ -719,3 +719,65 @@ export function summarizePlan(plan) {
   const p = plan || {};
   return `自改计划：通过 ${(p.applied || []).length} / 拒绝 ${(p.rejected || []).length} / 今日剩余 ${p.quotaLeft ?? '?'} 次 —— ${p.reason || ''}`;
 }
+
+// ── 节奏参数（tuning）与呼吸参数（breathing）之分 ───────────────────────────
+//
+// 为什么必须分开：`/api/socialV2/wake-config` 既是"调参数"的地方，**也是她结束每一轮的
+// 呼吸口**（睡多久、下次被什么叫醒）。如果把整套白名单都挂上"每天 3 次"的硬额度，
+// 她当天第 4 次收尾就会被 403 —— 那不是"限制她的自主权"，那是把她的呼吸管掐了
+// （收尾失败 → 桥接反复提醒"你还没收尾" → 可能变成唤醒循环）。
+//
+// 所以真正需要限量的是**能把自己变成话痨的那几个旋钮**（唤醒频率、冷却、概率）：
+//   speakCooldownMs / maxWakePerMinute / maxWakePerHour / triggers.probability
+// 它们一天最多改 3 次；而 mode / infinite / sleepMs / batchWindowMs / 触发开关 /
+// keywords / speakerIds 这些"呼吸参数"仍然逐一过白名单与区间校验，但不吃每日额度
+// —— 因为这批能力在本次升级之前她本来就有，限量等于凭空收回主人已经批准的东西。
+export const AUTONOMY_TUNING_PATHS = Object.freeze([
+  'socialV2.wake.speakCooldownMs',
+  'socialV2.wake.maxWakePerMinute',
+  'socialV2.wake.maxWakePerHour',
+  'socialV2.wake.triggers.probability',
+]);
+
+export function isTuningPath(path) {
+  return AUTONOMY_TUNING_PATHS.includes(String(path ?? ''));
+}
+
+const TUNING_TOP_FIELDS = Object.freeze(['speakCooldownMs', 'maxWakePerMinute', 'maxWakePerHour']);
+const TUNING_TRIGGER_FIELDS = Object.freeze(['probability']);
+
+// 把 qq_set_wake_config 的入参切成 {tuning, rest} 两份（都是新对象，不改入参）。
+// triggers 要单独深切一层：probability 属于 tuning，其余开关属于 rest。
+export function splitTuningInput(input) {
+  const safe = input && typeof input === 'object' && !Array.isArray(input) ? input : {};
+  const tuning = {};
+  const rest = {};
+  for (const [k, v] of Object.entries(safe)) {
+    if (k === 'triggers') continue;
+    const bucket = TUNING_TOP_FIELDS.includes(k) ? tuning : rest;
+    bucket[k] = v;
+  }
+  const trg = safe.triggers && typeof safe.triggers === 'object' && !Array.isArray(safe.triggers) ? safe.triggers : null;
+  if (trg) {
+    const tuningTrg = {};
+    const restTrg = {};
+    for (const [k, v] of Object.entries(trg)) {
+      const bucket = TUNING_TRIGGER_FIELDS.includes(k) ? tuningTrg : restTrg;
+      bucket[k] = v;
+    }
+    if (Object.keys(tuningTrg).length) tuning.triggers = tuningTrg;
+    if (Object.keys(restTrg).length) rest.triggers = restTrg;
+  }
+  return { tuning, rest };
+}
+
+// rest ⊕ 过闸门后的 tuning（triggers 深合并），拼回一个完整入参交给原路由。
+export function mergeTuningInput(rest, tuningInput) {
+  const out = { ...(rest && typeof rest === 'object' ? rest : {}) };
+  const t = tuningInput && typeof tuningInput === 'object' ? tuningInput : {};
+  for (const [k, v] of Object.entries(t)) {
+    if (k === 'triggers') out.triggers = { ...(out.triggers ?? {}), ...v };
+    else out[k] = v;
+  }
+  return out;
+}
