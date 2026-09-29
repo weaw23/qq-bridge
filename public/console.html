@@ -656,6 +656,17 @@
       </div>
       <pre id="v2StateOutput">（空）</pre>
       <pre id="v2AllStatesOutput" style="margin-top:6px">（全部会话状态：空）</pre>
+
+      <div class="divider"></div>
+      <div class="meta" style="margin-bottom:6px">🔓 她自己改配置的审计（只有"节奏参数"吃每日额度：<code>speakCooldownMs</code> / <code>maxWakePerMinute</code> / <code>maxWakePerHour</code> / <code>probability</code>，上限 3 次/天；<code>mode</code> / <code>infinite</code> / <code>sleepMs</code> / 触发开关等"呼吸参数"只校验、不吃额度。白名单、审计、暂停开关她自己绝对改不了）</div>
+      <div class="row">
+        <input type="text" id="v2AutonomyKey" placeholder="private:1918594889 或 group:123456789" style="flex:1">
+        <button id="v2AutonomyLoad" class="small">加载审计</button>
+        <button id="v2AutonomyRollback" class="small danger">一键回滚全部自改</button>
+        <span class="meta" id="v2AutonomyMsg"></span>
+      </div>
+      <div id="v2AutonomyStats" class="meta" style="margin-top:4px"></div>
+      <pre id="v2AutonomyOutput">（空）</pre>
     </section>
 
     <!-- ============ 08 黑话库 ============ -->
@@ -1665,6 +1676,46 @@ document.getElementById('v2ForceWake').addEventListener('click', async () => {
 document.getElementById('v2StatesList').addEventListener('click', async () => {
   const r = await api('/api/socialV2/states');
   document.getElementById('v2AllStatesOutput').textContent = JSON.stringify(r.conversations || [], null, 2);
+});
+
+// 阶段 6：她的自主改配置审计 + 一键回滚。GET 只读、POST 回滚，两个都是控制台专属接口。
+function renderV2Autonomy(r) {
+  const stats = r.stats || {};
+  const audit = r.audit || [];
+  const el = document.getElementById('v2AutonomyStats');
+  el.textContent = `今日自改 ${stats.todayCount ?? 0}/${stats.limit ?? 3} 次 ｜ 通过 ${stats.okCount ?? 0} ｜ 被拒 ${stats.rejectedCount ?? 0}`
+    + (r.wakeConfig?.speakCooldownMs ? ` ｜ 当前 speakCooldownMs = ${r.wakeConfig.speakCooldownMs}ms` : '');
+  if (!audit.length) {
+    document.getElementById('v2AutonomyOutput').textContent = '（她还没自己动过配置）';
+    return;
+  }
+  const lines = audit.slice().reverse().map((e) => {
+    const when = e.atMs ? new Date(e.atMs).toLocaleString('zh-CN', { hour12: false }) : '-';
+    const mark = e.ok ? '✅' : '⛔';
+    const from = e.from === null || e.from === undefined ? '（没设过）' : JSON.stringify(e.from);
+    return `${mark} ${when}  ${e.path}\n    ${from} → ${JSON.stringify(e.to)}${e.reason ? `\n    理由：${e.reason}` : ''}`;
+  });
+  document.getElementById('v2AutonomyOutput').textContent = lines.join('\n\n');
+}
+document.getElementById('v2AutonomyLoad').addEventListener('click', async () => {
+  const msg = document.getElementById('v2AutonomyMsg');
+  const key = document.getElementById('v2AutonomyKey').value.trim();
+  if (!key) { alert('请输入会话 key'); return; }
+  msg.textContent = '';
+  const r = await api('/api/socialV2/autonomy?key=' + encodeURIComponent(key));
+  if (!r.ok) { msg.textContent = '❌ ' + (r.error || '失败'); msg.className = 'meta err'; return; }
+  renderV2Autonomy(r);
+});
+document.getElementById('v2AutonomyRollback').addEventListener('click', async () => {
+  const msg = document.getElementById('v2AutonomyMsg');
+  const key = document.getElementById('v2AutonomyKey').value.trim();
+  if (!key) { alert('请输入会话 key'); return; }
+  if (!confirm(`确定把她自己改过的配置全部回滚到原值？\n${key}`)) return;
+  const r = await api('/api/socialV2/autonomy?key=' + encodeURIComponent(key), 'POST', {});
+  if (!r.ok) { msg.textContent = '❌ ' + (r.error || '失败'); msg.className = 'meta err'; return; }
+  msg.textContent = r.rolledBack ? `✅ 已撤销 ${r.rolledBack} 条自改` : '（没有需要回滚的自改）';
+  msg.className = 'meta ok';
+  renderV2Autonomy(r);
 });
 document.getElementById('v2FeedbackLoad').addEventListener('click', async () => {
   const r = await api('/api/socialV2/feedback');
