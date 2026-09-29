@@ -233,7 +233,8 @@ server.tool(
     try {
       const status = await agentApi('/api/status');
       if (status?.mode === 'reserved2') {
-        return { content: [{ type: 'text', text: 'reserved2 模式下旧只读工具不可用，请使用带会话令牌的 v2 读工具' }], isError: true };
+        // 别再让她撞一堵没有出路的墙：直接告诉她能用的那个带令牌工具（qq_get_my_groups）。
+        return { content: [{ type: 'text', text: 'reserved2 模式下这个旧只读工具不可用。要看她所在的群，请改用 qq_get_my_groups（带 key 与会话令牌）。' }], isError: true };
       }
     } catch (error) {
       return { content: [{ type: 'text', text: `无法确认当前模式，拒绝执行：${error?.message ?? error}` }], isError: true };
@@ -252,6 +253,27 @@ server.tool(
 );
 
 server.tool(
+  'qq_get_my_groups',
+  '列出她所在的群（只读，reserved2 专用，需要 key 与会话令牌）。',
+  {
+    key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
+    token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）')
+  },
+  async ({ key, token }) => {
+    try {
+      const data = await agentApi('/api/socialV2/groups', {
+        method: 'POST',
+        body: JSON.stringify({ key }),
+        headers: { 'x-agent-token': token }
+      });
+      return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
+    } catch (error) {
+      return { content: [{ type: 'text', text: `查询失败：${error?.message ?? error}` }], isError: true };
+    }
+  }
+);
+
+server.tool(
   'qq_get_group_members',
   '列出群成员（只读）。',
   { groupId: z.union([z.number(), z.string()]).describe('群号') },
@@ -262,7 +284,8 @@ server.tool(
       return { content: [{ type: 'text', text: `拒绝：群 ${g} 不在只读白名单中。白名单：${a.allowGroups.join(', ') || '（空）'}` }], isError: true };
     }
     try { await authorizeRead(`group:${g}`); } catch (error) {
-      return { content: [{ type: 'text', text: `拒绝读取：${error?.message ?? error}` }], isError: true };
+      // 别只丢一句"不可用"：告诉她 reserved2 下该用哪个带令牌的工具，省得反复撞墙。
+      return { content: [{ type: 'text', text: `拒绝读取：${error?.message ?? error}（reserved2 模式下请改用带 key 与会话令牌的 v2 读工具：读消息 qq_get_recent_messages / qq_get_unread_messages，看群成员 qq_get_active_members，看群列表 qq_get_my_groups）` }], isError: true };
     }
     try {
       const data = await onebot('get_group_member_list', { group_id: Number(g) });
@@ -285,7 +308,8 @@ server.tool(
       return { content: [{ type: 'text', text: `拒绝：群 ${g} 不在只读白名单中。白名单：${a.allowGroups.join(', ') || '（空）'}` }], isError: true };
     }
     try { await authorizeRead(`group:${g}`); } catch (error) {
-      return { content: [{ type: 'text', text: `拒绝读取：${error?.message ?? error}` }], isError: true };
+      // 别只丢一句"不可用"：告诉她 reserved2 下该用哪个带令牌的工具，省得反复撞墙。
+      return { content: [{ type: 'text', text: `拒绝读取：${error?.message ?? error}（reserved2 模式下请改用带 key 与会话令牌的 v2 读工具：读消息 qq_get_recent_messages / qq_get_unread_messages，看群成员 qq_get_active_members，看群列表 qq_get_my_groups）` }], isError: true };
     }
     try {
       const params = { group_id: Number(g) };

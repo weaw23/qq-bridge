@@ -5185,7 +5185,7 @@ async function main() {
         }
 
         // ── 自身状态端点（P3.5：查自己在群里的名片/角色/禁言等 + 好友清单） ──
-        if (req.method === 'POST' && (url.pathname === '/api/socialV2/my-status' || url.pathname === '/api/socialV2/friend-list')) {
+        if (req.method === 'POST' && (url.pathname === '/api/socialV2/my-status' || url.pathname === '/api/socialV2/friend-list' || url.pathname === '/api/socialV2/groups')) {
           const body = await readBody();
           const token = pickAgentToken(req, body);
           const key = String(body.key ?? '').trim();
@@ -5208,6 +5208,17 @@ async function main() {
               const friends = await obStatus('get_friend_list', {});
               const selfIdFl = selfUserId || Number(cfg.botQQ ?? -1);
               sendJson({ ok: true, count: friends.length, friends: friends.map((f) => ({ userId: f.user_id, nickname: f.nickname, remark: f.remark || '', isSelf: Number(f.user_id) === selfIdFl })) });
+              return;
+            }
+            if (url.pathname.endsWith('/groups')) {
+              // 旧只读工具 qq_list_groups 在 reserved2 下被令牌隔离挡住，她实际撞过这堵墙
+              // （2026-09-29 11:12 的 qq_list_groups 调用被拒），所以补一条带令牌的等价读法：
+              // 只回报当前模式下她本来就能待在里面的群，不越出白名单。
+              const allGroups = await obStatus('get_group_list', {});
+              const list = (Array.isArray(allGroups) ? allGroups : (allGroups?.data ?? []))
+                .filter((g) => modeAllowed('group:' + g.group_id, 'group', g.group_id, cfg, currentMode))
+                .map((g) => ({ groupId: String(g.group_id), name: g.group_name }));
+              sendJson({ ok: true, count: list.length, groups: list });
               return;
             }
             // my-status：群会话查自己所在群；主人私聊会话可传 groupId 查任意白名单群
