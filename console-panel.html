@@ -167,6 +167,7 @@
         <div class="kv" style="margin-top:8px">
           <div class="k">此刻状态</div><div id="herStateLine">读取中…</div>
           <div class="k">在忙吗</div><div id="herBusy">…</div>
+          <div class="k">当前模型</div><div id="herModel" class="muted">…</div>
           <div class="k">为什么安静</div><div id="herQuiet">…</div>
           <div class="k">行为建议</div><div id="herAdvice" class="muted">…</div>
         </div>
@@ -252,7 +253,7 @@
 
   <!-- 模型与思考 -->
   <div class="card">
-    <h2>模型与思考深度</h2>
+    <h2>模型与思考深度<span class="hint">手动直改（推荐用下方「API 与模型」）</span></h2>
     <div class="row"><span class="lbl">服务商</span><input type="text" id="mProvider"></div>
     <div class="row"><span class="lbl">模型</span><input type="text" id="mModel"></div>
     <div class="row"><span class="lbl">思考深度</span>
@@ -260,6 +261,67 @@
     </div>
     <div class="btns" style="margin-top:10px"><button class="primary" onclick="saveModel()">保存（新会话生效）</button>
       <button onclick="resetAllSessions()">立即生效（重建会话）</button></div>
+  </div>
+
+  <!-- API 与模型（供应商管理 + 密钥 + 档案热切换 + C2 搜索密钥） -->
+  <div class="card wide" id="llmCard">
+    <h2>API 与模型<span class="hint">OpenAI 兼容供应商 · 密钥只存不回读 · 保存即热生效（DSH 不重启）</span></h2>
+    <div class="row"><span class="lbl">当前模型</span><span id="llmCurrent" class="muted">读取中…</span></div>
+    <div class="btns" style="margin:8px 0">
+      <button class="sm" onclick="refreshLlm(true)">⟳ 刷新</button>
+      <button class="sm primary" onclick="newProviderForm()">＋ 新增供应商</button>
+      <button class="sm" onclick="newProfileForm()">＋ 新建模型档案</button>
+    </div>
+    <div id="llmProviders"><div class="muted">读取中…</div></div>
+    <details id="providerForm" class="weditor" style="display:none">
+      <summary>新增 / 编辑供应商（OpenAI 兼容）</summary>
+      <div class="wform">
+        <div class="row"><span class="lbl">供应商 id<span class="hint">小写字母/数字/连字符；新建后不可改</span></span>
+          <input type="text" id="pfId" placeholder="如 gmm / openrouter"></div>
+        <div class="row"><span class="lbl">显示名<span class="hint">可选，只用于面板展示</span></span>
+          <input type="text" id="pfLabel" placeholder="如 GLM 免费档"></div>
+        <div class="row"><span class="lbl">BaseURL<span class="hint">OpenAI 兼容地址，不含 /chat/completions</span></span>
+          <input type="text" id="pfBase" placeholder="https://api.example.com/v1" style="flex:1;max-width:460px"></div>
+        <div class="row"><span class="lbl">API Key<span class="hint">只写不读：留空 = 保留已存密钥</span></span>
+          <input type="password" id="pfKey" placeholder="sk-…" style="flex:1;max-width:460px" autocomplete="off"></div>
+        <div class="rowstack"><div class="lbl">模型列表<span class="hint">逗号/换行分隔；或点「自动发现」从 /models 拉取</span></div>
+          <div class="ctl">
+            <textarea id="pfModels" rows="3" style="flex:1;min-width:300px" placeholder="model-a, model-b"></textarea>
+            <button class="sm" onclick="discoverModels()">🔍 自动发现</button>
+          </div>
+        </div>
+        <div class="btns" style="margin-top:10px">
+          <button class="primary" onclick="saveProvider()">保存供应商（热生效）</button>
+          <button onclick="cancelProviderForm()">取消</button>
+        </div>
+      </div>
+    </details>
+    <div class="sep"></div>
+    <h2>模型档案<span class="hint">一键热切换：全部现有会话当场换脑，会话不断、上下文保留</span></h2>
+    <div id="llmProfiles"><div class="muted">读取中…</div></div>
+    <details id="profileForm" class="weditor" style="display:none">
+      <summary>新建 / 编辑档案</summary>
+      <div class="wform">
+        <div class="row"><span class="lbl">档案名<span class="hint">1-16 字：中文/字母/数字/_-</span></span><input type="text" id="prName" placeholder="如 省钱档"></div>
+        <div class="row"><span class="lbl">显示名<span class="hint">可选</span></span><input type="text" id="prLabel" placeholder="如 深夜省钱档"></div>
+        <div class="row"><span class="lbl">供应商</span><select id="prProvider" onchange="onProfileProviderChange()"></select></div>
+        <div class="row"><span class="lbl">模型</span><select id="prModel"></select></div>
+        <div class="row"><span class="lbl">思考深度</span>
+          <select id="prEffort"><option value="default">默认</option><option value="off">off</option><option value="low">low</option><option value="medium">medium</option><option value="high">high</option><option value="max">max</option></select></div>
+        <div class="btns" style="margin-top:10px">
+          <button class="primary" onclick="saveProfile()">保存档案</button>
+          <button onclick="cancelProfileForm()">取消</button>
+        </div>
+      </div>
+    </details>
+    <div class="sep"></div>
+    <div class="rowstack">
+      <div class="lbl">网页搜索密钥（web-search-deepseek）<span class="hint">她上网搜资料用的 DeepSeek key，配好搜索工具才能用</span><span id="wsKeyState"></span></div>
+      <div class="ctl">
+        <input type="password" id="wsKey" placeholder="sk-…" style="flex:1;max-width:460px" autocomplete="off">
+        <button class="sm" onclick="saveWebSearchKey()">保存</button>
+      </div>
+    </div>
   </div>
 
   <!-- 唤醒与成本 -->
@@ -502,7 +564,7 @@ async function refresh(allowRetry = true) {
       `<span class="pill">${dot(o.dshReady)}DSH</span>`,
       `<span class="pill">${dot(!o.paused, o.paused)}${o.paused ? 'AI 已暂停' : 'AI 运行中'}</span>`,
       `<span class="pill">模式 ${o.mode}</span>`,
-      `<span class="pill">模型 ${o.model.provider}/${o.model.model}</span>`,
+      `<span class="pill">模型 ${o.model.provider}/${o.model.model}${o.model.profile ? '（' + o.model.profile + '）' : ''}</span>`,
       `<span class="pill">思考 ${o.model.reasoningEffort}</span>`,
       `<span class="pill">工具 ${o.toolCount ?? '?'}</span>`,
     ].join('');
@@ -596,6 +658,11 @@ async function refreshHer(allowRetry = true) {
     $('herBusy').innerHTML = HER.busy
       ? '<span class="dot warn" style="display:inline-block;vertical-align:-1px"></span> 正忙着（3 分钟内在调工具，上次 ' + esc(fmtHM(HER.lastToolAt)) + '）'
       : '<span class="dot on" style="display:inline-block;vertical-align:-1px"></span> 闲着';
+    // C1：她此刻实际在用的模型（含档案名）
+    {
+      const hm = HER.model || {};
+      $('herModel').innerHTML = `${esc(hm.provider || '–')} / ${esc(hm.model || '–')} · 思考 ${esc(hm.reasoningEffort || 'default')}${hm.profile ? ` · 档案「${esc(hm.profile)}」` : ''}`;
+    }
     // 为什么安静：最近一条主动性决策
     const d = HER.lastDecision;
     if (!d) $('herQuiet').innerHTML = '<span class="muted">还没有主动性决策记录（她刚重启，或还没到决策周期）</span>';
@@ -794,6 +861,10 @@ async function refreshHealth(allowRetry = true) {
   const wd = h.watchdog || {};
   const today = h.today || {};
   const st = h.storage || {};
+  // C4：模型用量（按供应商/模型分组的回合数）
+  const mu = h.modelUsage || {};
+  const muRows = (mu.rows || []).map((r) =>
+    `<tr><td>${esc(r.provider)}</td><td>${esc(r.model)}</td><td class="num">${r.turnsToday ?? 0}</td><td class="num">${r.turns ?? 0}</td></tr>`).join('');
   const proactive = (today.proactive || []).map((p) =>
     `<div class="k">${esc(keyLabel(p.key))}</div><div>${p.used} / ${p.quota}（今日主动配额${p.allowed === false ? '，已满' : ''}）</div>`).join('');
   $('healthBody').innerHTML = `
@@ -832,9 +903,264 @@ async function refreshHealth(allowRetry = true) {
         <div class="k">工具日志 tool-calls</div><div>${fmtBytes(st.toolLog)}（封顶 2000 行自动滚）</div>
         <div class="k">社交状态 social-v2</div><div>${fmtBytes(st.socialV2)}</div>
         <div class="k">主动性日志 initiative</div><div>${fmtBytes(st.initiativeLog)}</div>
+        <div class="k">模型用量日志</div><div>${fmtBytes(st.modelUsage)}（封顶 20000 行自动滚）</div>
         <div class="k">DSH 会话数</div><div><span class="num">${st.sessionCount ?? '–'}</span> 个</div>
       </div>
+    </div>
+    <div class="tile">
+      <h3>模型用量（按供应商）</h3>
+      ${muRows ? `<table><tr><th>供应商</th><th>模型</th><th>今日回合</th><th>累计回合</th></tr>${muRows}</table>
+        <div class="muted" style="font-size:11.5px;margin-top:6px">${esc(mu.note || '')}${mu.since ? ' · 记账始于 ' + fmtTime(Date.parse(mu.since)) : ''}</div>`
+        : '<div class="muted">还没有回合记录（她被唤醒并完成一轮后才开始记账）</div>'}
     </div>`;
+}
+
+// ══ API 与模型（m04854：A 供应商管理 + B 档案热切换 + C2 搜索密钥）══
+let LLM = null;                  // /api/panel/llm-ns 缓存（含 providers/builtins/profiles/current）
+let editingProviderId = null;    // 正在编辑的供应商 id（null=新增）
+let editingProfileName = null;   // 正在编辑的档案名（null=新建）
+async function refreshLlm(allowRetry = true) {
+  try {
+    LLM = await api('/api/panel/llm-ns');
+    renderLlm();
+  } catch (e) {
+    if (e.message === 'NETDOWN') return;   // 横幅由 refresh() 负责
+    const needAuth = /未授权|令牌/.test(e.message);
+    if (needAuth && allowRetry && INJECTED_OK && TOKEN !== INJECTED) {
+      TOKEN = INJECTED; localStorage.setItem('whaleToken', TOKEN); $('token').value = TOKEN;
+      return refreshLlm(false);
+    }
+    $('llmProviders').innerHTML = '<div class="muted">读取失败：' + esc(e.message) + '</div>';
+    $('llmProfiles').innerHTML = '';
+  }
+}
+function renderLlm() {
+  if (!LLM) return;
+  const cur = LLM.current || {};
+  $('llmCurrent').innerHTML = `<b>${esc(cur.provider || '–')}</b> / ${esc(cur.model || '–')} · 思考 ${esc(cur.reasoningEffort || 'default')}${cur.profile ? ` · 档案「${esc(cur.profile)}」` : ''}`;
+  // C2：搜索密钥状态徽章
+  $('wsKeyState').innerHTML = LLM.webSearchKeySet ? ' <span class="chip good">已配置</span>' : ' <span class="chip bad">未配置</span>';
+  // 供应商卡片（自定义 + 内置）
+  const all = [...(LLM.providers || []), ...(LLM.builtins || [])];
+  $('llmProviders').innerHTML = all.length ? all.map((p) => {
+    const keyChip = p.builtIn
+      ? (p.account ? '<span class="chip good">账号内置</span>' : '<span class="chip good">DSH 内置</span>')
+      : (p.keyConfigured ? '<span class="chip good">密钥已配</span>' : '<span class="chip bad">密钥未配</span>');
+    const isCur = p.id === cur.provider;
+    const models = p.models || [];
+    const modelTxt = models.slice(0, 30).map((m) => m.id).join('、') + (models.length > 30 ? ' …' : '');
+    return `<div class="scard" data-provider="${esc(p.id)}">
+      <div class="shead">
+        <b>${esc(p.label || p.id)}</b><span class="pill">${esc(p.id)}</span>
+        ${isCur ? '<span class="chip good">当前在用</span>' : ''}
+        ${keyChip}
+        <span class="muted">${models.length} 个模型${p.apiKeyEnv && !p.builtIn ? ' · 密钥名 ' + esc(p.apiKeyEnv) : ''}</span>
+        <span class="muted" style="flex:1;min-width:220px;word-break:break-all">${esc(p.baseURL || '（账号内置路由，无直连地址）')}</span>
+      </div>
+      ${modelTxt ? `<div class="muted" style="font-size:11.5px;margin:4px 0">${esc(modelTxt)}</div>` : ''}
+      <div class="btns">
+        <button class="sm" onclick="testProvider('${esc(p.id)}')">📡 测试连通</button>
+        ${p.builtIn ? '' : `<button class="sm" onclick="editProvider('${esc(p.id)}')">✏️ 编辑</button>
+        <button class="sm danger" onclick="deleteProvider('${esc(p.id)}')">🗑 删除</button>`}
+        <span class="muted" id="test-${esc(p.id)}" style="font-size:11.5px"></span>
+      </div>
+    </div>`;
+  }).join('') : '<div class="muted">还没有自定义供应商：点「＋ 新增供应商」加一个 OpenAI 兼容接口</div>';
+  // 档案卡片
+  const profiles = LLM.profiles || {};
+  const names = Object.keys(profiles);
+  $('llmProfiles').innerHTML = names.length ? names.map((name) => {
+    const p = profiles[name] || {};
+    const active = cur.profile === name;
+    return `<div class="scard" data-profile="${esc(name)}">
+      <div class="shead">
+        <b>${esc(p.label || name)}</b><span class="pill">${esc(name)}</span>
+        ${active ? '<span class="chip good">当前档案</span>' : ''}
+        <span class="muted">${esc(p.provider || '')} / ${esc(p.model || '')} · 思考 ${esc(p.reasoningEffort || 'default')}</span>
+        <span class="btns" style="margin-left:auto">
+          <button class="sm primary" onclick="applyProfile('${esc(name)}')">⚡ 应用（热切换）</button>
+          <button class="sm" onclick="editProfile('${esc(name)}')">✏️ 编辑</button>
+          <button class="sm danger" onclick="deleteProfile('${esc(name)}')">🗑 删除</button>
+        </span>
+      </div>
+      <div id="applyResult-${esc(name)}" class="muted" style="font-size:11.5px;margin-top:4px"></div>
+    </div>`;
+  }).join('') : '<div class="muted">还没有档案：建一套「日常档」「省钱档」，一键切换、会话不断</div>';
+}
+
+// ── 供应商表单 ──
+function newProviderForm() {
+  editingProviderId = null;
+  const f = $('providerForm'); f.style.display = ''; f.open = true;
+  $('pfId').value = ''; $('pfId').disabled = false;
+  $('pfLabel').value = ''; $('pfBase').value = ''; $('pfKey').value = ''; $('pfModels').value = '';
+  $('pfId').focus();
+}
+function editProvider(id) {
+  const p = (LLM?.providers || []).find((x) => x.id === id);
+  if (!p) { toast('找不到该供应商', true); return; }
+  editingProviderId = id;
+  const f = $('providerForm'); f.style.display = ''; f.open = true;
+  $('pfId').value = id; $('pfId').disabled = true;
+  $('pfLabel').value = p.label || '';
+  $('pfBase').value = p.baseURL || '';
+  $('pfKey').value = '';   // 密钥只写不读：编辑不回填，留空=保留
+  $('pfModels').value = (p.models || []).map((m) => m.id).join(', ');
+  f.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+}
+function cancelProviderForm() { $('providerForm').style.display = 'none'; }
+async function saveProvider() {
+  const id = editingProviderId || val('pfId');
+  const models = String($('pfModels').value || '').split(/[,，\n]/).map((x) => x.trim()).filter(Boolean);
+  if (!id) { toast('供应商 id 不能为空', true); return; }
+  try {
+    const r = await api('/api/panel/llm-provider-save', { method: 'POST', body: JSON.stringify({
+      id, label: val('pfLabel'), baseURL: val('pfBase'), apiKey: $('pfKey').value.trim(), models }) });
+    toast(`供应商 ${r.id} 已保存（${(r.models || []).length} 个模型，热生效）${r.keyWritten ? '，密钥已写入' : ''}`);
+    cancelProviderForm();
+    await refreshLlm(true);
+  } catch (e) { toast('保存失败：' + e.message, true); }
+}
+async function deleteProvider(id) {
+  const p = (LLM?.providers || []).find((x) => x.id === id);
+  if (!p) return;
+  if (!confirm(`删除供应商「${p.label || id}」（${(p.models || []).length} 个模型）？`)) return;
+  const alsoKey = p.keyConfigured
+    ? confirm(`是否连带清除密钥 ${p.apiKeyEnv || ''}？\n确定 = 连带清除；取消 = 保留（以后新建同名供应商还能用）`)
+    : false;
+  try {
+    const r = await api('/api/panel/llm-provider-delete', { method: 'POST', body: JSON.stringify({ id, alsoKey }) });
+    toast(`已删除 ${id}` + ((r.warnings || []).length ? '（' + r.warnings[0] + '）' : ''));
+    await refreshLlm(true);
+  } catch (e) { toast('删除失败：' + e.message, true); }
+}
+async function discoverModels() {
+  const baseURL = val('pfBase');
+  if (!baseURL) { toast('先填 BaseURL 才能自动发现', true); return; }
+  const apiKey = $('pfKey').value.trim();
+  const editing = editingProviderId ? ((LLM?.providers || []).find((x) => x.id === editingProviderId)?.apiKeyEnv || '') : '';
+  toast('发现中…（最长 10 秒）');
+  try {
+    const r = await api('/api/panel/llm-discover', { method: 'POST', body: JSON.stringify({ baseURL, apiKey, ref: editing || null }) });
+    if (!(r.models || []).length) { toast('接口通了但没发现模型', true); return; }
+    $('pfModels').value = r.models.join(', ');
+    toast(`发现 ${r.count} 个模型（${r.latencyMs}ms）——删掉用不到的再保存`);
+  } catch (e) { toast('发现失败：' + e.message, true); }
+}
+async function testProvider(id) {
+  const out = document.getElementById('test-' + id);
+  const all = [...(LLM?.providers || []), ...(LLM?.builtins || [])];
+  const p = all.find((x) => x.id === id);
+  if (!p || (!p.baseURL && p.account)) {
+    if (out) { out.style.color = 'var(--dim2)'; out.textContent = '（账号内置路由，走 DSH 通道，无法直测）'; }
+    return;
+  }
+  if (out) { out.style.color = 'var(--dim2)'; out.textContent = '测试中…（最长 20 秒）'; }
+  try {
+    const body = p.builtIn
+      ? { baseURL: p.baseURL, ref: p.apiKeyEnv, model: (p.models?.[0]?.id) || '' }
+      : { provider: id };
+    const r = await api('/api/panel/llm-test', { method: 'POST', body: JSON.stringify(body) });
+    if (out) { out.style.color = 'var(--good)'; out.textContent = `✓ ${r.latencyMs}ms · ${r.model || ''} ·「${(r.replySnippet || '').slice(0, 24)}」`; }
+  } catch (e) {
+    if (out) { out.style.color = 'var(--bad)'; out.textContent = '✗ ' + e.message; }
+  }
+}
+
+// ── 档案表单 ──
+function newProfileForm() {
+  if (!(LLM?.providers || []).length && !(LLM?.builtins || []).length) { toast('先等供应商目录加载出来', true); return; }
+  editingProfileName = null;
+  const f = $('profileForm'); f.style.display = ''; f.open = true;
+  $('prName').value = ''; $('prName').disabled = false;
+  $('prLabel').value = '';
+  fillProfileSelectors('', '');
+  $('prEffort').value = 'default';
+  $('prName').focus();
+}
+function editProfile(name) {
+  const p = (LLM?.profiles || {})[name];
+  if (!p) { toast('找不到该档案', true); return; }
+  editingProfileName = name;
+  const f = $('profileForm'); f.style.display = ''; f.open = true;
+  $('prName').value = name; $('prName').disabled = true;
+  $('prLabel').value = p.label || '';
+  fillProfileSelectors(p.provider || '', p.model || '');
+  $('prEffort').value = p.reasoningEffort || 'default';
+  f.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+}
+function fillProfileSelectors(provider, model) {
+  const all = [...(LLM?.providers || []), ...(LLM?.builtins || [])];
+  $('prProvider').innerHTML = all.map((p) =>
+    `<option value="${esc(p.id)}" ${p.id === provider ? 'selected' : ''}>${esc(p.label || p.id)}${p.keyConfigured === false ? ' ⚠密钥未配' : ''}</option>`).join('');
+  onProfileProviderChange(model);
+}
+function onProfileProviderChange(presetModel) {
+  const pid = $('prProvider').value;
+  const all = [...(LLM?.providers || []), ...(LLM?.builtins || [])];
+  const p = all.find((x) => x.id === pid);
+  const models = (p?.models || []).map((m) => m.id);
+  $('prModel').innerHTML = models.length
+    ? models.map((m) => `<option value="${esc(m)}" ${m === presetModel ? 'selected' : ''}>${esc(m)}</option>`).join('')
+    : '<option value="">（该供应商还没有模型，先去编辑供应商）</option>';
+  // 预设模型不在目录（例如档案引用了已删掉的供应商）时也保留，避免静默改值
+  if (presetModel && !models.includes(presetModel)) {
+    $('prModel').insertAdjacentHTML('beforeend', `<option value="${esc(presetModel)}" selected>${esc(presetModel)}（不在目录）</option>`);
+  }
+}
+function cancelProfileForm() { $('profileForm').style.display = 'none'; }
+async function saveProfile() {
+  const name = editingProfileName || val('prName');
+  if (!name) { toast('档案名不能为空', true); return; }
+  try {
+    const r = await api('/api/panel/model-profile-save', { method: 'POST', body: JSON.stringify({
+      name, label: val('prLabel'), provider: $('prProvider').value, model: $('prModel').value, reasoningEffort: $('prEffort').value }) });
+    toast(`档案「${r.name}」已保存（要生效请点卡片上的「⚡ 应用」）`);
+    cancelProfileForm();
+    await refreshLlm(true);
+  } catch (e) { toast('保存失败：' + e.message, true); }
+}
+async function deleteProfile(name) {
+  if (!confirm(`删除模型档案「${name}」？（正在使用则同时取消当前档案标记，模型不变）`)) return;
+  try {
+    await api('/api/panel/model-profile-delete', { method: 'POST', body: JSON.stringify({ name }) });
+    toast('已删除');
+    await refreshLlm(true);
+  } catch (e) { toast('失败：' + e.message, true); }
+}
+async function applyProfile(name) {
+  const box = document.getElementById('applyResult-' + name);
+  if (box) { box.className = ''; box.style.color = 'var(--dim2)'; box.textContent = '切换中…（清应用标记 → 全部会话重跑 selectModel，DSH 不重启）'; }
+  try {
+    const r = await api('/api/panel/model-profile-apply', { method: 'POST', body: JSON.stringify({ name }) });
+    let txt = `已切到 ${r.applied.provider}/${r.applied.model}（effort=${r.applied.reasoningEffort}）· 热切换 ${r.sessionsHot}/${r.sessionsTotal} 个会话`;
+    if ((r.failedSessions || []).length) txt += `；${r.failedSessions.length} 个失败（下回合自动再试）`;
+    const warns = r.warnings || [];
+    if (box) {
+      box.style.color = warns.length ? 'var(--bad)' : ((r.failedSessions || []).length ? 'var(--warn)' : 'var(--good)');
+      box.innerHTML = esc(txt) + (warns.length ? '<br>' + warns.map((w) => '⚠ ' + esc(w)).join('<br>') : '');
+    }
+    toast(`档案「${name}」已应用：${r.sessionsHot}/${r.sessionsTotal} 个会话热切换`);
+    // C3：应用后立刻实测该供应商连通，失败即红字（测试结果落在供应商卡上）
+    testProvider(r.applied.provider);
+    await refreshLlm(true);
+    refresh(); refreshHer();
+  } catch (e) {
+    if (box) { box.style.color = 'var(--bad)'; box.textContent = '切换失败：' + e.message; }
+    toast('切换失败：' + e.message, true);
+  }
+}
+
+// ── C2：网页搜索密钥 ──
+async function saveWebSearchKey() {
+  const value = $('wsKey').value.trim();
+  if (!value) { toast('密钥不能为空', true); return; }
+  try {
+    await api('/api/panel/web-search-key', { method: 'POST', body: JSON.stringify({ value }) });
+    $('wsKey').value = '';
+    toast('搜索密钥已写入（值不回显）');
+    await refreshLlm(true);
+  } catch (e) { toast('失败：' + e.message, true); }
 }
 
 async function saveWhitelist() {
@@ -872,10 +1198,12 @@ refresh();
 refreshHer();
 loadSessions();
 refreshHealth();
+refreshLlm();
 setInterval(refresh, 6000);
 setInterval(refreshHer, 6000);
 setInterval(() => loadSessions(false), 60000);
 setInterval(refreshHealth, 30000);
+setInterval(refreshLlm, 60000);
 </script>
 </body>
 </html>

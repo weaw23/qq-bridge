@@ -9,6 +9,7 @@ import fs from 'node:fs';
 import http from 'node:http';
 import { spawn, execFileSync } from 'node:child_process';
 import path from 'node:path';
+import os from 'node:os';
 import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { SnowLumaWebSocketClient, text } from '@snowluma/sdk';
@@ -114,6 +115,25 @@ const FEEDBACK_FILE = path.join(STATE_DIR, 'feedback.json');
 const TOOL_LOG_FILE = path.join(STATE_DIR, 'tool-calls.jsonl');
 const ACTIVITY_LOG = path.join(STATE_DIR, 'qq-activity.log');
 const BRIDGE_LOG = path.join(STATE_DIR, 'bridge.log');
+const MODEL_USAGE_FILE = path.join(STATE_DIR, 'model-usage.jsonl');
+
+// 读 DSH 凭据库（.credentials.yaml）里某个 ref 的明文值：仅用于服务端出站请求的
+// Authorization 头（连通测试/模型发现），永不回显给面板、永不写日志。
+// 文件顶层 {version, refs, records}，refs 下内联标量条目形如「  GMM_API_KEY: sk-xxx」。
+function readCredentialValue(ref) {
+  if (!/^[A-Z][A-Z0-9_]{2,40}$/.test(ref)) return null;
+  try {
+    const dshHome = process.env.DSH_HOME || path.join(os.homedir(), '.dsh');
+    const file = path.join(dshHome, '.credentials.yaml');
+    const text = fs.readFileSync(file, 'utf8');
+    const re = new RegExp('^\\s*' + ref + ':\\s*(.+)$', 'm');
+    const hit = text.match(re);
+    if (!hit) return null;
+    const raw = hit[1].trim();
+    if (!raw || raw === 'null' || raw === '~' || raw === "''" || raw === '""') return null;
+    return raw.replace(/^['"]|['"]$/g, '');
+  } catch { return null; }
+}
 
 // 读取 JSON 文件并容错：Windows 下常见 UTF-8 BOM（\uFEFF）会令 JSON.parse 失败。
 // required=true 时文件缺失或解析失败直接抛错（用于启动必需配置，fail-fast）。
@@ -5516,6 +5536,13 @@ async function main() {
           sendJson({
             ok: true,
             now,
+            // 面板·C1：她此刻实际在用的模型（含档案名，一眼可见当前档位）
+            model: {
+              provider: String(cfg.dsh?.provider ?? ''),
+              model: String(cfg.dsh?.model ?? ''),
+              reasoningEffort: String(cfg.dsh?.reasoningEffort ?? ''),
+              profile: cfg.dsh?.activeProfile ?? null
+            },
             persona: {
               mood: Math.round(decayed.mood * 10) / 10,
               energy: Math.round(decayed.energy * 10) / 10,
@@ -5593,7 +5620,24 @@ async function main() {
             toolLog: sizeOf(TOOL_LOG_FILE),
             socialV2: sizeOf(SOCIAL_V2_FILE),
             initiativeLog: sizeOf(INITIATIVE_LOG_FILE),
+            modelUsage: sizeOf(MODEL_USAGE_FILE),
             sessionCount
+          };
+          // 面板·C4 模型用量：按供应商/模型分组的回合数（今日 + 累计）。
+          const usageEntries = readModelUsage(20000);
+          const usageBy = new Map();
+          for (const e of usageEntries) {
+            if (!e?.provider || !e?.model) continue;
+            const k = e.provider + '/' + e.model;
+            const rec = usageBy.get(k) ?? { provider: e.provider, model: e.model, turns: 0, turnsToday: 0 };
+            rec.turns += 1;
+            if (e.time && localDay(e.time) === todayKey) rec.turnsToday += 1;
+            usageBy.set(k, rec);
+          }
+          const modelUsage = {
+            note: '回合数（DSH 2.0.5 事件流不含 token 用量，如实用回合数观测成本）',
+            since: usageEntries.length ? usageEntries[0].time : null,
+            rows: [...usageBy.values()].sort((a, b) => b.turnsToday - a.turnsToday || b.turns - a.turns).slice(0, 20)
           };
           sendJson({
             ok: true,
@@ -5601,7 +5645,8 @@ async function main() {
             fts,
             watchdog,
             today: { callCount, sendOk, sendFail, wakeCount, sendTimes: sendTimesCount, initiativeToday, initiativeSpoken, proactive },
-            storage
+            storage,
+            modelUsage
           });
           return;
         }
@@ -5649,7 +5694,7 @@ async function main() {
             dshReady,
             gateway: login.online,
             qq: login,
-            model: { provider: cfg.dsh?.provider ?? '', model: cfg.dsh?.model ?? '', reasoningEffort: cfg.dsh?.reasoningEffort ?? 'default' },
+            model: { provider: cfg.dsh?.provider ?? '', model: cfg.dsh?.model ?? '', reasoningEffort: cfg.dsh?.reasoningEffort ?? 'default', profile: cfg.dsh?.activeProfile ?? null },
             allowPrivate: cfg.allow?.private ?? [],
             allowGroups: cfg.allow?.groups ?? [],
             groupsDisabled: cfg.groupsDisabled ?? [],
@@ -5724,6 +5769,402 @@ async function main() {
           } catch (error) { sendJson({ ok: false, error: '保存失败：' + (error?.message ?? error) }, 500); return; }
           log(`[panel] 模型切换为 ${provider}/${model}（effort=${effort}）`);
           sendJson({ ok: true, note: `已保存 ${provider}/${model}（新会话生效；点「重建全部会话」立即生效）` });
+          return;
+        }
+
+        // ── 面板·API 与模型（m04854 方案：A 供应商管理 + B 档案热切换 + C1-C4）────────────────
+        // 设计事实：settings.mutate/credentials.set 走 DSH 官方 RPC（热生效，applies=live）；
+        //           密钥 write-only 永不回读——面板只回显 configured 状态，值只出现在写入请求里。
+
+        // DSH 设置聚合：一次 describe，兼容 namespaces 为数组或字典两种返回形态。
+        const describeDshSettings = async () => {
+          const desc = unwrap(await api.settings.describe({}), 'settings.describe');
+          const pick = (name) => {
+            const nsList = desc?.namespaces;
+            if (Array.isArray(nsList)) return nsList.find((n) => n?.ns === name) ?? null;
+            if (nsList && typeof nsList === 'object') return nsList[name] ?? null;
+            return null;
+          };
+          return { desc, pick };
+        };
+        // 批量查密钥状态：refs -> { configured }（值不回读）。
+        const describeCredentials = async (refs) => {
+          const uniq = [...new Set(refs.map((r) => String(r ?? '').trim()).filter(Boolean))].slice(0, 64);
+          if (!uniq.length) return {};
+          try {
+            const cred = unwrap(await api.credentials.describe({ refs: uniq }), 'credentials.describe');
+            const out = {};
+            for (const ref of uniq) {
+              const hit = cred?.[ref] ?? (Array.isArray(cred) ? cred.find((c) => c?.ref === ref) : null);
+              out[ref] = { configured: !!(hit && (hit.configured === undefined ? true : hit.configured)) };
+            }
+            return out;
+          } catch { return {}; }
+        };
+
+        // A·目录聚合：供应商卡片 + 内置 + 密钥状态 + 当前默认 + 档案 + 搜索密钥状态
+        if (req.method === 'GET' && url.pathname === '/api/panel/llm-ns') {
+          try {
+            const { pick } = await describeDshSettings();
+            const nsLlm = pick('llm-pi-ai');
+            const nsDeep = pick('llm-deepseek');
+            const nsAdm = pick('agent-default-model');
+            const nsWs = pick('web-search-deepseek');
+            const providers = [];
+            for (const [id, p] of Object.entries(nsLlm?.value?.providers ?? {})) {
+              providers.push({
+                id,
+                label: String(p?.displayName || id),
+                api: String(p?.api || 'openai-completions'),
+                baseURL: String(p?.baseURL || ''),
+                apiKeyEnv: String(p?.apiKeyEnv || ''),
+                models: (Array.isArray(p?.models) ? p.models : []).map((m) => ({
+                  id: String(m?.id ?? ''),
+                  name: String(m?.name ?? m?.id ?? '')
+                })).filter((m) => m.id)
+              });
+            }
+            const builtins = [];
+            const deepModels = (Array.isArray(nsDeep?.value?.models) ? nsDeep.value.models : []).map((m) => ({
+              id: String(m?.id ?? ''), name: String(m?.name ?? m?.id ?? '')
+            })).filter((m) => m.id);
+            if (deepModels.length) {
+              builtins.push({
+                id: 'deepseek-official', label: 'DeepSeek 官方（DSH 内置）', api: 'official',
+                baseURL: String(nsDeep?.value?.baseURL || 'https://api.deepseek.com'), apiKeyEnv: String(nsDeep?.value?.apiKeyEnv || 'DEEPSEEK_API_KEY'),
+                models: deepModels, keyConfigured: false, builtIn: true
+              });
+            }
+            const admProvider = String(nsAdm?.value?.provider ?? '');
+            const admModel = String(nsAdm?.value?.model ?? '');
+            if (admProvider && admModel && !providers.some((p) => p.id === admProvider) && !builtins.some((b) => b.id === admProvider)) {
+              builtins.push({ id: admProvider, label: `${admProvider}（账号内置）`, api: 'official', baseURL: '', apiKeyEnv: '', models: [{ id: admModel, name: admModel }], keyConfigured: true, builtIn: true, account: true });
+            }
+            const cred = await describeCredentials(providers.map((p) => p.apiKeyEnv).concat(builtins.map((b) => b.apiKeyEnv)));
+            for (const p of providers) p.keyConfigured = !!(p.apiKeyEnv && cred[p.apiKeyEnv]?.configured);
+            for (const b of builtins) if (b.apiKeyEnv && !b.account) b.keyConfigured = !!cred[b.apiKeyEnv]?.configured;
+            sendJson({
+              ok: true,
+              providers,
+              builtins,
+              agentDefaultModel: nsAdm?.value ? {
+                provider: String(nsAdm.value.provider ?? ''), model: String(nsAdm.value.model ?? ''),
+                reasoningEffort: String(nsAdm.value.reasoningEffort ?? '')
+              } : null,
+              webSearchKeySet: !!(nsWs?.secrets ?? []).some((s) => s?.set === true),
+              current: {
+                provider: String(cfg.dsh?.provider ?? ''), model: String(cfg.dsh?.model ?? ''),
+                reasoningEffort: String(cfg.dsh?.reasoningEffort ?? ''), profile: cfg.dsh?.activeProfile ?? null
+              },
+              profiles: cfg.dsh?.profiles ?? {}
+            });
+          } catch (error) {
+            sendJson({ ok: false, error: '读取 DSH 模型设置失败：' + (error?.message ?? error) }, 500);
+          }
+          return;
+        }
+
+        // A·保存/新建供应商（OpenAI 兼容）：密钥走 credentials.set，档案走 settings.mutate（均热生效）
+        if (req.method === 'POST' && url.pathname === '/api/panel/llm-provider-save') {
+          const body = await readBody();
+          const id = String(body.id ?? '').trim().toLowerCase();
+          const baseURL = String(body.baseURL ?? '').trim().replace(/\/+$/, '');
+          const label = String(body.label ?? '').trim();
+          const apiKey = typeof body.apiKey === 'string' ? body.apiKey.trim() : '';
+          const rawModels = Array.isArray(body.models) ? body.models : String(body.models ?? '').split(/[,，\n]/);
+          const modelIds = [...new Set(rawModels.map((m) => String(typeof m === 'object' && m ? m.id : m).trim()).filter(Boolean))].slice(0, 50);
+          if (!/^[a-z][a-z0-9-]{0,30}$/.test(id)) { sendJson({ ok: false, error: '供应商 id 只能是小写字母/数字/连字符（字母开头，最长 31）' }, 400); return; }
+          if (!/^https?:\/\//.test(baseURL)) { sendJson({ ok: false, error: 'BaseURL 必须以 http:// 或 https:// 开头（OpenAI 兼容地址，不含 /chat/completions）' }, 400); return; }
+          if (!modelIds.length) { sendJson({ ok: false, error: '模型列表不能为空（点「自动发现」拉取，或手动填逗号分隔的模型 id）' }, 400); return; }
+          try {
+            let apiKeyEnv = '';
+            let savedRevision = null;
+            for (let attempt = 1; attempt <= 2; attempt += 1) {
+              const { pick } = await describeDshSettings();
+              const ns = pick('llm-pi-ai');
+              const existing = ns?.value?.providers?.[id] ?? {};
+              apiKeyEnv = String(body.apiKeyEnv || existing.apiKeyEnv || (id.toUpperCase().replace(/-/g, '_') + '_API_KEY'));
+              if (apiKey && attempt === 1) {
+                unwrap(await api.credentials.set({ ref: apiKeyEnv, value: apiKey }), 'credentials.set');
+              }
+              // 同 id 模型保留旧完整条目（contextWindow 等元数据不丢），新 id 用最小条目。
+              const prevModels = Array.isArray(existing.models) ? existing.models : [];
+              const models = modelIds.map((mid) => (prevModels.find((m) => m?.id === mid) ?? { id: mid, name: mid }));
+              const value = { ...existing, apiKeyEnv, api: String(existing.api || 'openai-completions'), baseURL, models };
+              if (label) value.displayName = label;
+              try {
+                const updated = unwrap(await api.settings.mutate({ ns: 'llm-pi-ai', ops: [{ op: 'set', path: ['providers', id], value }], expectedRevision: ns?.revision }), 'settings.mutate');
+                savedRevision = updated?.revision ?? ns?.revision ?? null;
+                break;
+              } catch (error) {
+                const msg = String(error?.message ?? error);
+                if (attempt < 2 && /conflict/i.test(msg)) continue; // revision 过期：重读目录重试一次
+                sendJson({ ok: false, error: 'DSH 拒绝保存：' + msg }, 400);
+                return;
+              }
+            }
+            log(`[panel] 供应商已保存：${id} -> ${baseURL}（${modelIds.length} 个模型，密钥 ${apiKey ? '已写入' : '未变'}）`);
+            sendJson({ ok: true, id, apiKeyEnv, baseURL, models: modelIds, revision: savedRevision, keyWritten: !!apiKey });
+          } catch (error) {
+            sendJson({ ok: false, error: '保存失败：' + (error?.message ?? error) }, 500);
+          }
+          return;
+        }
+
+        // A·删除供应商（可顺带清密钥；在用/被档案引用会拦或警告）
+        if (req.method === 'POST' && url.pathname === '/api/panel/llm-provider-delete') {
+          const body = await readBody();
+          const id = String(body.id ?? '').trim();
+          const alsoKey = body.alsoKey === true;
+          if (!id) { sendJson({ ok: false, error: 'id 不能为空' }, 400); return; }
+          if (id === String(cfg.dsh?.provider ?? '')) { sendJson({ ok: false, error: `${id} 是当前在用供应商，请先在「模型档案」里应用别家档案再删` }, 400); return; }
+          const usedByProfiles = Object.entries(cfg.dsh?.profiles ?? {}).filter(([, p]) => p?.provider === id).map(([name]) => name);
+          try {
+            let refToUnset = '';
+            for (let attempt = 1; attempt <= 2; attempt += 1) {
+              const { pick } = await describeDshSettings();
+              const ns = pick('llm-pi-ai');
+              refToUnset = String(ns?.value?.providers?.[id]?.apiKeyEnv ?? '');
+              try {
+                unwrap(await api.settings.mutate({ ns: 'llm-pi-ai', ops: [{ op: 'unset', path: ['providers', id] }], expectedRevision: ns?.revision }), 'settings.mutate');
+                break;
+              } catch (error) {
+                const msg = String(error?.message ?? error);
+                if (attempt < 2 && /conflict/i.test(msg)) continue;
+                sendJson({ ok: false, error: 'DSH 拒绝删除：' + msg }, 400);
+                return;
+              }
+            }
+            if (alsoKey && refToUnset) {
+              try { unwrap(await api.credentials.unset({ ref: refToUnset }), 'credentials.unset'); } catch { /* 密钥清理 best-effort */ }
+            }
+            log(`[panel] 供应商已删除：${id}${alsoKey && refToUnset ? '（连带清除密钥 ' + refToUnset + '）' : ''}`);
+            sendJson({ ok: true, warnings: usedByProfiles.length ? [`档案「${usedByProfiles.join('、')}」仍引用 ${id}，下次应用前请先改掉` ] : [] });
+          } catch (error) {
+            sendJson({ ok: false, error: '删除失败：' + (error?.message ?? error) }, 500);
+          }
+          return;
+        }
+
+        // A·密钥直写/清除（ref 形如 GMM_API_KEY；值只进 credentials，不回显）
+        if (req.method === 'POST' && url.pathname === '/api/panel/llm-key') {
+          const body = await readBody();
+          const ref = String(body.ref ?? '').trim();
+          if (!/^[A-Z][A-Z0-9_]{2,40}$/.test(ref)) { sendJson({ ok: false, error: '密钥名格式不对：大写字母开头，仅大写字母/数字/下划线（如 GMM_API_KEY）' }, 400); return; }
+          try {
+            if (body.clear === true) {
+              unwrap(await api.credentials.unset({ ref }), 'credentials.unset');
+              log(`[panel] 密钥已清除：${ref}`);
+              sendJson({ ok: true, cleared: true, ref });
+            } else {
+              const value = String(body.value ?? '').trim();
+              if (!value) { sendJson({ ok: false, error: '密钥值不能为空' }, 400); return; }
+              unwrap(await api.credentials.set({ ref, value }), 'credentials.set');
+              log(`[panel] 密钥已写入：${ref}（值不回显）`);
+              sendJson({ ok: true, set: true, ref });
+            }
+          } catch (error) {
+            sendJson({ ok: false, error: '密钥写入失败：' + (error?.message ?? error) }, 500);
+          }
+          return;
+        }
+
+        // A·模型自动发现：桥接直连 {baseURL}/models（DSH 2.0.5 无 discoverModels RPC）
+        if (req.method === 'POST' && url.pathname === '/api/panel/llm-discover') {
+          const body = await readBody();
+          const baseURL = String(body.baseURL ?? '').trim().replace(/\/+$/, '');
+          if (!/^https?:\/\//.test(baseURL)) { sendJson({ ok: false, error: 'BaseURL 必须以 http(s):// 开头' }, 400); return; }
+          let key = typeof body.apiKey === 'string' ? body.apiKey.trim() : '';
+          if (!key && body.ref) key = readCredentialValue(String(body.ref)) ?? '';
+          const t0 = Date.now();
+          try {
+            const r = await fetch(baseURL + '/models', {
+              headers: key ? { authorization: 'Bearer ' + key } : {},
+              signal: AbortSignal.timeout(10000)
+            });
+            if (!r.ok) {
+              const hint = r.status === 401 || r.status === 403 ? '（密钥无效或未填：密钥只存不回读，请在表单里粘一次再试）' : '';
+              sendJson({ ok: false, status: r.status, latencyMs: Date.now() - t0, error: `HTTP ${r.status}${hint}` });
+              return;
+            }
+            const j = await r.json().catch(() => ({}));
+            const list = Array.isArray(j?.data) ? j.data : (Array.isArray(j) ? j : []);
+            const ids = list.map((m) => String(m?.id ?? '')).filter(Boolean).slice(0, 200);
+            if (!ids.length) { sendJson({ ok: false, error: '接口通了但没解析到模型列表（非 OpenAI 格式？）' }); return; }
+            sendJson({ ok: true, models: ids, count: ids.length, latencyMs: Date.now() - t0 });
+          } catch (error) {
+            sendJson({ ok: false, error: '请求失败：' + (error?.message ?? error) });
+          }
+          return;
+        }
+
+        // A·连通测试：一发最小 chat/completions（表单值优先，未填则用已存供应商+密钥库的 key）
+        if (req.method === 'POST' && url.pathname === '/api/panel/llm-test') {
+          const body = await readBody();
+          let baseURL = String(body.baseURL ?? '').trim().replace(/\/+$/, '');
+          let key = typeof body.apiKey === 'string' ? body.apiKey.trim() : '';
+          let ref = String(body.ref ?? '').trim();
+          let model = String(body.model ?? '').trim();
+          const providerId = String(body.provider ?? '').trim();
+          if ((!baseURL || !model) && providerId) {
+            try {
+              const { pick } = await describeDshSettings();
+              const p = pick('llm-pi-ai')?.value?.providers?.[providerId];
+              if (p) {
+                baseURL = baseURL || String(p.baseURL || '').replace(/\/+$/, '');
+                ref = ref || String(p.apiKeyEnv || '');
+                model = model || String(p.models?.[0]?.id ?? '');
+              } else {
+                // 内置供应商：deepseek-official ← llm-deepseek ns（与 llm-ns 目录同一来源）
+                const nsDeep = pick('llm-deepseek');
+                const deepModels = Array.isArray(nsDeep?.value?.models) ? nsDeep.value.models : [];
+                if (deepModels.length && providerId === 'deepseek-official') {
+                  baseURL = baseURL || String(nsDeep.value.baseURL || 'https://api.deepseek.com').replace(/\/+$/, '');
+                  ref = ref || String(nsDeep.value.apiKeyEnv || 'DEEPSEEK_API_KEY');
+                  model = model || String(deepModels[0]?.id ?? '');
+                }
+              }
+            } catch { /* 目录读失败就按表单参数测 */ }
+          }
+          if (!key && ref) key = readCredentialValue(ref) ?? '';
+          if (!baseURL || !model) {
+            if (providerId && !baseURL) { sendJson({ ok: false, error: '该供应商没有直连 baseURL（账号内置路由走 DSH 通道，无法直测）' }, 400); return; }
+            sendJson({ ok: false, error: '缺 baseURL / model（该供应商也没配默认模型）' }, 400); return;
+          }
+          const t0 = Date.now();
+          try {
+            const r = await fetch(baseURL + '/chat/completions', {
+              method: 'POST',
+              headers: { 'content-type': 'application/json', ...(key ? { authorization: 'Bearer ' + key } : {}) },
+              body: JSON.stringify({ model, messages: [{ role: 'user', content: 'ping' }], max_tokens: 8, stream: false }),
+              signal: AbortSignal.timeout(20000)
+            });
+            const latencyMs = Date.now() - t0;
+            if (!r.ok) {
+              const hint = r.status === 401 || r.status === 403 ? '（密钥无效或未配置）' : r.status === 404 ? '（BaseURL 或模型名不对）' : r.status === 429 ? '（限流/额度）' : '';
+              sendJson({ ok: false, status: r.status, latencyMs, model, error: `HTTP ${r.status}${hint}` });
+              return;
+            }
+            const j = await r.json().catch(() => ({}));
+            const text = String(j?.choices?.[0]?.message?.content ?? '');
+            sendJson({ ok: true, latencyMs, model, replySnippet: text.slice(0, 60) || '(空回复但连通正常)' });
+          } catch (error) {
+            sendJson({ ok: false, latencyMs: Date.now() - t0, error: '请求失败：' + (error?.message ?? error) });
+          }
+          return;
+        }
+
+        // B·模型档案 CRUD：{name: {label, provider, model, reasoningEffort}} 存 config.json
+        if (req.method === 'POST' && url.pathname === '/api/panel/model-profile-save') {
+          const body = await readBody();
+          const name = String(body.name ?? '').trim();
+          const label = String(body.label ?? '').trim();
+          const provider = String(body.provider ?? '').trim();
+          const model = String(body.model ?? '').trim();
+          const effort = String(body.reasoningEffort ?? 'default').trim() || 'default';
+          if (!/^[\u4e00-\u9fff0-9A-Za-z_-]{1,16}$/.test(name)) { sendJson({ ok: false, error: '档案名 1-16 个字符（中文/字母/数字/_/-）' }, 400); return; }
+          if (!provider || !model) { sendJson({ ok: false, error: 'provider / model 不能为空' }, 400); return; }
+          cfg.dsh.profiles = { ...(cfg.dsh.profiles ?? {}), [name]: { label: label || name, provider, model, reasoningEffort: effort } };
+          try {
+            const configFile = path.join(ROOT, 'config.json');
+            const file = readJsonSafe(configFile, null, true) ?? {};
+            file.dsh = { ...(file.dsh ?? {}), profiles: cfg.dsh.profiles };
+            fs.writeFileSync(configFile, JSON.stringify(file, null, 2) + '\n');
+          } catch (error) { sendJson({ ok: false, error: '保存失败：' + (error?.message ?? error) }, 500); return; }
+          log(`[panel] 模型档案已保存：${name} -> ${provider}/${model}（effort=${effort}）`);
+          sendJson({ ok: true, name });
+          return;
+        }
+
+        if (req.method === 'POST' && url.pathname === '/api/panel/model-profile-delete') {
+          const body = await readBody();
+          const name = String(body.name ?? '').trim();
+          if (!name || !cfg.dsh?.profiles?.[name]) { sendJson({ ok: false, error: '档案不存在：' + (name || '(空)') }, 404); return; }
+          const rest = { ...cfg.dsh.profiles };
+          delete rest[name];
+          cfg.dsh.profiles = rest;
+          if (cfg.dsh.activeProfile === name) cfg.dsh.activeProfile = null;
+          try {
+            const configFile = path.join(ROOT, 'config.json');
+            const file = readJsonSafe(configFile, null, true) ?? {};
+            file.dsh = { ...(file.dsh ?? {}), profiles: rest };
+            if (file.dsh.activeProfile === name) delete file.dsh.activeProfile;
+            fs.writeFileSync(configFile, JSON.stringify(file, null, 2) + '\n');
+          } catch (error) { sendJson({ ok: false, error: '保存失败：' + (error?.message ?? error) }, 500); return; }
+          log(`[panel] 模型档案已删除：${name}`);
+          sendJson({ ok: true, name });
+          return;
+        }
+
+        // B·档案热切换：写默认配置 + 清应用标记 + 全部会话（含记忆/黑话两个内部会话）重跑 selectModel
+        if (req.method === 'POST' && url.pathname === '/api/panel/model-profile-apply') {
+          const body = await readBody();
+          const name = String(body.name ?? '').trim();
+          const profile = cfg.dsh?.profiles?.[name];
+          if (!profile) { sendJson({ ok: false, error: '档案不存在：' + (name || '(空)') }, 404); return; }
+          const provider = String(profile.provider ?? '').trim();
+          const model = String(profile.model ?? '').trim();
+          const effort = String(profile.reasoningEffort ?? 'default').trim() || 'default';
+          cfg.dsh.provider = provider;
+          cfg.dsh.model = model;
+          cfg.dsh.reasoningEffort = effort;
+          cfg.dsh.activeProfile = name;
+          try {
+            const configFile = path.join(ROOT, 'config.json');
+            const file = readJsonSafe(configFile, null, true) ?? {};
+            file.dsh = { ...(file.dsh ?? {}), provider, model, reasoningEffort: effort, activeProfile: name };
+            fs.writeFileSync(configFile, JSON.stringify(file, null, 2) + '\n');
+          } catch (error) { sendJson({ ok: false, error: '配置保存失败：' + (error?.message ?? error) }, 500); return; }
+          modelAppliedSessions.clear();
+          const targets = [...Object.values(state.sessions ?? {})];
+          if (memorySessionId) targets.push(memorySessionId);
+          if (slangLearnerSessionId) targets.push(slangLearnerSessionId);
+          const uniq = [...new Set(targets.filter(Boolean))];
+          let hot = 0;
+          const failedSessions = [];
+          for (const sid of uniq) {
+            await ensureChatModel(sid);
+            if (modelAppliedSessions.has(sid)) hot += 1; else failedSessions.push(sid);
+          }
+          // C3 预警：供应商不在目录 / 密钥未配置 → 前端红字展示
+          const warnings = [];
+          try {
+            const { pick } = await describeDshSettings();
+            const p = pick('llm-pi-ai')?.value?.providers?.[provider];
+            if (p) {
+              const ref = String(p.apiKeyEnv || '');
+              if (ref) {
+                const cred = await describeCredentials([ref]);
+                if (!cred[ref]?.configured) warnings.push(`供应商 ${provider} 的密钥（${ref}）未配置，模型调用会失败`);
+              }
+            } else if (provider !== 'deepseek-official' && provider !== 'assistant-official') {
+              warnings.push(`供应商 ${provider} 不在 DSH 供应商目录里，模型选择可能被拒`);
+            }
+          } catch { /* 预警 best-effort */ }
+          log(`[panel] 档案「${name}」已应用：${provider}/${model}（effort=${effort}），热切换 ${hot}/${uniq.length} 个会话`);
+          sendJson({
+            ok: true,
+            applied: { name, provider, model, reasoningEffort: effort },
+            sessionsTotal: uniq.length,
+            sessionsHot: hot,
+            failedSessions,
+            warnings
+          });
+          return;
+        }
+
+        // C2·网页搜索密钥：settings secret 槽 write-only，只设不清
+        if (req.method === 'POST' && url.pathname === '/api/panel/web-search-key') {
+          const body = await readBody();
+          const value = String(body.value ?? '').trim();
+          if (!value) { sendJson({ ok: false, error: '密钥不能为空' }, 400); return; }
+          try {
+            unwrap(await api.settings.update({ ns: 'web-search-deepseek', patch: { apiKey: value } }), 'settings.update');
+            log('[panel] web-search-deepseek 密钥已写入（值不回显）');
+            sendJson({ ok: true });
+          } catch (error) {
+            sendJson({ ok: false, error: '写入失败：' + (error?.message ?? error) }, 500);
+          }
           return;
         }
 
@@ -10140,6 +10581,40 @@ async function main() {
     }
   }
 
+  // 面板·C4 模型用量记账：每个回合（turn/end）落一行 {time,key,provider,model}。
+  // DSH 2.0.5 事件流不暴露 token 用量，如实用「回合数」做成本观测，不假装有 token 数。
+  function readModelUsage(limit = 5000) {
+    try {
+      const raw = fs.readFileSync(MODEL_USAGE_FILE, 'utf8');
+      const lines = raw.split('\n').filter(Boolean);
+      const parsed = [];
+      for (const line of lines.slice(-Math.max(1, Math.min(20000, Number(limit) || 5000)))) {
+        try { parsed.push(JSON.parse(line)); } catch {}
+      }
+      return parsed;
+    } catch {
+      return [];
+    }
+  }
+
+  function appendModelUsage(entry) {
+    try {
+      fs.mkdirSync(STATE_DIR, { recursive: true });
+      fs.appendFileSync(MODEL_USAGE_FILE, JSON.stringify({
+        time: entry.time || new Date().toISOString(),
+        key: entry.key, provider: entry.provider, model: entry.model
+      }) + '\n', 'utf8');
+      // 与工具日志同样的防膨胀：保留最近 20000 行（按回合计，一天几百回合也够用近两个月）。
+      const raw = fs.readFileSync(MODEL_USAGE_FILE, 'utf8');
+      const lines = raw.split('\n');
+      if (lines.length > 20000) {
+        fs.writeFileSync(MODEL_USAGE_FILE, lines.slice(-20000).join('\n') + '\n', 'utf8');
+      }
+    } catch {
+      // 记账失败不影响主流程
+    }
+  }
+
   const SENSITIVE_ARG_KEYS = new Set(['token', 'authorization', 'password', 'passwd', 'secret', 'apikey', 'api_key', 'accesskey', 'access_key', 'accesstoken', 'access_token', 'cookie', 'session', 'privatekey', 'private_key', 'clientsecret', 'client_secret', 'refreshtoken', 'refresh_token', 'x-agent-token', 'x_agent_token']);
   function redactSensitive(obj) {
     if (Array.isArray(obj)) return obj.map(redactSensitive);
@@ -11663,6 +12138,9 @@ async function main() {
             collectors.set(frame.sessionId, collector);
             const ended = collector.push(frame.event);
             if (ended) {
+              // 面板·C4 模型用量记账：每个映射会话的 turn 都过这里（含静默投喂 turn）。
+              // token 数 DSH 2.0.5 事件流不暴露，只记回合数——诚实不假装。
+              appendModelUsage({ time: new Date().toISOString(), key: key ?? null, provider: String(cfg.dsh?.provider ?? ''), model: String(cfg.dsh?.model ?? '') });
               // reserved2 无行动兜底：普通唤醒回合若既没发消息、也没 mark_read / set_wake_config，
               // 则累计 noActionCount；达到阈值后自动重置 WakeConfig，避免 AI 卡死。
               const silentQueueNow = social.silentTurns.get(frame.sessionId) ?? [];
