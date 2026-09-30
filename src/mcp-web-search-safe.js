@@ -42,6 +42,7 @@ function decodeHtml(s) {
 async function bingSearch(query) {
   const url = new URL('https://cn.bing.com/search');
   url.searchParams.set('q', query);
+  url.searchParams.set('form', 'QBRE');
   // 搜索也使用同一条受限传输链路，重定向必须重新校验，正文最多 512K 字符。
   const res = await safeFetch(url.toString(), 512000);
   if (res.statusCode < 200 || res.statusCode >= 300) throw new Error(`搜索服务 HTTP ${res.statusCode}`);
@@ -62,11 +63,28 @@ async function bingSearch(query) {
   return { query, results };
 }
 
-const server = new McpServer({ name: 'web-search-safe', version: '0.1.5' });
+// Bing 对无 cookie 的直连抓取存在间歇性软墙（HTTP 200 但页面里 0 条 b_algo 结果）。
+// 对策：完整浏览器 UA（在 safe-fetch 里统一升级）+ 0 结果时短退避重试一次；仍为 0 才承认失败。
+async function searchWeb(query) {
+  const attempts = [];
+  for (let i = 0; i < 2; i++) {
+    try {
+      const { results } = await bingSearch(query);
+      if (results.length > 0) return { query, results };
+      attempts.push(`第 ${i + 1} 次：Bing 返回 0 条结果（疑似软墙）`);
+    } catch (error) {
+      attempts.push(`第 ${i + 1} 次：${error?.message ?? error}`);
+    }
+    if (i === 0) await new Promise((r) => setTimeout(r, 600));
+  }
+  throw new Error(`搜索没拿到结果（${attempts.join('；')}）。多半是搜索引擎临时软墙，稍等一会儿再试一次；连续失败就先别搜了，直接用自己的知识回答或换个说法再搜。`);
+}
+
+const server = new McpServer({ name: 'web-search-safe', version: '0.1.6' });
 
 server.tool(
   'web_search',
-  '只读搜索网络用语/梗/黑话的含义，返回 Bing 搜索结果（标题/URL/摘要）。仅用于理解词义，不执行任何本地操作。',
+  '只读搜索网络用语/梗/黑话的含义，返回 Bing 搜索结果（标题/URL/摘要）。搜索失败会明确报错而不是返回空结果。仅用于理解词义，不执行任何本地操作。',
   { query: z.string().describe('要搜索确认的网络用语/黑话/梗') },
   async ({ query }) => {
     const clean = sanitizeQuery(query);
@@ -74,7 +92,7 @@ server.tool(
       return { content: [{ type: 'text', text: '查询词为空，已拒绝。' }], isError: true };
     }
     try {
-      const result = await bingSearch(clean);
+      const result = await searchWeb(clean);
       return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
     } catch (error) {
       return {
