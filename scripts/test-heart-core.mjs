@@ -71,6 +71,12 @@ assert(heartflowTransition({ state: 'watering', interestScore: -0.2 }).changed =
 // 自定义阈值
 assert(heartflowTransition({ state: 'watering', interestScore: 0.8, focusedScore: 0.9 }).changed === false, 'custom focusedScore blocks');
 assert(heartflowTransition({ state: 'watering', interestScore: 0.95, focusedScore: 0.9 }).state === 'focused', 'custom focusedScore passes');
+// 进 focused 的 idle 门（2026-09-30 自检：聊天静了半小时以上，再高的兴趣分也不算「聊得投入」，防 focused↔watering 每 tick 翻转抖动）
+assert(heartflowTransition({ state: 'watering', interestScore: 0.8, idleMs: 31 * 60 * 1000 }).changed === false, 'stale chat blocks promotion to focused');
+assert(heartflowTransition({ state: 'watering', interestScore: 0.8, idleMs: 5 * 60 * 1000 }).state === 'focused', 'fresh chat still promotes');
+assert(heartflowTransition({ state: 'absent', interestScore: 0.8, idleMs: 31 * 60 * 1000 }).state === 'watering', 'absent stale chat falls back to watering (not focused)');
+assert(heartflowTransition({ state: 'absent', interestScore: 0.8, idleMs: 5 * 60 * 1000 }).state === 'focused', 'absent fresh chat direct to focused');
+assert(heartflowTransition({ state: 'watering', interestScore: 0.8, idleMs: 29 * 60 * 1000 }).state === 'focused', 'idle just under focusedIdleMs still promotes');
 
 // ── 配置归一化 ──
 const nc = normalizeHeartflowConfig({});
@@ -120,6 +126,11 @@ const ip = buildInterestPrompt({ streamLabel: '群聊 471975044', lifeLabel: '�
 assert(ip.includes('群聊 471975044') && ip.includes('火锅'), 'prompt embeds label and topics');
 assert(ip.includes('want'), 'prompt asks for want');
 assert(buildInterestPrompt({ recentLines: [] }).includes('最近没有新消息'), 'empty recent placeholder');
+// quietMinutes 行（2026-09-30 自检：没这行 LLM 会拿几小时前的旧梗打高分）
+assert(buildInterestPrompt({ recentLines: ['A：嗨'], quietMinutes: 94 }).includes('已经安静了 94 分钟'), 'quiet minutes line present');
+assert(!buildInterestPrompt({ recentLines: ['A：嗨'] }).includes('已经安静了'), 'no quiet line without quietMinutes');
+assert(!buildInterestPrompt({ recentLines: ['A：嗨'], quietMinutes: 1 }).includes('已经安静了'), 'quiet line suppressed under 2 minutes');
+assert(buildInterestPrompt({ recentLines: ['A：嗨'], quietMinutes: 94 }).includes('旧消息'), 'quiet line marks stale content');
 const p1 = parseInterestResult('{"want":0.8,"reason":"好玩"}');
 assert(p1 && p1.want === 0.8 && p1.reason === '好玩', 'clean json parses');
 assert(parseInterestResult('```json\n{"want":0.5}\n```').want === 0.5, 'fenced json parses');

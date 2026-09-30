@@ -3706,7 +3706,9 @@ async function main() {
             st.lastActionAt = now;
             st.wakeConfig.noActionCount = 0;
             // 说话本身就是消耗：统一发送路由（她最常用）以前不碰心情/精力，补上。
-            bumpPersonaState(key, messages.length > 1 && sentMessages.length > 1 ? ['chat', 'burst'] : ['chat']);
+            // 注意只记 chat：burst 是「被别人刷屏」的惩罚，不能用在出站——她天然分 2-3 条说话，
+            // 老写法每次回复扣 -8（chat-2 + burst-6），聊一早上精力就归零（2026-09-30 实测 70→0.5）。
+            bumpPersonaState(key, ['chat']);
             saveSocialV2State();
             log(`[reserved2] 工具分条发送 ${key}: 成功 ${sentMessages.length}/${messages.length} 条`);
             appendActivity(`${key} [reserved2] 工具分条发送：成功 ${sentMessages.length}/${messages.length} 条`);
@@ -3867,8 +3869,8 @@ async function main() {
             st.lastAiReplyAt = now;
             st.lastActionAt = now;
             st.wakeConfig.noActionCount = 0;
-            // 同 /api/socialV2/send-burst：说话要真的影响她的心情/精力。
-            bumpPersonaState(key, messages.length > 1 && sentMessages.length > 1 ? ['chat', 'burst'] : ['chat']);
+            // 同 /api/socialV2/send-burst：说话要真的影响她的心情/精力（只记 chat，burst 留给「被刷屏」语义）。
+            bumpPersonaState(key, ['chat']);
             saveSocialV2State();
             log(`[reserved2] 工具统一发送 ${key}: 成功 ${sentMessages.length}/${messages.length} 条`);
             appendActivity(`${key} [reserved2] 工具统一发送：成功 ${sentMessages.length}/${messages.length} 条`);
@@ -7136,8 +7138,9 @@ async function main() {
             st.lastAiReplyAt = now;
             st.lastActionAt = now;
             st.wakeConfig.noActionCount = 0;
-            // 阶段 2：她开口了 → 心情/精力按事件走（分条多发算一次 burst）。
-            bumpPersonaState(key, parts.length > 1 && sentMessages.length > 1 ? ['chat', 'burst'] : ['chat']);
+            // 阶段 2：她开口了 → 心情/精力按事件走（只记 chat：burst 是「被刷屏」惩罚，出站误用会把她自己的
+            // 分条风格变成每回复 -8 精力，一早上就能归零——见 2026-09-30 自检）。
+            bumpPersonaState(key, ['chat']);
             saveSocialV2State();
             log(`[send] ${url.pathname} ${key}: 成功 ${sentMessages.length}/${parts.length} 条`);
             appendActivity(`${key} [send] 成功 ${sentMessages.length}/${parts.length} 条：${message.slice(0, 80)}`);
@@ -12197,7 +12200,11 @@ async function main() {
         .filter((m) => m && !m.isSelf)
         .slice(-(Number(cfg.heart?.interest?.maxMessages) || 20))
         .map((m) => `${String(m.sender || '未知')}：${String(m.plain || m.text || '').slice(0, 100)}`);
-      const prompt = buildInterestPrompt({ streamLabel: key, lifeLabel, recentLines: recent, planTopics });
+      // 把「聊天静了多久」喂给判断器：没有这行，LLM 会拿几小时前的旧梗给高分。
+      const quietMinutes = st.lastIncomingAt
+        ? Math.min(240, Math.max(0, Math.round((Date.now() - Number(st.lastIncomingAt)) / 60000)))
+        : null;
+      const prompt = buildInterestPrompt({ streamLabel: key, lifeLabel, recentLines: recent, planTopics, quietMinutes });
       await api.sessions.prompt({ sessionId, mode: 'queue', content: [{ type: 'text', text: prompt }] });
       const text = await waitLearnerTurn(sessionId, Number(cfg.heart?.interest?.timeoutMs) || 60000);
       const parsed = parseInterestResult(text);
@@ -12426,6 +12433,19 @@ async function main() {
       // 鲸鲸 2.0 B1：生活状态机接管作息——睡眠不主动开口，摸鱼降频一半
       if (heartEnabled()) {
         const lifeState = heartLifeNow().state;
+        // 睡醒恢复：状态机从睡眠切回清醒 → 精力回一大截（bump 后 updatedAtMs=now，条件自锁存不会重复触发；
+        // 含重启补判：只要 persona 的最后更新还落在睡眠窗内，醒来第一个 tick 就能补上）。
+        // 修的是「精力半衰期 4h 恢复太慢」：昨晚被 drain 到 0.5 的精力要 ~21h 才回到 50，整个上午全被
+        // minEnergy=20 挡死。加 wakeRest 之后「睡一觉就回来了」才真正成立。
+        try {
+          const ps = getPersonaState();
+          const lastAt = Number(ps.updatedAtMs) || 0;
+          if (lifeState !== 'sleeping' && lastAt && heartLifeNow(lastAt).state === 'sleeping') {
+            bumpPersonaState('', ['wakeRest']);
+            saveSocialV2State();
+            log('[persona-state] 睡醒恢复：精力回了 50（wakeRest）');
+          }
+        } catch { /* 睡醒恢复绝不影响主链路 */ }
         if (lifeState === 'sleeping') return skip('生活状态：睡眠');
         if (lifeState === 'slacking' && Math.random() < 0.5) return skip('生活状态：摸鱼降频');
       }
@@ -12534,7 +12554,9 @@ async function main() {
     if (heartEnabled()) {
       const hfc = heartflowCfg();
       const fresh = interest && nowMs - Number(interest.at) < hfc.evalThrottleMs;
-      if (!fresh && (activity > 0 || heartflowStateOf(st) !== 'absent')) {
+      // 只有「上次评估之后来了新消息」才值得重新评估：对同一批旧消息反复打分只会翻出老梗、白烧模型。
+      const hasNew = (Number(st.lastIncomingAt) || 0) > (Number(interest?.at) || 0);
+      if (!fresh && hasNew && (activity > 0 || heartflowStateOf(st) !== 'absent')) {
         const evaluated = await runInterestEvalV2(key, st, { lifeLabel: lifeFx.label });
         if (evaluated) interest = evaluated;
       }

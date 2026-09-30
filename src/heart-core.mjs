@@ -92,14 +92,16 @@ export function heartflowTransition({ state, silentCount = 0, idleMs = 0, intere
     return { state: cur, changed: false, reason: '' };
   }
   if (cur === 'watering') {
-    if (want != null && want >= c.focusedScore && focusedCount < c.focusedCap) {
+    // 进 focused 必须有近期动静（与退出超时对称）：聊天都静了半小时以上，再高的兴趣分也不算「聊得投入」，
+    // 否则会 focused↔watering 每 tick 翻转抖动（陈旧上下文给高分 → idle 超时退回 → 又给高分）。
+    if (want != null && want >= c.focusedScore && focusedCount < c.focusedCap && Number(idleMs) < c.focusedIdleMs) {
       return { state: 'focused', changed: true, reason: `兴趣 ${want.toFixed(2)}，且专注名额未满` };
     }
     if (silent >= c.silentToAbsent) return { state: 'absent', changed: true, reason: `连续静默 ${silent} 次` };
     return { state: cur, changed: false, reason: '' };
   }
   // absent：只有兴趣评估够高才重新进入（消息来了但她不想看就继续 absent）
-  if (want != null && want >= c.focusedScore && focusedCount < c.focusedCap) {
+  if (want != null && want >= c.focusedScore && focusedCount < c.focusedCap && Number(idleMs) < c.focusedIdleMs) {
     return { state: 'focused', changed: true, reason: `兴趣 ${want.toFixed(2)}，直接投入` };
   }
   if (want != null && want >= c.reentryScore) {
@@ -135,13 +137,16 @@ export function topicMatchScore(recentText = '', topics = []) {
 
 // ── B4 兴趣评估 LLM 的 prompt 与解析 ────────────────────────────────────────
 
-export function buildInterestPrompt({ streamLabel = '这个聊天', lifeLabel = '', recentLines = [], planTopics = [] }) {
+export function buildInterestPrompt({ streamLabel = '这个聊天', lifeLabel = '', recentLines = [], planTopics = [], quietMinutes = null }) {
   const lines = (Array.isArray(recentLines) ? recentLines : []).slice(-20)
     .map((l) => String(l || '').slice(0, 120)).join('\n') || '（最近没有新消息）';
   const topicLine = (Array.isArray(planTopics) && planTopics.length)
     ? `她今天的计划里有这些话题：${planTopics.slice(0, 5).map((t) => String(t).slice(0, 20)).join('；')}\n`
     : '';
-  return `你是她的「心流判断器」：只判断她现在想不想参与下面这个聊天，不写台词。\n\n【她的设定】活泼、爱接梗的女仆型 AI 伙伴（哦鲸鲸），有自己的兴趣和情绪，不是客服。\n${lifeLabel ? `【她的生活状态】${lifeLabel}\n` : ''}${topicLine}【聊天：${streamLabel} 的最近内容】\n${lines}\n\n【判断】结合聊天内容与她的性格，给她此刻「想参与这个聊天」的程度打分。\n只输出一行 JSON（不要围栏、不要解释）：{"want": 0到1的小数, "reason": "不超过12字的原因"}\nwant≥0.75 表示很投入；0.5~0.75 随便看看；<0.5 暂时不想参与。`;
+  const quietLine = Number.isFinite(Number(quietMinutes)) && Number(quietMinutes) > 2
+    ? `这个聊天已经安静了 ${Math.round(Number(quietMinutes))} 分钟（下面是旧消息，不是刚发生的）。\n`
+    : '';
+  return `你是她的「心流判断器」：只判断她现在想不想参与下面这个聊天，不写台词。\n\n【她的设定】活泼、爱接梗的女仆型 AI 伙伴（哦鲸鲸），有自己的兴趣和情绪，不是客服。\n${lifeLabel ? `【她的生活状态】${lifeLabel}\n` : ''}${topicLine}${quietLine}【聊天：${streamLabel} 的最近内容】\n${lines}\n\n【判断】结合聊天内容与她的性格，给她此刻「想参与这个聊天」的程度打分。安静了很久的聊天不该给高分，除非话题她特别惦记。\n只输出一行 JSON（不要围栏、不要解释）：{"want": 0到1的小数, "reason": "不超过12字的原因"}\nwant≥0.75 表示很投入；0.5~0.75 随便看看；<0.5 暂时不想参与。`;
 }
 
 export function parseInterestResult(text) {

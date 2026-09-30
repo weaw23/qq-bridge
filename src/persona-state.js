@@ -35,6 +35,7 @@ export const STATE_EVENTS = Object.freeze({
   lateNight: Object.freeze({ mood: -2, energy: -10, why: '熬夜' }),
   burst: Object.freeze({ mood: -3, energy: -6, why: '被连着刷屏' }),
   quietHour: Object.freeze({ mood: 1, energy: 6, why: '安静一小时' }),
+  wakeRest: Object.freeze({ mood: 4, energy: 50, why: '睡醒了（一夜好眠）' }),
   error: Object.freeze({ mood: -6, energy: -4, why: '工具报错/被拒绝' })
 });
 

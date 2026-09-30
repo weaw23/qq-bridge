@@ -219,5 +219,17 @@ section('T9 与其它模块的契合（别互相打架）');
   check('T9.3 状态层的输出不含出站审计相关字样（不会绕过 sensitive/guard）', !/令牌|token|白名单/.test(renderStateLine({ mood: 40, energy: 30 })));
 }
 
+section('T10 睡醒恢复 wakeRest（2026-09-30 自检：精力半衰期 4h，被 drain 到 ~0 要一上午才回 20，补上「睡一觉就回来了」）');
+{
+  check('T10.1 事件表里有 wakeRest 且大幅回精力', (STATE_EVENTS.wakeRest?.energy ?? 0) >= 40, JSON.stringify(STATE_EVENTS.wakeRest));
+  const justDrained = applyEvents({ mood: 30, energy: 0.5, updatedAtMs: T0 }, [{ type: 'wakeRest', at: T0 + 5 * 60000 }]);
+  check('T10.2 刚被 drain 完就睡醒（5 分钟后）→ 精力过 50（远超 20 的开口闸门）', justDrained.energy >= 50, `energy=${justDrained.energy}`);
+  check('T10.3 心情小幅回升', justDrained.mood >= 34, `mood=${justDrained.mood}`);
+  const slept = applyEvents({ mood: 20, energy: 2, updatedAtMs: T0 }, [{ type: 'wakeRest', at: T0 + 6 * H }]);
+  check('T10.4 整夜 6h 后 wakeRest → 精力接近满（先衰减再 +50，封顶 100）', slept.energy >= 90 && slept.energy <= 100, `energy=${slept.energy}`);
+  check('T10.5 updatedAtMs 前移（自锁存，不会重复触发）', slept.updatedAtMs === T0 + 6 * H);
+  check('T10.6 已是高精力时 wakeRest 不越界（夹到 100）', applyEvents({ mood: 90, energy: 95, updatedAtMs: T0 }, [{ type: 'wakeRest', at: T0 }]).energy === 100);
+}
+
 console.log(`\n═══ 汇总：通过 ${pass} / 失败 ${fail} / 跳过 ${skip} ═══`);
 if (fail > 0) process.exitCode = 1;
