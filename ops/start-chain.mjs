@@ -19,7 +19,7 @@ const ROOT = 'D:\\qqbot\\qq-bridge';
 const LOGS = 'D:\\qqbot\\logs';
 const SNOW_DIR = 'D:\\qqbot\\SnowLuma';
 const DSH_EXE = 'D:\\DSH Desktop 2.0.5\\DSH Desktop.exe';
-const EXPECT_UIN = '3835811547';            // 哦鲸鲸二号机
+const EXPECT_UIN = '3692140164';            // 哦鲸鲸一号机（2026-09-30 解封回归；3835811547 二号机为过渡备用）
 const SNOW_TOKEN_FILE = path.join(ROOT, '.snowluma-token');
 const CONSOLE_TOKEN_FILE = path.join(ROOT, 'state', 'console-token');
 const LOCK_FILE = path.join(ROOT, 'state', 'bridge.lock');
@@ -138,7 +138,7 @@ step(3, `校验 hook 到的账号是否为鲸鲸号 ${EXPECT_UIN}`);
 li = await onebot('get_login_info');
 if (li?.retcode !== 0) {
   bad(`网关未返回登录信息（retcode=${li?.retcode ?? '无响应'}）`);
-  console.log('\n    多半是 QQ 客户端没登录。请先在 QQ 里登录 3835811547（哦鲸鲸二号机），再重跑本脚本。');
+  console.log('\n    多半是 QQ 客户端没登录。请先在 QQ 里登录 3692140164（哦鲸鲸一号机），再重跑本脚本。');
   die(1);
 }
 const uin = String(li.data?.user_id ?? '');
