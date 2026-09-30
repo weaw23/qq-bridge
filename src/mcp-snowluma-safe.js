@@ -1904,6 +1904,85 @@ if (cfg.socialV2?.tools?.personProfile !== false) {
 }
 
 
+// ── 鲸鲸 2.0 B5 元工具：目标队列 / 自我调参 / 内状态自省 ──────────────
+if (cfg.socialV2?.tools?.goal !== false) {
+  server.tool(
+    'qq_goal',
+    '管理她自己的目标队列（跨天跟踪想做的事）：list 看全部 / add 建新目标 / done 完成 / abandon 放弃（写句原因）/ note 记进展。',
+    {
+      key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
+      token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
+      action: z.string().describe('list | add | done | abandon | note'),
+      id: z.number().optional().describe('action=done/abandon/note 时：目标 id'),
+      text: z.string().optional().describe('action=add 时：目标内容（≤60 字）'),
+      drive: z.string().optional().describe('action=add 时：curiosity | sociability | care（默认 curiosity）'),
+      note: z.string().optional().describe('action=done/abandon/note 时：一句话原因或进展（≤80 字）')
+    },
+    async ({ key, token, action, id, text, drive, note }) => {
+      try {
+        const body = { key, token, action };
+        if (id != null) body.id = id;
+        if (text != null) body.text = text;
+        if (drive != null) body.drive = drive;
+        if (note != null) body.note = note;
+        const data = await agentApi('/api/socialV2/goal', { method: 'POST', body: JSON.stringify(body), headers: { 'x-agent-token': token }, timeoutMs: 60000 });
+        return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
+      } catch (error) {
+        return { content: [{ type: 'text', text: '目标操作失败：' + (error?.message ?? error) }], isError: true };
+      }
+    }
+  );
+}
+
+if (cfg.socialV2?.tools?.selfAdjust !== false) {
+  server.tool(
+    'qq_self_adjust',
+    '微调自己的主动节奏参数（get 看当前生效值 / set 修改）。有硬边界：probability 0.05~0.95、quotaPerDayGroup/Private 5~100、idleThresholdMs 60000~1800000（1~30 分钟）。感觉太吵/太安静时用它。',
+    {
+      key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
+      token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
+      action: z.string().describe('get | set'),
+      probability: z.number().optional().describe('action=set 时：主动冒泡概率（0.05~0.95）'),
+      quotaPerDayGroup: z.number().optional().describe('action=set 时：群聊每日主动上限（5~100）'),
+      quotaPerDayPrivate: z.number().optional().describe('action=set 时：私聊每日主动上限（5~100）'),
+      idleThresholdMs: z.number().optional().describe('action=set 时：安静多久才算“空闲可开口”（60000~1800000 毫秒）')
+    },
+    async ({ key, token, action, probability, quotaPerDayGroup, quotaPerDayPrivate, idleThresholdMs }) => {
+      try {
+        const body = { key, token, action };
+        if (probability != null) body.probability = probability;
+        if (quotaPerDayGroup != null) body.quotaPerDayGroup = quotaPerDayGroup;
+        if (quotaPerDayPrivate != null) body.quotaPerDayPrivate = quotaPerDayPrivate;
+        if (idleThresholdMs != null) body.idleThresholdMs = idleThresholdMs;
+        const data = await agentApi('/api/socialV2/self-adjust', { method: 'POST', body: JSON.stringify(body), headers: { 'x-agent-token': token }, timeoutMs: 60000 });
+        return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
+      } catch (error) {
+        return { content: [{ type: 'text', text: '自我调参失败：' + (error?.message ?? error) }], isError: true };
+      }
+    }
+  );
+}
+
+if (cfg.socialV2?.tools?.requestState !== false) {
+  server.tool(
+    'qq_request_state',
+    '看自己的内状态：生活状态（睡眠/摸鱼/正常/专注）、心流三态、今日计划、目标队列、主动配额余量、唤醒配置。想弄清“我现在是什么状态/今天想干嘛”就用它。',
+    {
+      key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
+      token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）')
+    },
+    async ({ key, token }) => {
+      try {
+        const body = { key, token };
+        const data = await agentApi('/api/socialV2/request-state', { method: 'POST', body: JSON.stringify(body), headers: { 'x-agent-token': token }, timeoutMs: 60000 });
+        return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
+      } catch (error) {
+        return { content: [{ type: 'text', text: '内状态查询失败：' + (error?.message ?? error) }], isError: true };
+      }
+    }
+  );
+}
+
 if (cfg.socialV2?.tools?.help !== false) {
   server.tool(
     'qq_help',

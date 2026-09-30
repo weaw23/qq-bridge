@@ -25,6 +25,9 @@
     "test:plugin": "node scripts/test-qq-mode-plugin.mjs",
     "test:setup-idempotent": "node scripts/test-setup-dsh-idempotent.mjs",
     "test:mux-reconnect": "node scripts/test-mux-reconnect.mjs",
+    "test:memory-v2": "node scripts/test-memory-v2.mjs",
+    "test:heart-core": "node scripts/test-heart-core.mjs",
+    "test:goals-core": "node scripts/test-goals-core.mjs",
     "probe:events": "node scripts/probe-events.mjs",
     "probe:tools": "node scripts/probe-tools.mjs",
     "postinstall": "node scripts/patch-snowluma-sdk.mjs"

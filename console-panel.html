@@ -187,6 +187,35 @@
     </div>
   </div>
 
+  <!-- 鲸鲸 2.0：心核 · 今日计划 · 目标 -->
+  <div class="card wide" id="heartCard">
+    <h2>心核 · 今日计划 · 目标</h2>
+    <div class="btns" style="margin-bottom:10px">
+      <button class="sm" onclick="refreshHeart(true)">⟳ 刷新</button>
+      <span class="muted" style="align-self:center" id="heartAt">读取中…</span>
+      <span class="pills" id="heartflowChips" style="margin-left:auto"></span>
+    </div>
+    <div id="heartBody"><div class="muted">读取中…</div></div>
+    <div class="sep"></div>
+    <div class="rowstack">
+      <div class="lbl">主动性档位<span class="hint">一键切三档：写自校准覆盖（落盘重启保留），她仍可用 qq_self_adjust 微调</span></div>
+      <div class="ctl">
+        <button class="sm" id="tier-conservative" onclick="setTier('conservative')">🐢 保守（p=0.25 群12/天）</button>
+        <button class="sm" id="tier-standard" onclick="setTier('standard')">🙂 标准（p=0.45 群25/天）</button>
+        <button class="sm" id="tier-bold" onclick="setTier('bold')">🔥 大胆（p=0.65 群40/天）</button>
+        <span class="muted" id="selfAdjustInfo" style="align-self:center"></span>
+      </div>
+    </div>
+    <div class="rowstack">
+      <div class="lbl">记忆检修（A9）<span class="hint">作废过期事实 / 合并近似 / 淘汰老旧情节（夜间 1 点自动跑，这里可手动）</span></div>
+      <div class="ctl">
+        <button class="sm" onclick="maintainNow()">🧹 立即检修</button>
+        <button class="sm" onclick="showTab('memoryV2')">📚 记忆账本</button>
+        <span class="muted" id="memoryV2Info" style="align-self:center"></span>
+      </div>
+    </div>
+  </div>
+
   <!-- 状态总览 -->
   <div class="card">
     <h2>状态总览</h2>
@@ -520,7 +549,7 @@ async function setToggle(path, value) {
   catch (e) { toast('失败：' + e.message, true); refresh(); }
 }
 
-const TABS = [['affinity', '好感度'], ['facts', '长期记忆'], ['followups', '待跟进'], ['reminders', '定时提醒'], ['activity', '最近活动'], ['tool-log', '工具日志'], ['slang', '黑话库'], ['expressions', '表达库'], ['feedback', '她的反馈']];
+const TABS = [['affinity', '好感度'], ['facts', '长期记忆'], ['memoryV2', '记忆账本2.0'], ['followups', '待跟进'], ['reminders', '定时提醒'], ['activity', '最近活动'], ['tool-log', '工具日志'], ['slang', '黑话库'], ['expressions', '表达库'], ['feedback', '她的反馈']];
 let curTab = 'affinity';
 function renderTabs() {
   $('tabs').innerHTML = TABS.map(([k, n]) => `<div class="tab ${k === curTab ? 'active' : ''}" onclick="showTab('${k}')">${n}</div>`).join('');
@@ -1193,17 +1222,109 @@ async function resetAllSessions() {
   if (!confirm('重建全部会话？会清空 DSH 侧上下文（记忆/好感度/提醒都在桥接侧，不会丢）')) return;
   await act('reset-all-sessions');
 }
+// ── 鲸鲸 2.0：心核卡（计划/目标/心流/自校准/记忆检修）──
+let HEART = null;
+const HF_LABEL = { absent: '没在看', watering: '随便看看', focused: '聊得投入' };
+const TIERS = {
+  conservative: { probability: 0.25, quotaPerDayGroup: 12, quotaPerDayPrivate: 8, idleThresholdMs: 900000 },
+  standard: { probability: 0.45, quotaPerDayGroup: 25, quotaPerDayPrivate: 18, idleThresholdMs: 600000 },
+  bold: { probability: 0.65, quotaPerDayGroup: 40, quotaPerDayPrivate: 30, idleThresholdMs: 300000 }
+};
+async function refreshHeart() {
+  try {
+    HEART = await api('/api/panel/heart');
+    const h = HEART;
+    $('heartAt').textContent = (h.heartEnabled ? '生活状态：' + h.life.label : '心核未开启（cfg.heart.enabled=false）') + ' · 每天约 ' + h.planHour + ' 点自定今日计划';
+    // 心流 chips：每个会话一条
+    $('heartflowChips').innerHTML = (h.heartflow || []).map((s) =>
+      `<span class="pill" title="${esc(s.key)}">${esc(String(s.key).split(':').pop())}：${HF_LABEL[s.state] || s.state}${s.interest != null ? '（兴趣 ' + Number(s.interest.score).toFixed(2) + '）' : ''} · 今日主动 ${s.proactiveUsed}/${s.proactiveQuota}</span>`).join(' ') || '<span class="muted">还没有会话</span>';
+    // 今日计划 + 目标
+    const planRows = (p) => {
+      const parts = [];
+      (p.topics || []).forEach((t) => parts.push(['想聊', t.text + (t.why ? ` <span class="muted">${esc(t.why)}</span>` : '')]));
+      (p.people || []).forEach((x) => parts.push(['想找', x.name ?? x.text ?? '']));
+      (p.learnings || []).forEach((l) => parts.push(['想学', typeof l === 'string' ? l : (l.text ?? '')]));
+      return parts.map(([k, v]) => `<div class="k">${k}</div><div>${esc(String(v))}</div>`).join('');
+    };
+    const planBlock = h.plan
+      ? '<div class="kv">' + planRows(h.plan) + '</div>'
+      : '<div class="muted">今天还没有计划（晨间 ' + (h.planHour ?? 8) + ' 点自动生成；心跳每 10 分钟会检查补跑）</div>';
+    const ageDays = (t) => Math.max(0, Math.round((Date.now() - Number(t || 0)) / 86400000));
+    const goalBlock = (h.goals.active || []).length
+      ? (h.goals.active).map((g) => {
+        const last = (g.progressNotes || []).length ? g.progressNotes[g.progressNotes.length - 1].note : '';
+        return `<div class="rowstack"><div class="lbl">#${g.id} <span class="chip">${esc(g.drive)}</span> ${esc(g.text)} <span class="muted">· ${ageDays(g.createdAt)} 天</span></div>${last ? `<div class="muted" style="font-size:12px">最近：${esc(last)}</div>` : ''}</div>`;
+      }).join('')
+      : '<div class="muted">没有进行中的目标（驱动轮盘 / 晨间规划会生成）</div>';
+    const closedBlock = (h.goals.closed || []).length
+      ? '<div class="sep"></div><div class="muted" style="font-size:12px;margin-top:6px">最近闭环：' + h.goals.closed.map((g) => `#${g.id} ${g.status === 'done' ? '✅' : '🚪'} ${esc(g.text)}`).join(' · ') + '</div>'
+      : '';
+    $('heartBody').innerHTML =
+      '<div class="hn-cols"><div><h2>今日计划（她早上自己定的）</h2>' + planBlock + '</div>'
+      + '<div><h2>她的目标（' + (h.goals.activeCount ?? 0) + '/' + (h.goals.maxActive ?? 8) + ' 进行中）</h2>' + goalBlock + closedBlock + '</div></div>';
+    // 自校准现状 + 档位高亮
+    const sa = h.selfAdjust || {};
+    const idleMin = sa.idleThresholdMs != null ? Math.round(sa.idleThresholdMs / 60000) : null;
+    $('selfAdjustInfo').textContent = '当前：' + [
+      sa.probability != null ? 'p=' + sa.probability : 'p=默认',
+      sa.quotaPerDayGroup != null ? '群 ' + sa.quotaPerDayGroup + '/天' : '群默认',
+      sa.quotaPerDayPrivate != null ? '私 ' + sa.quotaPerDayPrivate + '/天' : '私默认',
+      idleMin != null ? '闲置 ' + idleMin + ' 分钟起主动' : ''
+    ].filter(Boolean).join(' · ') + (sa.updatedBy ? '（' + sa.updatedBy + '）' : '');
+    let curTier = '';
+    for (const [name, p] of Object.entries(TIERS)) {
+      if (Math.abs((sa.probability ?? -1) - p.probability) < 1e-6
+        && (sa.quotaPerDayGroup ?? -1) === p.quotaPerDayGroup
+        && (sa.idleThresholdMs ?? -1) === p.idleThresholdMs) curTier = name;
+    }
+    for (const name of Object.keys(TIERS)) {
+      const b = $('tier-' + name);
+      if (b) b.style.borderColor = name === curTier ? 'var(--aqua)' : '';
+      if (b) b.style.color = name === curTier ? 'var(--aqua)' : '';
+    }
+    // 记忆统计
+    const m = h.memoryV2 || {};
+    const maint = m.lastMaintainAt ? ' · 上次检修 ' + new Date(m.lastMaintainAt).toLocaleString('zh-CN') : '';
+    $('memoryV2Info').textContent = `事实 ${m.factsValid ?? 0} 有效 / ${m.factsInvalidated ?? 0} 作废 · 情节 ${m.episodes ?? 0}${maint}`;
+  } catch (e) {
+    $('heartAt').textContent = '读取失败：' + e.message;
+  }
+}
+async function setTier(tier) {
+  try {
+    const r = await api('/api/panel/proactive-tier', { method: 'POST', body: JSON.stringify({ tier }) });
+    toast('主动性 → ' + tier + '（p=' + r.probability + '，群 ' + r.quotaPerDayGroup + '/天，闲置 ' + Math.round(r.idleThresholdMs / 60000) + ' 分钟）');
+    refreshHeart();
+  } catch (e) { toast('切档失败：' + e.message, true); }
+}
+async function maintainNow() {
+  try {
+    const r = await api('/api/panel/memory-maintain', { method: 'POST', body: JSON.stringify({}) });
+    const s = r.stats || {};
+    toast('检修完成：事实 ' + (r.facts ?? '?') + ' 条 · 情节 ' + (r.episodes ?? '?') + ' 条' + (s.stale || s.merged || s.evicted ? '（作废 ' + (s.stale ?? 0) + ' / 合并 ' + (s.merged ?? 0) + ' / 淘汰 ' + (s.evicted ?? 0) + '）' : '（本次无需清理）'));
+    refreshHeart();
+  } catch (e) { toast('检修失败：' + e.message, true); }
+}
+async function factV2Toggle(id, invalidate) {
+  try {
+    await api('/api/panel/memory-fact', { method: 'POST', body: JSON.stringify({ id, action: invalidate ? 'invalidate' : 'restore' }) });
+    toast('事实 #' + id + (invalidate ? ' 已作废（软删，可恢复）' : ' 已恢复'));
+    showTab('memoryV2');
+  } catch (e) { toast('失败：' + e.message, true); }
+}
 renderTabs();
 refresh();
 refreshHer();
 loadSessions();
 refreshHealth();
 refreshLlm();
+refreshHeart();
 setInterval(refresh, 6000);
 setInterval(refreshHer, 6000);
 setInterval(() => loadSessions(false), 60000);
 setInterval(refreshHealth, 30000);
 setInterval(refreshLlm, 60000);
+setInterval(refreshHeart, 10000);
 </script>
 </body>
 </html>

@@ -54,11 +54,29 @@ import {
   SLANG_STATUS
 } from './slang-learner.js';
 import { buildSummaryPrompt, parseSummaryJson, toBigrams, queryToMatch, formatProfileLine } from './memory-engine.js';
+// 鲸鲸 2.0 A 层：消息流 L0 / Episode L1 / 事实账本 L2（纯函数，见 docs/upgrade-plan-2026-10.md）
+import {
+  sanitizeStreamKey, makeStreamLine, buildEpisodePrompt, parseEpisodeJson, normalizeEpisode,
+  buildFactPrompt, parseFactOps, applyFactOps, legacyFactToV2, matchFact,
+  scoreMemoryV2Candidates, maintainMemoryV2Rows, visibleKeysFor
+} from './memory-v2.js';
+// 鲸鲸 2.0 B 层：生活状态机 + 聊天流三态心流 + 大胆档时机信号（纯函数）
+import {
+  LIFE_EFFECTS, HEARTFLOW_EFFECTS, lifeStateFor, heartflowTransition, normalizeHeartflowConfig,
+  groupActivityScore, topicMatchScore, buildInterestPrompt, parseInterestResult, heartLineFor
+} from './heart-core.mjs';
+// 鲸鲸 2.0 B2/B3：每日计划 + 目标队列；A7：画像夜刷（纯函数）
+import {
+  DRIVES, selectDrive, buildMorningPlanPrompt, parseMorningPlanResult,
+  foldGoalLines, applyGoalOps, maintainGoals, nextGoalId,
+  normalizePlan, planTopicsOf, renderPlanLines, renderGoalLines,
+  buildPersonaRefreshPrompt, parsePersonaRefreshResult
+} from './goals-core.mjs';
 import {
   normalizeRepeatSpec, nextRepeatFireMs, repeatFromRow, repeatColumnsFor, describeRepeat
 } from './repeat-schedule.js';
 import {
-  localDayKey, quotaPerDayFromConfig, proactiveAllowed, nextLocalMidnight
+  localDayKey, quotaPerDayFromConfig, quotaPerDayFor, proactiveAllowed, nextLocalMidnight
 } from './proactive-quota.js';
 import {
   classifySendFailure, outboxBackoffMs, outboxExhausted, outboxExpired,
@@ -484,10 +502,13 @@ function loadConfig() {
       },
       proactive: {
         enabled: true,
-        checkIntervalMinMs: 30 * 60 * 1000,
-        checkIntervalMaxMs: 90 * 60 * 1000,
-        idleThresholdMs: 15 * 60 * 1000,
-        probability: 0.3
+        // 鲸鲸 2.0 C 大胆档（主人批复「大胆放开」）：更密的主动机会检查 + 更高基线概率 + 更短空闲门槛
+        checkIntervalMinMs: 5 * 60 * 1000,
+        checkIntervalMaxMs: 20 * 60 * 1000,
+        idleThresholdMs: 5 * 60 * 1000,
+        probability: 0.65,
+        // 大胆档每日硬配额：群 40 / 私聊 30（旧 config.json 里的数字仍作统一值生效）
+        quotaPerDay: { group: 40, private: 30 }
       },
       feedback: {
         maxLength: 500,
@@ -559,6 +580,72 @@ function loadConfig() {
       maxRemarkChars: 20,
       ...((cfg.socialV2?.sticker?.collect) ?? {})
     }
+  };
+
+  // 鲸鲸 2.0 A 层记忆引擎默认值（docs/upgrade-plan-2026-10.md）：总开关可回滚，旧链路原样保留。
+  cfg.memoryV2 = {
+    enabled: true,
+    streams: {
+      capLines: 20000,   // 每聊天流 JSONL 行数上限（超出裁剪保尾部）
+      trimTo: 12000
+    },
+    episodes: {
+      groupThreshold: 30,     // 群聊新增 N 条消息触发一次情景总结
+      privateThreshold: 12,   // 私聊阈值更低（对话更密）
+      promptMessages: 40,
+      prevSummaries: 2,
+      maxKeep: 5000,
+      failRetryMs: 10 * 60 * 1000
+    },
+    facts: {
+      extractIntervalMs: 5 * 60 * 1000,  // 同流两次事实提取最小间隔
+      minNewLines: 8,                     // 新增不足 N 条不跑
+      promptMessages: 40,
+      maxOps: 6,
+      maxKeep: 10000
+    },
+    recall: {
+      throttleMs: 180000,   // 同一会话两次注入最小间隔（防刷屏）
+      cacheMs: 300000,      // 召回结果缓存期（期间命中不再重算）
+      episodeLines: 2,      // 情景回忆注入行数
+      factLines: 4,         // 事实回忆注入行数
+      minScore: 0.05        // 三因子召回门槛
+    },
+    maintain: {
+      staleDays: 90,             // 事实超 N 天未被想起进入作废评估
+      staleImportanceBelow: 5,   // 重要度低于此值才作废（高价值永不自动忘）
+      episodeMaxAgeDays: 180,    // 情节最长保留
+      minEpisodeScore: 0.02,     // 老旧情节三因子下限
+      weeklyMerge: true          // 同人近似事实夜间合并
+    },
+    sharedGroups: [],        // 共享记忆组：[['private:1918594889','group:471975044']] 表示两者互见
+    legacyImport: true,
+    ...(file.memoryV2 ?? {})
+  };
+
+  // 鲸鲸 2.0 B 层：自主心核（生活状态机作息 + 每聊天流三态心流 + 兴趣评估节流）
+  cfg.heart = {
+    enabled: true,
+    schedule: {
+      sleepStart: 1,          // 睡眠时段 [sleepStart, sleepEnd)
+      sleepEnd: 8,
+      focusedWindows: [[19, 22]],   // 专注时段（晚高峰，主动频率+回复深度上调）
+      slackingWindows: [[13, 15]]   // 摸鱼时段（午后低能量）
+    },
+    heartflow: {
+      focusedCap: 2,                    // 同时专注的聊天流上限
+      silentToAbsent: 5,                // watering 连续静默 N 次 → absent
+      focusedExitSilent: 3,             // focused 连续静默 N 次 → watering
+      focusedIdleMs: 30 * 60 * 1000,    // focused 无新消息超时 → watering
+      reentryScore: 0.5,                // absent 重新进入的兴趣门槛
+      focusedScore: 0.75,               // 进入 focused 的兴趣门槛
+      evalThrottleMs: 5 * 60 * 1000     // 每流兴趣评估最小间隔
+    },
+    interest: {
+      maxMessages: 20,        // 兴趣评估读最近 N 条
+      timeoutMs: 60000
+    },
+    ...(file.heart ?? {})
   };
 
   // 新版 DSH 的 launch token 每次启动会变；配置里没填时自动从 DSH guard 日志发现。
@@ -1392,7 +1479,13 @@ async function main() {
         const fu = db.prepare("SELECT name, topic FROM followups WHERE conv_key = ? AND status = 'pending' ORDER BY due_at ASC LIMIT 3").all(key);
         if (fu.length) parts.push('【待跟进的事】\n' + fu.map((f) => '- ' + (f.name ? f.name + '：' : '') + String(f.topic).slice(0, 60)).join('\n') + '\n（合适的时候自然地问一句，别像查岗）');
       } catch {}
-      const notes = db.prepare('SELECT kind, content FROM persona_notes ORDER BY id DESC LIMIT 3').all();
+      // 鲸鲸 2.0 A8：insight（日终洞见）与 style/self/quirk 分开取——防止每晚的洞见把风格笔记挤出窗口
+      let notes = [];
+      try {
+        const base = db.prepare("SELECT kind, content FROM persona_notes WHERE kind != 'insight' ORDER BY id DESC LIMIT 2").all();
+        const ins = db.prepare("SELECT kind, content FROM persona_notes WHERE kind = 'insight' ORDER BY id DESC LIMIT 1").all();
+        notes = [...base, ...ins];
+      } catch { notes = db.prepare('SELECT kind, content FROM persona_notes ORDER BY id DESC LIMIT 3').all(); }
       if (notes.length) {
         parts.push('【你的自我演化笔记（最近）】\n' + notes.map((n) => '- (' + n.kind + ') ' + String(n.content).slice(0, 80)).join('\n') + '\n（这是你自己沉淀的风格与自我认知，自然体现在言行里；有新感悟用 qq_self_note 记录）');
       }
@@ -3090,7 +3183,10 @@ async function main() {
             setStickerRemark: 'qq_set_sticker_remark',
             stickerNote: 'qq_sticker_note',
             collectSticker: 'qq_collect_sticker',
-            getSelfImage: 'qq_get_self_image'
+            getSelfImage: 'qq_get_self_image',
+            goal: 'qq_goal',
+            selfAdjust: 'qq_self_adjust',
+            requestState: 'qq_request_state'
           };
           const tools = cfg.socialV2?.tools ?? {};
           const stickerToolFlags = new Set(['listStickers', 'getStickerImage', 'sendSticker', 'setStickerRemark', 'stickerNote', 'collectSticker']);
@@ -3874,6 +3970,8 @@ async function main() {
               poke: { targetId: targetUserId || String(id), targetIsSelf: false, groupId: kind === 'group' ? String(id) : null },
               time: Date.now()
             });
+            // 鲸鲸 2.0 A1：她主动拍一拍也进消息流。
+            try { noteConversationMessageV2(key, { kind: 'poke', sender: '我', isSelf: true, isOwner: true, text: pokeText, time: Date.now() }); } catch {}
             const recentLimit = Number(cfg.socialV2?.context?.recentLimit) || 100;
             if (st.recentMessages.length > recentLimit) st.recentMessages.splice(0, st.recentMessages.length - recentLimit);
             st.preSleepWaitSatisfiedAt = 0;
@@ -4133,6 +4231,8 @@ async function main() {
               sticker: { id: sent.entry?.id || stickerId, desc: sent.entry?.desc || '', localNote: sent.entry?.localNote || '' },
               time: Date.now()
             });
+            // 鲸鲸 2.0 A1：她发表情也进消息流。
+            try { noteConversationMessageV2(key, { kind: 'message', sender: '我', isSelf: true, isOwner: true, text, time: Date.now() }); } catch {}
             const recentLimit = Number(cfg.socialV2?.context?.recentLimit) || 100;
             if (st.recentMessages.length > recentLimit) st.recentMessages.splice(0, st.recentMessages.length - recentLimit);
             st.lastAiReplyAt = now;
@@ -5351,6 +5451,154 @@ async function main() {
           sendJson({ ok: true, count: rows.length, notes: rows });
           return;
         }
+        // ── 鲸鲸 2.0 B5 元工具端点：qq_goal（目标队列自主管理） ─────────────
+        // goals.jsonl 追加式事件日志（同 id 后行覆盖前行）；add 受 maxActive 上限约束。
+        if (req.method === 'POST' && url.pathname === '/api/socialV2/goal') {
+          const body = await readBody();
+          const token = pickAgentToken(req, body);
+          const key = String(body.key ?? '').trim();
+          if (currentMode !== 'reserved2') { sendJson({ ok: false, error: '该接口仅 reserved2 模式可用' }, 403); return; }
+          if (!key || !agentTokenOk(key, token)) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
+          if (!v2ToolEnabled('goal')) { sendJson({ ok: false, error: '工具未启用：qq_goal' }, 403); return; }
+          const action = String(body.action ?? 'list').trim();
+          const nowMs = Date.now();
+          if (action === 'list') {
+            const rows = readGoalRows();
+            const active = rows.filter((g) => g?.status === 'active');
+            const closed = rows.filter((g) => g?.status !== 'active').slice(0, 10);
+            sendJson({ ok: true, active, closed, activeCount: active.length, maxActive: GOAL_LIMITS.maxActive });
+            return;
+          }
+          if (action === 'add') {
+            const text = String(body.text ?? '').trim().slice(0, 60);
+            if (!text) { sendJson({ ok: false, error: 'text 不能为空' }, 400); return; }
+            const rows = readGoalRows();
+            const activeCount = rows.filter((g) => g?.status === 'active').length;
+            if (activeCount >= GOAL_LIMITS.maxActive) { sendJson({ ok: false, error: `进行中的目标已有 ${activeCount} 个（上限 ${GOAL_LIMITS.maxActive}），先完成或放弃一个再说` }, 400); return; }
+            const goal = { id: nextGoalId(rows), text, drive: String(body.drive ?? 'curiosity').slice(0, 12), status: 'active', createdAt: nowMs, updatedAt: nowMs, closedAt: null, closedNote: '', progressNotes: [] };
+            appendGoalRows([goal]);
+            log(`[goals] #${goal.id} 新目标：${text}`);
+            sendJson({ ok: true, goal });
+            return;
+          }
+          const id = Number(body.id);
+          if (!Number.isInteger(id) || id <= 0) { sendJson({ ok: false, error: 'id 必须是正整数' }, 400); return; }
+          if (action === 'done' || action === 'abandon') {
+            const rows = readGoalRows();
+            const target = rows.find((g) => Number(g?.id) === id && g?.status === 'active');
+            if (!target) { sendJson({ ok: false, error: `没有进行中的目标 #${id}` }, 404); return; }
+            const note = String(body.note ?? '').trim().slice(0, 80);
+            const updated = { ...target, status: action === 'done' ? 'done' : 'abandoned', closedAt: nowMs, updatedAt: nowMs, closedNote: note };
+            appendGoalRows([updated]);
+            log(`[goals] #${id} ${action === 'done' ? '完成' : '放弃'}：${target.text}`);
+            sendJson({ ok: true, goal: updated });
+            return;
+          }
+          if (action === 'note') {
+            const note = String(body.note ?? '').trim().slice(0, 80);
+            if (!note) { sendJson({ ok: false, error: 'note 不能为空' }, 400); return; }
+            const rows = readGoalRows();
+            const target = rows.find((g) => Number(g?.id) === id && g?.status === 'active');
+            if (!target) { sendJson({ ok: false, error: `没有进行中的目标 #${id}` }, 404); return; }
+            const progressNotes = [...(Array.isArray(target.progressNotes) ? target.progressNotes : []), { at: nowMs, note }].slice(-10);
+            const updated = { ...target, progressNotes, updatedAt: nowMs };
+            appendGoalRows([updated]);
+            sendJson({ ok: true, goal: updated });
+            return;
+          }
+          sendJson({ ok: false, error: 'action 仅支持 list/add/done/abandon/note' }, 400);
+          return;
+        }
+
+        // ── 鲸鲸 2.0 B5 元工具端点：qq_self_adjust（自主微调主动参数，硬边界） ──
+        // 她能改的只有节奏参数（概率/配额/空闲阈值），每项都有上下限；落 state/self-adjust.json，
+        // 运行时覆盖 config（restart 后依然生效，控制台改 config 不受影响）。
+        if (req.method === 'POST' && url.pathname === '/api/socialV2/self-adjust') {
+          const body = await readBody();
+          const token = pickAgentToken(req, body);
+          const key = String(body.key ?? '').trim();
+          if (currentMode !== 'reserved2') { sendJson({ ok: false, error: '该接口仅 reserved2 模式可用' }, 403); return; }
+          if (!key || !agentTokenOk(key, token)) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
+          if (!v2ToolEnabled('selfAdjust')) { sendJson({ ok: false, error: '工具未启用：qq_self_adjust' }, 403); return; }
+          const action = String(body.action ?? 'get').trim();
+          const effective = () => ({
+            probability: selfAdjust.probability ?? (Number(cfg.socialV2?.proactive?.probability) || 0.4),
+            quotaPerDayGroup: selfAdjust.quotaPerDayGroup ?? quotaPerDayFor(cfg.socialV2?.proactive?.quotaPerDay, true),
+            quotaPerDayPrivate: selfAdjust.quotaPerDayPrivate ?? quotaPerDayFor(cfg.socialV2?.proactive?.quotaPerDay, false),
+            idleThresholdMs: selfAdjust.idleThresholdMs ?? (Number(cfg.socialV2?.proactive?.idleThresholdMs) || 300000),
+            updatedAt: selfAdjust.updatedAt || 0
+          });
+          if (action === 'get') { sendJson({ ok: true, ...effective() }); return; }
+          if (action !== 'set') { sendJson({ ok: false, error: 'action 仅支持 get/set' }, 400); return; }
+          const changed = [];
+          const errors = [];
+          const num = (v) => { const n = Number(v); return Number.isFinite(n) ? n : NaN; };
+          if (body.probability !== undefined && body.probability !== null) {
+            const n = num(body.probability);
+            if (n < 0.05 || n > 0.95) errors.push(`probability 超出边界 [0.05, 0.95]：${body.probability}`);
+            else { selfAdjust.probability = n; changed.push(`probability=${n}`); }
+          }
+          if (body.quotaPerDayGroup !== undefined && body.quotaPerDayGroup !== null) {
+            const n = num(body.quotaPerDayGroup);
+            if (!Number.isInteger(n) || n < 5 || n > 100) errors.push(`quotaPerDayGroup 需为 [5, 100] 整数：${body.quotaPerDayGroup}`);
+            else { selfAdjust.quotaPerDayGroup = n; changed.push(`quotaPerDayGroup=${n}`); }
+          }
+          if (body.quotaPerDayPrivate !== undefined && body.quotaPerDayPrivate !== null) {
+            const n = num(body.quotaPerDayPrivate);
+            if (!Number.isInteger(n) || n < 5 || n > 100) errors.push(`quotaPerDayPrivate 需为 [5, 100] 整数：${body.quotaPerDayPrivate}`);
+            else { selfAdjust.quotaPerDayPrivate = n; changed.push(`quotaPerDayPrivate=${n}`); }
+          }
+          if (body.idleThresholdMs !== undefined && body.idleThresholdMs !== null) {
+            const n = num(body.idleThresholdMs);
+            if (n < 60000 || n > 1800000) errors.push(`idleThresholdMs 超出边界 [60000, 1800000]（1~30 分钟）：${body.idleThresholdMs}`);
+            else { selfAdjust.idleThresholdMs = n; changed.push(`idleThresholdMs=${n}`); }
+          }
+          if (errors.length) { sendJson({ ok: false, error: errors.join('；') }, 400); return; }
+          if (!changed.length) { sendJson({ ok: false, error: '没有要改的字段（probability / quotaPerDayGroup / quotaPerDayPrivate / idleThresholdMs）' }, 400); return; }
+          selfAdjust.updatedAt = Date.now();
+          selfAdjust.updatedBy = key;
+          saveSelfAdjust();
+          log(`[selfAdjust] ${key} 自调：${changed.join('，')}`);
+          sendJson({ ok: true, changed, ...effective() });
+          return;
+        }
+
+        // ── 鲸鲸 2.0 B5 元工具端点：qq_request_state（她看自己的内状态） ──
+        if (req.method === 'POST' && url.pathname === '/api/socialV2/request-state') {
+          const body = await readBody();
+          const token = pickAgentToken(req, body);
+          const key = String(body.key ?? '').trim();
+          if (currentMode !== 'reserved2') { sendJson({ ok: false, error: '该接口仅 reserved2 模式可用' }, 403); return; }
+          if (!key || !agentTokenOk(key, token)) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
+          if (!v2ToolEnabled('requestState')) { sendJson({ ok: false, error: '工具未启用：qq_request_state' }, 403); return; }
+          const st = getSocialV2State(key);
+          const life = heartLifeNow(Date.now());
+          const quota = proactiveQuotaPerDay(key);
+          sendJson({
+            ok: true,
+            key,
+            time: new Date().toISOString(),
+            life: { state: life.state, label: life.label },
+            heartflow: {
+              state: heartflowStateOf(st),
+              interest: st.heartflowInterest ?? null,
+              silentCount: Number(st.heartflowSilentCount) || 0
+            },
+            plan: getTodayPlan(),
+            goals: listActiveGoals(),
+            proactive: {
+              quota,
+              used: proactiveUsedToday(key),
+              probability: selfAdjust.probability ?? (Number(cfg.socialV2?.proactive?.probability) || 0.4),
+              idleThresholdMs: selfAdjust.idleThresholdMs ?? (Number(cfg.socialV2?.proactive?.idleThresholdMs) || 300000)
+            },
+            wakeConfig: st.wakeConfig ?? null,
+            pendingThoughts: (Array.isArray(st.pendingThoughts) ? st.pendingThoughts : []).length,
+            unreadCount: (Array.isArray(st.unread) ? st.unread : []).length
+          });
+          return;
+        }
+
         // ── 立即学一次（用桥接侧历史消息播种学习窗口，跑黑话+表达提取） ──
         if (req.method === 'POST' && url.pathname === '/api/panel/style/extract-now') {
           const body = await readBody();
@@ -5414,13 +5662,14 @@ async function main() {
         // 加这个端点是因为这两样东西此前只活在内存/DB 深处，出了事只能靠猜；测试也需要一个
         // 零副作用的读口来验证状态机（发图被拦之后 lastStickerId 有没有被误改）。
         if (req.method === 'GET' && url.pathname === '/api/panel/social-state') {
-          const quota = proactiveQuotaPerDay();
+          // 鲸鲸 2.0 C：配额按类型（群/私聊）区分，随 key 解析
           // 显式 ?key= 分支：只读 DB + 只读已存在的会话状态，**不创建**新会话。
           // 作用：面板 sessions 只列「已经有过消息的对话」，而配额表和 lastSticker 状态都按 key
           // 存放，所以「某个 key 的配额读出来是多少」在默认视图里查不到（合成 key 更是查不到）。
           // 调试和回归测试都需要一个能按任意 key 读、且不产生副作用的口子。
           const qKey = String(url.searchParams.get('key') ?? '').trim();
           if (qKey) {
+            const quota = proactiveQuotaPerDay(qKey);
             const used = proactiveUsedToday(qKey);
             const st = socialV2.conversations.get(qKey) || null;
             sendJson({
@@ -5443,6 +5692,7 @@ async function main() {
           const sessions = [];
           for (const [key, st] of socialV2.conversations) {
             const used = proactiveUsedToday(key);
+            const quota = proactiveQuotaPerDay(key);
             sessions.push({
               key,
               proactiveUsedToday: used,
@@ -5463,6 +5713,126 @@ async function main() {
             outbox: outboxStats(),
             sessions
           });
+          return;
+        }
+
+        // ── 鲸鲸 2.0 D：心核 / 今日计划 / 目标 / 自校准 只读聚合（控制台令牌=管理员）──
+        // 与 B5 的 /api/socialV2/request-state（她自己用 agent token 自省）互为镜像：
+        // 这里是主人视角，多给 memoryV2 统计与 planHour，供面板「心核」卡渲染。
+        if (req.method === 'GET' && url.pathname === '/api/panel/heart') {
+          const now = Date.now();
+          const life = heartLifeNow(now);
+          const heartflow = [];
+          for (const [key, st] of socialV2.conversations) {
+            heartflow.push({
+              key,
+              state: heartflowStateOf(st),
+              silentCount: Number(st.heartflowSilentCount) || 0,
+              interest: st.heartflowInterest && typeof st.heartflowInterest === 'object'
+                ? { score: st.heartflowInterest.score, reason: st.heartflowInterest.reason, at: Number(st.heartflowInterest.at) || 0 }
+                : null,
+              lastIncomingAt: Number(st.lastIncomingAt) || 0,
+              lastAiReplyAt: Number(st.lastAiReplyAt) || 0,
+              proactiveUsed: proactiveUsedToday(key),
+              proactiveQuota: proactiveQuotaPerDay(key),
+              wakeMode: st?.wakeConfig?.mode ?? null
+            });
+          }
+          const goals = readGoalRows();
+          sendJson({
+            ok: true,
+            time: new Date(now).toISOString(),
+            heartEnabled: heartEnabled(),
+            life: { state: life.state, label: life.label },
+            heartflow,
+            plan: getTodayPlan(),
+            planHour: Number(cfg.autonomy?.planHour) || 8,
+            goals: {
+              active: goals.filter((g) => g.status === 'active'),
+              closed: goals.filter((g) => g.status !== 'active').slice(-10).reverse(),
+              activeCount: goals.filter((g) => g.status === 'active').length,
+              maxActive: GOAL_LIMITS.maxActive
+            },
+            selfAdjust: {
+              probability: selfAdjust.probability,
+              quotaPerDayGroup: selfAdjust.quotaPerDayGroup,
+              quotaPerDayPrivate: selfAdjust.quotaPerDayPrivate,
+              idleThresholdMs: selfAdjust.idleThresholdMs,
+              updatedAt: selfAdjust.updatedAt,
+              updatedBy: selfAdjust.updatedBy
+            },
+            memoryV2: {
+              factsTotal: memoryV2Store.facts.length,
+              factsValid: memoryV2Store.facts.filter((f) => !f.invalidated).length,
+              factsInvalidated: memoryV2Store.facts.filter((f) => f.invalidated).length,
+              episodes: memoryV2Store.episodes.length,
+              lastMaintainAt: Number(memoryV2Store.meta?.lastMaintainAt) || 0
+            }
+          });
+          return;
+        }
+
+        // D：主动性三档（面板一键）。写 selfAdjust 运行时覆盖（落盘、重启保留）；
+        // 值域都在 qq_self_adjust 的硬边界内，她之后随时可再微调，互不冲突。
+        if (req.method === 'POST' && url.pathname === '/api/panel/proactive-tier') {
+          const body = await readBody();
+          const tier = String(body.tier ?? '').trim();
+          const PRESETS = {
+            conservative: { probability: 0.25, quotaPerDayGroup: 12, quotaPerDayPrivate: 8, idleThresholdMs: 900000 },
+            standard: { probability: 0.45, quotaPerDayGroup: 25, quotaPerDayPrivate: 18, idleThresholdMs: 600000 },
+            bold: { probability: 0.65, quotaPerDayGroup: 40, quotaPerDayPrivate: 30, idleThresholdMs: 300000 }
+          };
+          const preset = PRESETS[tier];
+          if (!preset) { sendJson({ ok: false, error: 'tier 只认 conservative / standard / bold' }, 400); return; }
+          selfAdjust.probability = preset.probability;
+          selfAdjust.quotaPerDayGroup = preset.quotaPerDayGroup;
+          selfAdjust.quotaPerDayPrivate = preset.quotaPerDayPrivate;
+          selfAdjust.idleThresholdMs = preset.idleThresholdMs;
+          selfAdjust.updatedAt = Date.now();
+          selfAdjust.updatedBy = 'console:tier:' + tier;
+          saveSelfAdjust();
+          log('[panel] 主动性档位 → ' + tier + '（p=' + preset.probability + '，群配额 ' + preset.quotaPerDayGroup + '/天）');
+          sendJson({ ok: true, tier, ...preset, updatedAt: selfAdjust.updatedAt });
+          return;
+        }
+
+        // A9 记忆检修：手动跑一次 v2 维护（stale 作废 / 同人近似合并 / 老旧情节淘汰）。
+        // 与夜间 maintainTimer 跑的是同一段逻辑（runMemoryMaintenance 的 A10 段），提前手动触发而已。
+        if (req.method === 'POST' && url.pathname === '/api/panel/memory-maintain') {
+          if (!memoryV2Enabled()) { sendJson({ ok: false, error: 'memoryV2 未开启' }, 400); return; }
+          try {
+            const r2 = maintainMemoryV2Rows({
+              episodes: memoryV2Store.episodes, facts: memoryV2Store.facts, nowMs: Date.now(),
+              ...(cfg.memoryV2?.maintain ?? {})
+            });
+            memoryV2Store.episodes = r2.episodes;
+            memoryV2Store.facts = r2.facts;
+            saveMemoryV2Facts();
+            try { fs.writeFileSync(MEMORY_V2_EPISODES_FILE, memoryV2Store.episodes.map((e) => JSON.stringify(e) + '\n').join('')); } catch {}
+            memoryV2Store.meta = { ...(memoryV2Store.meta ?? {}), lastMaintainAt: Date.now() };
+            saveMemoryV2MetaNow();
+            log('[panel] A9 记忆检修手动执行：' + JSON.stringify(r2.stats ?? {}));
+            sendJson({ ok: true, stats: r2.stats ?? null, facts: memoryV2Store.facts.length, episodes: memoryV2Store.episodes.length });
+          } catch (error) { sendJson({ ok: false, error: String(error?.message ?? error) }, 500); }
+          return;
+        }
+
+        // A9 记忆检修：单条 v2 事实作废 / 恢复（面板记忆账本 tab 的行内按钮）
+        if (req.method === 'POST' && url.pathname === '/api/panel/memory-fact') {
+          const body = await readBody();
+          const id = Number(body.id);
+          const action = String(body.action ?? '').trim();
+          if (!Number.isFinite(id) || (action !== 'invalidate' && action !== 'restore')) {
+            sendJson({ ok: false, error: '需要 {id, action: invalidate|restore}' }, 400); return;
+          }
+          const row = memoryV2Store.facts.find((f) => Number(f?.id) === id);
+          if (!row) { sendJson({ ok: false, error: '没有这条事实 #' + id }, 404); return; }
+          row.invalidated = action === 'invalidate';
+          row.invalidatedAt = action === 'invalidate' ? Date.now() : 0;
+          row.invalidationReason = action === 'invalidate' ? String(body.reason || '面板手动作废') : '';
+          row.updatedAt = Date.now();
+          saveMemoryV2Facts();
+          sendJson({ ok: true, id, action });
           return;
         }
         // ── 面板完善①：「她此刻」状态卡（心情/精力 + 为什么安静 + 她最近说的话 + 她惦记的事）──
@@ -5592,12 +5962,12 @@ async function main() {
             if (e.type === 'result' && isSendToolName(String(e.tool || ''))) { if (e.ok) sendOk++; else sendFail++; }
           }
           let wakeCount = 0, sendTimesCount = 0;
-          const quota = proactiveQuotaPerDay();
           const proactive = [];
           for (const [key, st] of socialV2.conversations) {
             wakeCount += (st.wakeTimes || []).filter((t) => t >= dayStartMs).length;
             sendTimesCount += (st.sendTimes || []).filter((t) => t >= dayStartMs).length;
             const used = proactiveUsedToday(key);
+            const quota = proactiveQuotaPerDay(key);
             proactive.push({ key, used, quota, allowed: used < quota });
           }
           let initiativeToday = 0, initiativeSpoken = 0;
@@ -6190,6 +6560,19 @@ async function main() {
             html = '<table><tr><th>#</th><th>内容</th><th>类别</th><th>重要度</th><th></th></tr>' + rows.map((r) =>
               `<tr><td>${r.id}</td><td>${esc(r.content)}</td><td>${esc(r.category)}</td><td>${r.importance}</td>
                <td><button class="sm danger" onclick="delRow('facts',${r.id})">删</button></td></tr>`).join('') + '</table>';
+          } else if (kind === 'memoryV2') {
+            // 鲸鲸 2.0 A9：记忆账本（v2 事实 + 情节）只读表 + 行内作废/恢复按钮
+            const facts = (memoryV2Store.facts ?? []).slice()
+              .sort((a, b) => (Number(b.updatedAt) || 0) - (Number(a.updatedAt) || 0)).slice(0, 200);
+            const episodes = (memoryV2Store.episodes ?? []).slice(-30).reverse();
+            html = '<h3 style="margin:4px 0 8px;color:var(--aqua)">事实账本（共 ' + (memoryV2Store.facts ?? []).length + ' 条，最新 200）</h3>'
+              + '<table><tr><th>#</th><th>人</th><th>事实</th><th>重要度</th><th>置信</th><th>状态</th><th>最近想起</th><th></th></tr>'
+              + facts.map((r) => `<tr><td>${r.id}</td><td>${esc(r.person)}</td><td>${esc(r.fact)}</td><td>${r.importance}</td><td>${(Number(r.confidence) || 0).toFixed(2)}</td><td>${r.invalidated ? '<span style="color:var(--bad)">作废</span>' : '<span style="color:var(--good)">有效</span>'}</td><td>${r.lastHitAt ? new Date(r.lastHitAt).toLocaleString('zh-CN') : '从未'}</td><td><button class="sm ${r.invalidated ? '' : 'danger'}" onclick="factV2Toggle(${r.id},${r.invalidated ? 'false' : 'true'})">${r.invalidated ? '恢复' : '作废'}</button></td></tr>`).join('')
+              + '</table>'
+              + '<h3 style="margin:14px 0 8px;color:var(--aqua)">情节记忆（最新 30 条）</h3>'
+              + '<table><tr><th>时间</th><th>会话</th><th>情节</th><th>状态</th></tr>'
+              + episodes.map((e) => `<tr><td style="white-space:nowrap">${e.time ? new Date(e.time).toLocaleString('zh-CN') : '-'}</td><td>${esc(e.streamKey ?? e.key ?? '')}</td><td>${esc(String(e.summary ?? e.text ?? '').slice(0, 160))}</td><td>${e.invalidated ? '作废' : '有效'}</td></tr>`).join('')
+              + '</table>';
           } else if (kind === 'reminders') {
             const rows = db.prepare('SELECT id, conv_key, text, fire_at, status FROM reminders ORDER BY fire_at DESC LIMIT 100').all();
             html = '<table><tr><th>#</th><th>会话</th><th>内容</th><th>触发时间</th><th>状态</th><th></th></tr>' + rows.map((r) =>
@@ -9666,6 +10049,8 @@ async function main() {
     if (st.unread.length > unreadLimit) st.unread.splice(0, st.unread.length - unreadLimit);
     // P1-4：客观累计熟识度（「回复她」= 被点名）。放这里是因为 appendSocialV2Poke / Notice 共用同样结构。
     noteMemberActivityV2(msg.userId, sender, !!quoteTargetIsSelf);
+    // 鲸鲸 2.0 A1：正式消息进消息流（L0，含引用/媒体标记）。
+    try { noteConversationMessageV2(key, { ...msg, kind: 'message' }); } catch {}
     const lowerPlain = String(plainContent ?? textContent ?? '');
     for (const t of st.activeTopics || []) {
       if (!t || typeof t !== 'object') continue;
@@ -9715,6 +10100,8 @@ async function main() {
     if (st.recentMessages.length > recentLimit) st.recentMessages.splice(0, st.recentMessages.length - recentLimit);
     st.unread.push(msg);
     if (st.unread.length > unreadLimit) st.unread.splice(0, st.unread.length - unreadLimit);
+    // 鲸鲸 2.0 A1：拍一拍/系统通知也进消息流（kind 已带 poke/reminder 等）。
+    try { noteConversationMessageV2(key, msg); } catch {}
     saveSocialV2State();
     return msg;
   }
@@ -9830,6 +10217,8 @@ async function main() {
     if (st.recentMessages.length > recentLimit) st.recentMessages.splice(0, st.recentMessages.length - recentLimit);
     st.unread.push(msg);
     if (st.unread.length > unreadLimit) st.unread.splice(0, st.unread.length - unreadLimit);
+    // 鲸鲸 2.0 A1：拍一拍/系统通知也进消息流（kind 已带 poke/reminder 等）。
+    try { noteConversationMessageV2(key, msg); } catch {}
     saveSocialV2State();
     return msg;
   }
@@ -9971,6 +10360,417 @@ async function main() {
   const readAutonomy = () => readJsonSafe(autonomyFile, {}, false) ?? {};
   const writeAutonomy = (obj) => { try { fs.writeFileSync(autonomyFile, JSON.stringify(obj, null, 2)); } catch {} };
 
+  // ── 鲸鲸 2.0 A 层记忆引擎：消息流 L0 / Episode L1 / 事实账本 L2（docs/upgrade-plan-2026-10.md）──
+  // 总开关 cfg.memoryV2.enabled=false 整体回滚，旧链路（memory.db/recallFactLines）原样保留。
+  // 铁律：生成任务全部异步后台、失败静默退避，绝不阻塞回复链路。
+  const MEMORY_V2_DIR = path.join(STATE_DIR, 'memory-v2');
+  const MEMORY_V2_STREAMS_DIR = path.join(MEMORY_V2_DIR, 'streams');
+  const MEMORY_V2_EPISODES_FILE = path.join(MEMORY_V2_DIR, 'episodes.jsonl');
+  const MEMORY_V2_FACTS_FILE = path.join(MEMORY_V2_DIR, 'facts.json');
+  const MEMORY_V2_META_FILE = path.join(MEMORY_V2_DIR, 'meta.json');
+  const memoryV2Store = { episodes: [], facts: [], meta: {} };
+  let memoryV2LlmBusy = false; // Episode/事实共用记忆整理会话（含旧引擎摘要），串行防串台
+  let memoryV2MetaSaveTimer = null;
+
+  function memoryV2Enabled() { return cfg.memoryV2?.enabled !== false; }
+
+  function metaMap(name) {
+    const m = memoryV2Store.meta;
+    if (!m[name] || typeof m[name] !== 'object' || Array.isArray(m[name])) m[name] = {};
+    return m[name];
+  }
+
+  function streamFileFor(key) {
+    return path.join(MEMORY_V2_STREAMS_DIR, sanitizeStreamKey(key) + '.jsonl');
+  }
+
+  function loadMemoryV2Store() {
+    try { fs.mkdirSync(MEMORY_V2_STREAMS_DIR, { recursive: true }); } catch {}
+    try {
+      const raw = fs.readFileSync(MEMORY_V2_EPISODES_FILE, 'utf8');
+      memoryV2Store.episodes = raw.split('\n').filter(Boolean).slice(-5000)
+        .map((l) => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+    } catch { memoryV2Store.episodes = []; }
+    try {
+      const data = readJsonSafe(MEMORY_V2_FACTS_FILE, { rows: [] }, false);
+      memoryV2Store.facts = Array.isArray(data?.rows) ? data.rows.filter((r) => r && typeof r === 'object') : [];
+    } catch { memoryV2Store.facts = []; }
+    try { memoryV2Store.meta = readJsonSafe(MEMORY_V2_META_FILE, {}, false) ?? {}; } catch { memoryV2Store.meta = {}; }
+  }
+
+  function saveMemoryV2MetaNow() {
+    try { fs.mkdirSync(MEMORY_V2_DIR, { recursive: true }); } catch {}
+    try { fs.writeFileSync(MEMORY_V2_META_FILE, JSON.stringify(memoryV2Store.meta, null, 2)); } catch {}
+  }
+
+  function saveMemoryV2MetaSoon() {
+    if (memoryV2MetaSaveTimer) return;
+    memoryV2MetaSaveTimer = setTimeout(() => {
+      memoryV2MetaSaveTimer = null;
+      saveMemoryV2MetaNow();
+    }, 30000);
+    if (memoryV2MetaSaveTimer.unref) memoryV2MetaSaveTimer.unref();
+  }
+
+  function saveMemoryV2Facts() {
+    try {
+      fs.mkdirSync(MEMORY_V2_DIR, { recursive: true });
+      fs.writeFileSync(MEMORY_V2_FACTS_FILE, JSON.stringify({ rows: memoryV2Store.facts }, null, 2));
+    } catch (error) { log('[memoryV2] 事实账本落盘失败: ' + (error?.message ?? error)); }
+  }
+
+  // ── 鲸鲸 2.0 B2/B3：每日计划 plans.jsonl + 目标队列 goals.jsonl（docs/upgrade-plan-2026-10.md）──
+  // plans.jsonl：每天一行，读取取「今天」最后一行（重跑自然覆盖）。
+  // goals.jsonl：追加式事件日志，同 id 后行覆盖前行，foldGoalLines 折叠出当前状态（崩溃安全）。
+  // B5 的 qq_self_adjust：她可以微调自己的主动参数（有硬边界），存 self-adjust.json 运行时覆盖 config。
+  const MEMORY_V2_PLANS_FILE = path.join(MEMORY_V2_DIR, 'plans.jsonl');
+  const MEMORY_V2_GOALS_FILE = path.join(MEMORY_V2_DIR, 'goals.jsonl');
+  const SELF_ADJUST_FILE = path.join(STATE_DIR, 'self-adjust.json');
+  const selfAdjust = (() => {
+    const raw = readJsonSafe(SELF_ADJUST_FILE, {}, false) ?? {};
+    // 注意 Number(null) === 0：部分写入后未设字段会以 null 落盘，重载时必须显式把
+    // null/undefined 归 null，否则 0 会变成「配额=0」的真实覆盖、把主动性全部关死。
+    const num = (v) => (v == null ? null : (Number.isFinite(Number(v)) ? Number(v) : null));
+    return {
+      probability: num(raw.probability),
+      quotaPerDayGroup: num(raw.quotaPerDayGroup),
+      quotaPerDayPrivate: num(raw.quotaPerDayPrivate),
+      idleThresholdMs: num(raw.idleThresholdMs),
+      updatedAt: Number(raw.updatedAt) || 0,
+      updatedBy: String(raw.updatedBy ?? '')
+    };
+  })();
+  const GOAL_LIMITS = {
+    maxActive: Math.max(2, Number(cfg.memoryV2?.goals?.maxActive) || 8),
+    maxAgeDays: Math.max(2, Number(cfg.memoryV2?.goals?.maxAgeDays) || 14),
+    keepClosed: Math.max(10, Number(cfg.memoryV2?.goals?.keepClosed) || 60)
+  };
+
+  function saveSelfAdjust() {
+    try {
+      fs.mkdirSync(STATE_DIR, { recursive: true });
+      fs.writeFileSync(SELF_ADJUST_FILE, JSON.stringify(selfAdjust, null, 2));
+    } catch (error) { log('[selfAdjust] 落盘失败: ' + (error?.message ?? error)); }
+  }
+
+  function readGoalRows() {
+    try {
+      const raw = fs.readFileSync(MEMORY_V2_GOALS_FILE, 'utf8');
+      return maintainGoals(foldGoalLines(raw.split('\n')), { ...GOAL_LIMITS, nowMs: Date.now() });
+    } catch { return []; }
+  }
+
+  function appendGoalRows(rows) {
+    try {
+      fs.mkdirSync(MEMORY_V2_DIR, { recursive: true });
+      fs.appendFileSync(MEMORY_V2_GOALS_FILE, rows.map((g) => JSON.stringify(g) + '\n').join(''));
+    } catch (error) { log('[goals] 落盘失败: ' + (error?.message ?? error)); }
+  }
+
+  function listActiveGoals() {
+    return readGoalRows().filter((g) => g?.status === 'active');
+  }
+
+  function getTodayPlan() {
+    const today = localDayKey(Date.now());
+    try {
+      const raw = fs.readFileSync(MEMORY_V2_PLANS_FILE, 'utf8');
+      const lines = raw.split('\n').filter(Boolean);
+      for (let i = lines.length - 1; i >= 0; i--) {
+        let obj;
+        try { obj = JSON.parse(lines[i]); } catch { continue; }
+        if (obj && obj.date === today) return normalizePlan(obj, { dateStr: today, nowMs: Date.now() });
+      }
+    } catch {}
+    return null;
+  }
+
+  function appendPlanLine(plan) {
+    try {
+      fs.mkdirSync(MEMORY_V2_DIR, { recursive: true });
+      fs.appendFileSync(MEMORY_V2_PLANS_FILE, JSON.stringify(plan) + '\n');
+    } catch (error) { log('[plan] 落盘失败: ' + (error?.message ?? error)); }
+  }
+
+  function trimStreamFile(key, file) {
+    try {
+      const raw = fs.readFileSync(file, 'utf8');
+      const keep = Math.max(1000, Number(cfg.memoryV2?.streams?.trimTo) || 12000);
+      const lines = raw.split('\n').filter(Boolean);
+      if (lines.length <= keep) return;
+      const tail = lines.slice(-keep);
+      fs.writeFileSync(file, tail.map((l) => l + '\n').join(''));
+      log('[memoryV2] 裁剪消息流 ' + key + '：' + lines.length + ' → ' + tail.length + ' 行');
+    } catch {}
+  }
+
+  function appendStreamLine(key, line) {
+    try { fs.mkdirSync(MEMORY_V2_STREAMS_DIR, { recursive: true }); } catch { return; }
+    const file = streamFileFor(key);
+    try {
+      fs.appendFileSync(file, JSON.stringify(line) + '\n');
+      try {
+        const capBytes = (Number(cfg.memoryV2?.streams?.capLines) || 20000) * 300;
+        if (fs.statSync(file).size > capBytes) trimStreamFile(key, file);
+      } catch {}
+    } catch (error) {
+      log('[memoryV2] 流落盘失败 ' + key + ': ' + (error?.message ?? error));
+    }
+  }
+
+  function readStreamLines(key, limit = 40) {
+    try {
+      const raw = fs.readFileSync(streamFileFor(key), 'utf8');
+      const lines = raw.split('\n').filter(Boolean);
+      return lines.slice(-Math.max(1, limit)).map((l) => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+    } catch { return []; }
+  }
+
+  // A1 总入口：所有进出消息（含她自己发的）记一条流；并推进 Episode/事实触发计数。
+  function noteConversationMessageV2(key, msg) {
+    if (!memoryV2Enabled() || !key) return;
+    // 鲸鲸 2.0 B4：她本人的外发（文本/拍一拍/表情）统一在这里回填心流——清静默计数、absent 回 watering
+    if (msg && msg.isSelf) { try { noteHeartflowOutcome(key, true); } catch {} }
+    try {
+      appendStreamLine(key, makeStreamLine({ ...msg, key }));
+      const eps = metaMap('epNewSince');
+      eps[key] = (eps[key] || 0) + 1;
+      const fns = metaMap('factsNewSince');
+      fns[key] = (fns[key] || 0) + 1;
+      saveMemoryV2MetaSoon();
+    } catch {}
+    try { void maybeRunEpisodePipeline(key).catch(() => {}); } catch {}
+  }
+
+  // A2：每流新增 N 条（群 30 / 私聊 12）→ 后台总结成 Episode 情景卡（Generative Agents importance）。
+  async function maybeRunEpisodePipeline(key) {
+    if (!memoryV2Enabled() || !dshReady || socialV2.paused || memoryV2LlmBusy) return;
+    const opts = cfg.memoryV2?.episodes ?? {};
+    const threshold = key.startsWith('group:')
+      ? (Number(opts.groupThreshold) || 30)
+      : (Number(opts.privateThreshold) || 12);
+    const eps = metaMap('epNewSince');
+    const since = eps[key] || 0;
+    if (since < threshold) return;
+    const failMap = metaMap('epLastFailAt');
+    if (Date.now() - (Number(failMap[key]) || 0) < (Number(opts.failRetryMs) || 600000)) return;
+    memoryV2LlmBusy = true;
+    try {
+      const lines = readStreamLines(key, Number(opts.promptMessages) || 40);
+      if (lines.length < Math.min(threshold, 10)) { eps[key] = 0; saveMemoryV2MetaSoon(); return; }
+      const prevSummaries = memoryV2Store.episodes
+        .filter((e) => e && e.key === key && !e.invalidated)
+        .slice(-2)
+        .map((e) => e.summary);
+      const convLabel = key.startsWith('group:') ? ('群 ' + key.split(':')[1]) : ('私聊 ' + key.split(':')[1]);
+      const promptText = buildEpisodePrompt({ convLabel, messages: lines, prevSummaries, herName: String(selfNickname || '鲸鲸') });
+      const sessionId = await ensureMemorySession();
+      const accepted = await api.sessions.prompt({ sessionId, mode: 'queue', content: [{ type: 'text', text: promptText }] });
+      if (accepted?.result && accepted.result.ok === false) { log('[memoryV2] Episode 提取被拒'); failMap[key] = Date.now(); saveMemoryV2MetaSoon(); return; }
+      const output = await waitLearnerTurn(sessionId, 180000);
+      const parsed = parseEpisodeJson(output);
+      const nextId = memoryV2Store.episodes.reduce((m, e) => Math.max(m, Number(e.id) || 0), 0) + 1;
+      const episode = normalizeEpisode(parsed, {
+        key, id: nextId,
+        spanFrom: lines[0]?.time, spanTo: lines[lines.length - 1]?.time,
+        msgCount: lines.length, now: Date.now()
+      });
+      if (!episode) { log('[memoryV2] Episode 解析为空（' + key + '）'); failMap[key] = Date.now(); saveMemoryV2MetaSoon(); return; }
+      memoryV2Store.episodes.push(episode);
+      const maxKeep = Number(opts.maxKeep) || 5000;
+      if (memoryV2Store.episodes.length > maxKeep) memoryV2Store.episodes = memoryV2Store.episodes.slice(-maxKeep);
+      try {
+        fs.mkdirSync(MEMORY_V2_DIR, { recursive: true });
+        if (memoryV2Store.episodes.length >= maxKeep) {
+          fs.writeFileSync(MEMORY_V2_EPISODES_FILE, memoryV2Store.episodes.map((e) => JSON.stringify(e) + '\n').join(''));
+        } else {
+          fs.appendFileSync(MEMORY_V2_EPISODES_FILE, JSON.stringify(episode) + '\n');
+        }
+      } catch {}
+      eps[key] = 0;
+      delete failMap[key];
+      saveMemoryV2MetaSoon();
+      log(`[memoryV2] Episode #${episode.id} ${key}（${lines.length} 条 → 重要度 ${episode.importance}）：${String(episode.summary).slice(0, 60)}`);
+    } catch (error) {
+      failMap[key] = Date.now();
+      saveMemoryV2MetaSoon();
+      log('[memoryV2] Episode 生成失败 ' + key + ': ' + (error?.message ?? error));
+    } finally {
+      memoryV2LlmBusy = false;
+    }
+  }
+
+  // A3：她发言的回合结束后 → 异步提取人物事实（mem0 ADD/UPDATE/DELETE 语义）。
+  function scheduleFactExtractionV2(key) {
+    if (!memoryV2Enabled() || !key) return;
+    setImmediate(() => { void runFactExtractionV2(key).catch(() => {}); });
+  }
+
+  async function runFactExtractionV2(key) {
+    if (!memoryV2Enabled() || !dshReady || socialV2.paused || memoryV2LlmBusy) return;
+    const opts = cfg.memoryV2?.facts ?? {};
+    const runMap = metaMap('factsLastRunAt');
+    const fns = metaMap('factsNewSince');
+    const now = Date.now();
+    if (now - (Number(runMap[key]) || 0) < (Number(opts.extractIntervalMs) || 300000)) return;
+    if ((fns[key] || 0) < (Number(opts.minNewLines) || 8)) return;
+    memoryV2LlmBusy = true;
+    try {
+      const lines = readStreamLines(key, Number(opts.promptMessages) || 40);
+      if (!lines.length) { runMap[key] = now; fns[key] = 0; saveMemoryV2MetaSoon(); return; }
+      // 相关旧事实：在场人物优先，其次无主老事实
+      const persons = new Set();
+      for (const l of lines) { if (l && !l.isSelf && l.sender) persons.add(String(l.sender)); }
+      const known = memoryV2Store.facts
+        .filter((f) => f && !f.invalidated && (!persons.size || persons.has(f.person) || !f.person))
+        .sort((a, b) => (Number(b.lastHitAt) || 0) - (Number(a.lastHitAt) || 0))
+        .slice(0, 12);
+      const convLabel = key.startsWith('group:') ? ('群 ' + key.split(':')[1]) : ('私聊 ' + key.split(':')[1]);
+      const promptText = buildFactPrompt({ convLabel, messages: lines, existingFacts: known, herName: String(selfNickname || '鲸鲸') });
+      const sessionId = await ensureMemorySession();
+      const accepted = await api.sessions.prompt({ sessionId, mode: 'queue', content: [{ type: 'text', text: promptText }] });
+      if (accepted?.result && accepted.result.ok === false) { log('[memoryV2] 事实提取被拒'); runMap[key] = now; saveMemoryV2MetaSoon(); return; }
+      const output = await waitLearnerTurn(sessionId, 180000);
+      const ops = parseFactOps(output).slice(0, (Number(opts.maxOps) || 6));
+      if (!ops.length) { runMap[key] = now; fns[key] = 0; saveMemoryV2MetaSoon(); return; }
+      const { rows, applied } = applyFactOps(memoryV2Store.facts, ops, { streamKey: key, now });
+      memoryV2Store.facts = rows;
+      const maxKeep = Number(opts.maxKeep) || 10000;
+      if (memoryV2Store.facts.length > maxKeep) {
+        // 上限裁剪：先淘汰已作废，再淘汰低重要度（稳定排序，不打乱正常顺序的相对次序）
+        memoryV2Store.facts.sort((a, b) => (Number(!!a.invalidated) - Number(!!b.invalidated)) || ((Number(a.importance) || 3) - (Number(b.importance) || 3)));
+        memoryV2Store.facts = memoryV2Store.facts.slice(-maxKeep);
+      }
+      saveMemoryV2Facts();
+      // v2→旧账本镜像：新 ADD 的事实同步写 memory.db（qq_db_recall 等旧工具读旧账本；三元组抽取顺带覆盖）。
+      // 只镜像新增：UPDATE/DELETE 的旧账本同步交给夜间维护的近似合并，避免双写打架。
+      for (const a of applied) {
+        if (a.op !== 'ADD' || !a.fact) continue;
+        try {
+          insertFactRow(getMemoryDb(), {
+            content: `[${a.person || '某人'}] ${a.fact}`.slice(0, 200),
+            category: 'fact',
+            sourceKey: key,
+            importance: Math.max(1, Math.min(5, Math.round((Number(a.importance) || 6) / 2)))
+          });
+        } catch {}
+      }
+      runMap[key] = now;
+      fns[key] = 0;
+      saveMemoryV2MetaSoon();
+      const add = applied.filter((p) => p.op === 'ADD').length;
+      const upd = applied.filter((p) => p.op === 'UPDATE').length;
+      const del = applied.filter((p) => p.op === 'DELETE').length;
+      log(`[memoryV2] 事实账本 ${key}：新增 ${add}，更新 ${upd}，作废 ${del}（有效共 ${memoryV2Store.facts.filter((f) => !f.invalidated).length} 条）`);
+    } catch (error) {
+      runMap[key] = Date.now(); // 失败也占住节流位，防止每回合都撞
+      saveMemoryV2MetaSoon();
+      log('[memoryV2] 事实提取失败 ' + key + ': ' + (error?.message ?? error));
+    } finally {
+      memoryV2LlmBusy = false;
+    }
+  }
+
+  // A3 存量导入：memory.db facts 表 → v2 账本（一次性，meta.legacyImportedAt 幂等；0.9 相似度内部去重）。
+  function importLegacyFactsV2() {
+    if (!memoryV2Enabled() || cfg.memoryV2?.legacyImport === false) return;
+    if (Number(memoryV2Store.meta.legacyImportedAt) > 0) return;
+    memoryV2Store.meta.legacyImportedAt = Date.now();
+    try {
+      const db = getMemoryDb();
+      const rows = db.prepare('SELECT id, content, category, source_key, importance, created_at, updated_at FROM facts').all();
+      let nextId = memoryV2Store.facts.reduce((m, f) => Math.max(m, Number(f.id) || 0), 0);
+      let imported = 0;
+      for (const r of rows) {
+        const fact = String(r.content || '').trim().slice(0, 200);
+        if (!fact) continue;
+        const { score } = matchFact(memoryV2Store.facts, '', fact);
+        if (score >= 0.9) continue;
+        nextId += 1;
+        memoryV2Store.facts.push(legacyFactToV2({ ...r, content: fact }, nextId));
+        imported += 1;
+      }
+      saveMemoryV2Facts();
+      log('[memoryV2] 存量事实导入：' + imported + ' 条（旧账本 ' + rows.length + ' 条）');
+    } catch (error) {
+      log('[memoryV2] 存量导入失败: ' + (error?.message ?? error));
+    }
+    saveMemoryV2MetaNow();
+  }
+
+  try { loadMemoryV2Store(); } catch (error) { log('[memoryV2] 加载失败: ' + (error?.message ?? error)); }
+  try { importLegacyFactsV2(); } catch {}
+
+  // ── A4/A5：三因子召回 + 唤醒注入（节流 180s / 缓存 300s / 命中强化）──
+  const memoryV2RecallCache = new Map(); // key → { at, episodes, facts }
+  const memoryV2InjectAt = new Map();    // key → 上次实际注入时间
+
+  function recallMemoryV2(key, st) {
+    const empty = { episodes: [], facts: [] };
+    if (!memoryV2Enabled()) return empty;
+    const opts = cfg.memoryV2?.recall ?? {};
+    const now = Date.now();
+    const cached = memoryV2RecallCache.get(key);
+    if (cached && now - cached.at < (Number(opts.cacheMs) || 300000)) return cached;
+    // 查询文本：最近 6 条别人发的话（相关性因子）；在场人：最近 30 条里的非自发发言者
+    const recentAll = Array.isArray(st?.recentMessages) ? st.recentMessages : [];
+    const recent = recentAll.filter((m) => m && !m.isSelf).slice(-6);
+    const queryText = recent.map((m) => String(m.plain || m.text || '')).join(' ').slice(0, 240);
+    const presentPeople = [];
+    for (const m of recentAll.slice(-30)) {
+      if (!m || m.isSelf) continue;
+      if (m.sender && !presentPeople.includes(String(m.sender))) presentPeople.push(String(m.sender));
+      if (m.userId && !presentPeople.includes(String(m.userId))) presentPeople.push(String(m.userId));
+    }
+    // 隐私（与 recallFactLines/privateLeak 同规则）：群聊只见「本群 + 共享组」来源；私聊不限来源。
+    const isGroup = String(key).startsWith('group:');
+    const allowed = isGroup ? visibleKeysFor(String(key), cfg.memoryV2?.sharedGroups) : null;
+    const result = scoreMemoryV2Candidates({
+      episodes: memoryV2Store.episodes.filter((e) => e && e.key === key),
+      facts: memoryV2Store.facts,
+      queryText, nowMs: now,
+      allowedSources: allowed, presentPeople,
+      maxEpisodes: opts.episodeLines ?? 2, maxFacts: opts.factLines ?? 4, minScore: opts.minScore ?? 0.05
+    });
+    // 命中强化：被召回的事实回写 lastHitAt（喂 A10 衰减——"常想起的才留得久"）
+    const hitIds = new Set(result.facts.map((x) => Number(x.id)));
+    let hitTouched = false;
+    for (const f of memoryV2Store.facts) {
+      if (hitIds.has(Number(f.id)) && (Number(f.lastHitAt) || 0) < now) { f.lastHitAt = now; hitTouched = true; }
+    }
+    if (hitTouched) saveMemoryV2Facts();
+    memoryV2RecallCache.set(key, { at: now, episodes: result.episodes, facts: result.facts });
+    return result;
+  }
+
+  // 注入口：buildWakePromptV2 用。缓存照常更新，注入按 throttleMs 节流。
+  function recallMemoryV2Lines(key, st) {
+    const r = recallMemoryV2(key, st);
+    const opts = cfg.memoryV2?.recall ?? {};
+    const throttleMs = Number(opts.throttleMs) || 180000;
+    const now = Date.now();
+    if ((Number(memoryV2InjectAt.get(key)) || 0) > now - throttleMs) return { episodes: [], facts: [] };
+    if (r.episodes.length || r.facts.length) memoryV2InjectAt.set(key, now);
+    return r;
+  }
+
+  // 旧→v2 镜像：qq_db_remember / 旧摘要管线写进 memory.db 的事实同步进 2.0 账本（注入走 v2）。
+  // '[某人] 事实' 前缀会解析成 person；0.9 相似去重；幂等无递归（只动 v2 store，不回调 insertFactRow）。
+  function mirrorLegacyFactToV2(content, sourceKey, importance) {
+    if (!memoryV2Enabled() || !content) return;
+    const fact = String(content).slice(0, 200);
+    let person = '';
+    const m = /^\[([^\[\]]{1,20})\]\s*/.exec(fact);
+    if (m) { person = m[1]; }
+    const bare = (m ? fact.slice(m[0].length) : fact).trim() || fact;
+    const found = matchFact(memoryV2Store.facts, '', bare);
+    if (found.row && found.score >= 0.9) { found.row.lastHitAt = Date.now(); return; }
+    const nextId = memoryV2Store.facts.reduce((mx, f) => Math.max(mx, Number(f.id) || 0), 0) + 1;
+    memoryV2Store.facts.push(legacyFactToV2({ content: bare, source_key: sourceKey, importance }, nextId));
+    if (person) memoryV2Store.facts[memoryV2Store.facts.length - 1].person = person;
+    saveMemoryV2Facts();
+  }
+
   // facts 与 FTS 索引同步（中文用二元切分，见 memory-engine.js）
   function insertFactRow(db, { content, category, sourceKey, importance }) {
     const now = Date.now();
@@ -9987,6 +10787,8 @@ async function main() {
     try { db.prepare('INSERT INTO facts_fts (rowid, content, bigrams) VALUES (?, ?, ?)').run(id, content, toBigrams(content)); }
     catch (error) { log('[memory] FTS 索引写入失败（该条事实暂时搜不到）:', error?.message ?? error); }
     ingestTriplesFromFact({ content, sourceKey, importance });
+    // 鲸鲸 2.0 旧→v2 镜像：qq_db_remember/旧摘要管线写入的事实同步进 2.0 账本（召回注入走 v2）。
+    try { mirrorLegacyFactToV2(content, sourceKey, importance); } catch {}
     return { id, deduped: false };
   }
 
@@ -10347,6 +11149,135 @@ async function main() {
   }, 10 * 60 * 1000);
   if (reflectTimer.unref) reflectTimer.unref();
 
+  // ── 鲸鲸 2.0 B2/B3：晨间自规划（每日计划 + 目标队列维护） ──────────────
+  // 与复盘同修：锚点=最近一次 planHour 计划时刻（默认 8 点，cfg.autonomy.planHour），
+  // 上次执行早于锚点就补跑。LLM 走记忆整理会话（ensureMemorySession + queue + waitLearnerTurn），
+  // 不额外唤醒她——计划是后台生成的数据，白天她被任何理由唤醒时都会在 prompt 里看到。
+  // 失败不烧当天名额：只有成功或连续失败 ≥6 次（约 1 小时）才写 lastPlanAt。
+  async function runMorningPlanV2() {
+    if (cfg.memoryV2?.enabled === false) return false;
+    const dateStr = localDayKey(Date.now());
+    const drive = selectDrive();
+    const activeGoals = listActiveGoals();
+    // 话头：全部会话里还活着的 pendingThought（明早开口的原料）
+    const pendingThoughts = [];
+    for (const key of socialV2.conversations.keys()) {
+      const st = socialV2.conversations.get(key);
+      const list = Array.isArray(st?.pendingThoughts) ? st.pendingThoughts : [];
+      for (const t of list) {
+        if (pendingThoughts.length >= 6) break;
+        if (!t || (t.expiresAt && Date.now() >= Number(t.expiresAt))) continue;
+        pendingThoughts.push({ text: String(t.text ?? '').slice(0, 40) });
+      }
+    }
+    // 常联系的人：好感度绝对值排序（她的世界里有分量的人）
+    let people = [];
+    try {
+      const db = getMemoryDb();
+      people = db.prepare('SELECT member_id AS memberId, name, score, notes FROM affinity ORDER BY ABS(score) DESC LIMIT 8').all()
+        .map((r) => ({ name: r.name || r.memberId, score: r.score, note: r.notes }));
+    } catch {}
+    const sessionId = await ensureMemorySession();
+    if (!sessionId) return false;
+    const prompt = buildMorningPlanPrompt({
+      dateStr, drive,
+      lifeLabel: LIFE_EFFECTS[heartLifeNow(Date.now()).state]?.label ?? '',
+      activeGoals, pendingThoughts, people
+    });
+    await api.sessions.prompt({ sessionId, mode: 'queue', content: [{ type: 'text', text: prompt }] });
+    const text = await waitLearnerTurn(sessionId, Number(cfg.autonomy?.planTimeoutMs) || 90000);
+    const parsed = parseMorningPlanResult(text);
+    if (!parsed) return false;
+    const plan = normalizePlan({ ...parsed, drive }, { dateStr, nowMs: Date.now() });
+    appendPlanLine(plan);
+    let goalNote = '';
+    if (parsed.goalOps && (parsed.goalOps.add?.length || parsed.goalOps.done?.length || parsed.goalOps.abandon?.length || parsed.goalOps.progress?.length)) {
+      const rows = readGoalRows();
+      const { rows: next, applied } = applyGoalOps(rows, parsed.goalOps, Date.now());
+      appendGoalRows(next);
+      if (applied.added || applied.done || applied.abandoned || applied.progressed) {
+        goalNote = `，目标 +${applied.added} done ${applied.done} abandon ${applied.abandoned} note ${applied.progressed}`;
+      }
+    }
+    log(`[plan] ${dateStr} 晨间计划已生成：话题 ${plan.topics.length}、想找 ${plan.people.length}、想学 ${plan.learnings.length}${goalNote}`);
+    return true;
+  }
+  const planTimer = setInterval(async () => {
+    try {
+      if (cfg.autonomy?.enabled === false || cfg.memoryV2?.enabled === false) return;
+      if (!dshReady || socialV2.paused) return;
+      const hour = Number(cfg.autonomy?.planHour);
+      const targetHour = Number.isFinite(hour) ? hour : 8;
+      const now = new Date();
+      const sched = lastScheduledAt(targetHour, now);
+      const auto = readAutonomy();
+      const lastPlan = Number(auto.lastPlanAt) || 0;
+      if (lastPlan >= sched.getTime()) return;
+      try {
+        const ok = await runMorningPlanV2();
+        const auto2 = readAutonomy();
+        if (ok) { auto2.lastPlanAt = Date.now(); auto2.planFailCount = 0; }
+        else {
+          auto2.planFailCount = (Number(auto2.planFailCount) || 0) + 1;
+          if (auto2.planFailCount >= 6) { auto2.lastPlanAt = Date.now(); auto2.planFailCount = 0; log('[plan] 连续 6 次失败，今天放弃晨间规划'); }
+        }
+        writeAutonomy(auto2);
+      } catch (error) {
+        log('[plan] 晨间规划执行失败: ' + (error?.message ?? error));
+      }
+    } catch (error) { log('[plan] 调度失败: ' + (error?.message ?? error)); }
+  }, 10 * 60 * 1000);
+  if (planTimer.unref) planTimer.unref();
+
+  // ── 鲸鲸 2.0 A7：画像夜刷（消费事实账本 → 重写 affinity.profile） ──
+  // 与夜间维护同班车：事实账本攒够 ≥3 条 active 事实的人（按事实量排序，每晚最多 maxPersons=8 个），
+  // 每人一次 LLM 增量修订 profile（JSON 列）。旧 profile 由 prompt 之外的存量行提供；
+  // 不确定字段输出空串（不编造）。画像行存在就 UPDATE，不存在就 INSERT 中性行。
+  async function runPersonaRefreshV2() {
+    if (cfg.memoryV2?.enabled === false) return { updated: 0 };
+    if (!dshReady || socialV2.paused) return { updated: 0 };
+    const byPerson = new Map();
+    for (const f of memoryV2Store.facts) {
+      if (!f || f.invalidated) continue;
+      const person = String(f.person ?? '').trim();
+      if (!person || person === '多人' || person === '未知') continue;
+      if (!byPerson.has(person)) byPerson.set(person, []);
+      byPerson.get(person).push(f);
+    }
+    const candidates = [...byPerson.entries()]
+      .map(([person, facts]) => ({ person, facts: [...facts].sort((a, b) => Number(b.updatedAt || b.createdAt || 0) - Number(a.updatedAt || a.createdAt || 0)) }))
+      .filter((c) => c.facts.length >= 3)
+      .sort((a, b) => b.facts.length - a.facts.length)
+      .slice(0, Math.max(1, Number(cfg.memoryV2?.persona?.maxPersons) || 8));
+    if (!candidates.length) return { updated: 0 };
+    const sessionId = await ensureMemorySession();
+    if (!sessionId) return { updated: 0 };
+    const db = getMemoryDb();
+    let updated = 0;
+    for (const c of candidates) {
+      try {
+        let row = db.prepare('SELECT member_id AS memberId, name FROM affinity WHERE member_id = ?').get(c.person);
+        if (!row) row = db.prepare('SELECT member_id AS memberId, name FROM affinity WHERE name = ?').get(c.person);
+        const name = row?.name || c.person;
+        const prompt = buildPersonaRefreshPrompt({ name, facts: c.facts.map((f) => f.fact) });
+        await api.sessions.prompt({ sessionId, mode: 'queue', content: [{ type: 'text', text: prompt }] });
+        const text = await waitLearnerTurn(sessionId, Number(cfg.autonomy?.planTimeoutMs) || 90000);
+        const parsed = parsePersonaRefreshResult(text);
+        if (!parsed) continue;
+        const profileJson = JSON.stringify(parsed);
+        if (row?.memberId) {
+          db.prepare('UPDATE affinity SET profile = ?, updated_at = ? WHERE member_id = ?').run(profileJson, Date.now(), String(row.memberId));
+        } else {
+          db.prepare('INSERT OR IGNORE INTO affinity (member_id, name, score, notes, profile, updated_at) VALUES (?, ?, 0, \'\', ?, ?)')
+            .run(c.person, name, profileJson, Date.now());
+        }
+        updated += 1;
+        log(`[persona] 画像刷新：${name}（${c.facts.length} 条事实）`);
+      } catch (error) { log('[persona] 单人刷新失败 ' + c.person + ': ' + (error?.message ?? error)); }
+    }
+    return { updated };
+  }
+
   // ── 自主性：高好感度久未联系 → 主动关心 ──
   const careTimer = setInterval(async () => {
     try {
@@ -10407,6 +11338,21 @@ async function main() {
     const db = getMemoryDb();
     const now = Date.now();
     let merged = 0, decayed = 0, archived = 0;
+    // 7) 鲸鲸 2.0 A10（放最前：旧链路关闭时 v2 维护照跑）——stale 作废 / 同人近似合并 / 老旧情节淘汰
+    let v2stats = null;
+    if (memoryV2Enabled() && cfg.memoryV2?.maintain !== false) {
+      try {
+        const r2 = maintainMemoryV2Rows({
+          episodes: memoryV2Store.episodes, facts: memoryV2Store.facts, nowMs: now,
+          ...(cfg.memoryV2?.maintain ?? {})
+        });
+        memoryV2Store.episodes = r2.episodes;
+        memoryV2Store.facts = r2.facts;
+        saveMemoryV2Facts();
+        try { fs.writeFileSync(MEMORY_V2_EPISODES_FILE, memoryV2Store.episodes.map((e) => JSON.stringify(e) + '\n').join('')); } catch {}
+        v2stats = r2.stats;
+      } catch (error) { log('[memoryV2] 夜间维护失败: ' + (error?.message ?? error)); }
+    }
     // 1) 同文合并：保留最新一条，重要度取最大值
     const dups = db.prepare('SELECT content, COUNT(*) AS c, MAX(id) AS keep, MAX(importance) AS mi FROM facts GROUP BY content HAVING c > 1').all();
     for (const d of dups) {
@@ -10467,11 +11413,11 @@ async function main() {
     //    不另开定时器 —— 三元组的合并争议（谁和谁是同一条）本来就该在低峰期一次算完。
     let triples = null;
     try { triples = mergeTriplesWeekly(); } catch (error) { log('[triples] 周合并失败: ' + (error?.message ?? error)); }
-    return { merged, decayed, archived, triples };
+    return { merged, decayed, archived, triples, v2: v2stats };
   }
   const maintainTimer = setInterval(() => {
     try {
-      if (cfg.memory?.enabled === false || cfg.memory?.maintain === false) return;
+      if ((cfg.memory?.enabled === false || cfg.memory?.maintain === false) && !memoryV2Enabled()) return;
       const nowD = new Date();
       const hour = Number.isFinite(Number(cfg.memory?.maintainHour)) ? Number(cfg.memory?.maintainHour) : 1;
       // P8-2：与复盘同修——凌晨 1 点机器不在线时不再整轮丢失，恢复后补跑（纯 DB 操作，不需要 DSH）
@@ -10482,7 +11428,9 @@ async function main() {
       autoM.lastMaintainDate = sched.toISOString().slice(0, 10); // 兼容旧字段
       writeAutonomy(autoM);
       const r = runMemoryMaintenance();
-      log(`[memory] 夜间维护：合并重复 ${r.merged} 组，清理低价值 ${r.decayed} 条，归档跟进 ${r.archived} 条${r.triples ? `，三元组 ${r.triples.before} → ${r.triples.after} 条（合并 ${r.triples.merged}，淘汰 ${r.triples.dropped}）` : ''}`);
+      log(`[memory] 夜间维护：合并重复 ${r.merged} 组，清理低价值 ${r.decayed} 条，归档跟进 ${r.archived} 条${r.triples ? `，三元组 ${r.triples.before} → ${r.triples.after} 条（合并 ${r.triples.merged}，淘汰 ${r.triples.dropped}）` : ''}${r.v2 ? `，v2 账本作废 ${r.v2.factsInvalidated} 条 / 合并 ${r.v2.factsMerged} 条 / 淘汰情节 ${r.v2.episodesDropped} 段` : ''}`);
+      // 鲸鲸 2.0 A7：画像夜刷——事实账本攒够了的人，消费事实重写 affinity.profile（LLM，异步不阻塞）
+      void runPersonaRefreshV2().catch((e) => log('[persona] 夜刷失败: ' + (e?.message ?? e)));
     } catch (error) { log('[memory] 夜间维护失败: ' + (error?.message ?? error)); }
   }, 10 * 60 * 1000);
   if (maintainTimer.unref) maintainTimer.unref();
@@ -10504,6 +11452,8 @@ async function main() {
         isSelf: true,
         time: now + i * 1000
       });
+      // 鲸鲸 2.0 A1：她自己发出去的话也进消息流（Episode/事实提取需要她的发言在场）。
+      try { noteConversationMessageV2(key, { kind: 'message', sender: '我', isSelf: true, isOwner: true, text, time: now + i * 1000 }); } catch {}
     }
     if (st.recentMessages.length > recentLimit) st.recentMessages.splice(0, st.recentMessages.length - recentLimit);
     // P1-4：记下本轮说出去的话，收尾时与「内心」比对（让步判定）
@@ -10727,6 +11677,19 @@ async function main() {
     const personaLine = personaStateText
       ? `${/^【/.test(personaStateText) ? personaStateText : `【此刻的你】${personaStateText}`}\n\n`
       : '';
+    // 鲸鲸 2.0 B1/B4：心核状态行（生活状态 + 对此聊天流的投入度 + 回复深度提示）
+    let heartLine = '';
+    if (heartEnabled()) {
+      const lifeFx = LIFE_EFFECTS[heartLifeNow().state];
+      const hf = heartflowStateOf(st);
+      heartLine = heartLineFor({
+        lifeLabel: lifeFx.label,
+        lifeDepthHint: lifeFx.depthHint,
+        heartflowLabel: HEARTFLOW_EFFECTS[hf].label,
+        streamLabel: key.startsWith('group:') ? '群' : '私聊'
+      });
+      if (heartLine) heartLine += '\n';
+    }
     const wc = st.wakeConfig || {};
     const wcTr = wc.triggers || {};
     const wcMode = wc.mode === 'active' ? '活跃' : '潜水';
@@ -10741,13 +11704,22 @@ async function main() {
     if (wcTr.anyMessage) wcTriggers.push('任意消息');
     if (Number(wcTr.probability) > 0) wcTriggers.push(`概率${wcTr.probability}`);
     const wakeLine = `【当前唤醒】${wcMode}，${wcTime}${wcTriggers.length ? `；触发：${wcTriggers.join('/')}` : ''}\n\n`;
-    const factLines = recallFactLines(key, st, 4);
+    // 鲸鲸 2.0 A4/A5：三因子召回注入。情景回忆独立成块；有 v2 事实时替换旧 facts 注入（避免同一事实两份）。
+    const v2Recall = recallMemoryV2Lines(key, st);
+    const v2EpisodeLine = v2Recall.episodes.length
+      ? `【近期回忆（自动想起的最近经历）】\n${v2Recall.episodes.map((x) => x.text).join('\n')}\n（像人一样顺口想起，别照着念清单）\n\n`
+      : '';
+    let factLines = v2Recall.facts.map((x) => x.text);
+    if (!factLines.length) factLines = recallFactLines(key, st, 4); // 旧链兜底（含三元组）
     const factLine = factLines.length
       ? `【相关记忆（自动想起的长期事实）】\n${factLines.join('\n')}\n（这些是你确实记过的，用得上就自然提起，别照着念清单；想翻更多用 qq_db_recall）\n\n`
       : '';
-    const base = roleLine + tokenLine + antiAiLine + proactiveLine + stickerLine + preSleepLine + statusLine + personaLine + wakeLine + memoryLine + factLine + participationLine;
+    // B2/B3：今日计划 + 目标队列注入（所有唤醒都带上——她随时知道自己今天想干嘛）
+    const planLine = renderPlanLines(getTodayPlan());
+    const goalLine = renderGoalLines(listActiveGoals());
+    const base = roleLine + tokenLine + antiAiLine + proactiveLine + stickerLine + preSleepLine + statusLine + personaLine + heartLine + planLine + goalLine + wakeLine + memoryLine + v2EpisodeLine + factLine + participationLine;
     if (reason === 'reflect') {
-      return `${base}【每日复盘】现在是今天的自我整理时间，不需要给任何人发消息（除非你确实想对主人说一句）。\n请按顺序做三件事：\n1) 回顾今天：用 qq_db_recall 看看近期记忆，用 qq_affinity(action=list) 看关系变化；\n2) 沉淀：值得长期记住的写进 qq_db_remember；对某人的观感变了就 qq_affinity(action=bump/set) 更新；对自己的新发现写 qq_self_note；\n3) 给明天留话头：想主动聊的话题/想问的事，用 qq_memory_append(category=pendingThought, extra.expiresAtMs=从现在到明早合适时间的毫秒数，一般 10~16 小时后过期) 记 1~2 条，明早被叫醒时你会自然带着这个话题开口；也可以 qq_set_reminder 设具体提醒。\n注意：已被移出或停用的群不要规划话题。做完用 qq_mark_read 或 qq_set_wake_config 正常收尾即可。`;
+      return `${base}【每日复盘】现在是今天的自我整理时间，不需要给任何人发消息（除非你确实想对主人说一句）。\n请按顺序做五件事：\n1) 回顾今天：用 qq_db_recall 看看近期记忆，用 qq_affinity(action=list) 看关系变化；\n2) 核对今日计划（见上方【今日计划】）：逐项想想做到了没、为什么没做到；值得记的经过/教训用 qq_db_remember 写进日记（1~3 条，像写给自己看的日记，别记流水账）；\n3) 目标闭环（见上方【她的目标】）：有进展的用 qq_goal(action=note, id, note) 记一笔；完成了 action=done；确定不做了 action=abandon 并写一句放弃原因；都还在推进就留着；\n4) 沉淀与洞见：对某人的观感变了就 qq_affinity(action=bump/set) 更新；今天悟出的 2~3 条高阶洞见（关于自己怎么跟人相处/什么场合说什么话/自己的风格偏好）用 qq_self_note(kind=insight) 写下来；\n5) 给明天留话头：想主动聊的话题/想问的事，用 qq_memory_append(category=pendingThought, extra.expiresAtMs=从现在到明早合适时间的毫秒数，一般 10~16 小时后过期) 记 1~2 条，明早被叫醒时你会自然带着这个话题开口；也可以 qq_set_reminder 设具体提醒。\n注意：已被移出或停用的群不要规划话题。做完用 qq_mark_read 或 qq_set_wake_config 正常收尾即可。`;
     }
     if (reason === 'care') {
       return `${base}【主动关心】提示里提到的朋友已经有一阵子没出现了。\n可以主动发一句自然的问候或分享（别一本正经地“你最近怎么不来了”），参考你们之前的相处方式和好感度；如果觉得现在开口不合适，也可以只更新一下记忆、安静收尾。`;
@@ -10777,7 +11749,7 @@ async function main() {
         : '';
       // P0-2：把配额余量告诉她。不告诉的话她不知道今天还剩几次机会，可能上午就把额度用完，
       // 后半天想说话却张不开嘴，只能困惑地安静收尾。
-      const quota = proactiveQuotaPerDay();
+      const quota = proactiveQuotaPerDay(key);
       const quotaNote = quota >= 0
         ? `【今日主动机会】本次是第 ${proactiveUsedToday(key)}/${quota} 次（每天上限，用完后不会再被主动唤醒，只能等主人说话）。请把额度留给真正想说的那一句，别为冒泡而冒泡。\n`
         : '';
@@ -11143,8 +12115,13 @@ async function main() {
   // 再吃配额只会把日常闲聊挤没。判定逻辑在 src/proactive-quota.js（纯函数，可单测）。
   // 日期一律本地时区（见 repeat-schedule.js 的时区纪律）：用 toISOString 会在当地早上 8 点
   // 才换日，于是「今天」一直是昨天，配额要拖到下午才刷新。
-  function proactiveQuotaPerDay() {
-    return quotaPerDayFromConfig(cfg.socialV2?.proactive?.quotaPerDay);
+  function proactiveQuotaPerDay(key) {
+    // 鲸鲸 2.0 C：配额按类型（群/私聊）区分；旧配置的单一数字仍作统一值生效。
+    // B5：她用 qq_self_adjust 自调的值优先于 config（硬边界在路由层已保证）。
+    const isGroup = /^group:/.test(String(key));
+    if (isGroup && Number.isFinite(selfAdjust.quotaPerDayGroup) && selfAdjust.quotaPerDayGroup !== null) return selfAdjust.quotaPerDayGroup;
+    if (!isGroup && Number.isFinite(selfAdjust.quotaPerDayPrivate) && selfAdjust.quotaPerDayPrivate !== null) return selfAdjust.quotaPerDayPrivate;
+    return quotaPerDayFor(cfg.socialV2?.proactive?.quotaPerDay, isGroup);
   }
   function proactiveUsedToday(key, ts = Date.now()) {
     try {
@@ -11158,6 +12135,80 @@ async function main() {
         'INSERT INTO proactive_quota (conv_key, day, count, updated_at) VALUES (?, ?, 1, ?) ON CONFLICT(conv_key, day) DO UPDATE SET count = count + 1, updated_at = excluded.updated_at'
       ).run(key, localDayKey(ts), ts);
     } catch (error) { log('[reserved2] 主动配额计数失败:', error?.message ?? error); }
+  }
+
+  // ── 鲸鲸 2.0 B 层接线：生活状态机 + 三态心流（决策在 src/heart-core.mjs 纯函数） ──
+  function heartEnabled() { return cfg.heart?.enabled !== false; }
+  function heartLifeNow(nowMs = Date.now()) {
+    return lifeStateFor(new Date(nowMs).getHours(), cfg.heart?.schedule);
+  }
+  function heartflowCfg() {
+    return normalizeHeartflowConfig({ ...(cfg.heart?.heartflow ?? {}) });
+  }
+  function heartflowStateOf(st) {
+    const s = st?.heartflowState;
+    return s === 'absent' || s === 'watering' || s === 'focused' ? s : 'watering';
+  }
+  function countFocusedStreams(excludeKey = '') {
+    let n = 0;
+    for (const [k, st] of socialV2.conversations) {
+      if (k === excludeKey) continue;
+      if (st && st.heartflowState === 'focused') n++;
+    }
+    return n;
+  }
+  // 回合结果回填：engaged=true（她发言了）清静默计数、absent→watering；
+  // engaged=false（她选择静默/输出为空）计数+1 并当场评估降级。绝不影响主链路。
+  function noteHeartflowOutcome(key, engaged) {
+    try {
+      if (!heartEnabled()) return;
+      const st = getSocialV2State(key);
+      if (engaged) {
+        st.heartflowSilentCount = 0;
+        if (st.heartflowState === 'absent') {
+          st.heartflowState = 'watering';
+          log(`[heart] ${key} 心流 absent → watering（她开口了）`);
+        }
+        return;
+      }
+      st.heartflowSilentCount = (Number(st.heartflowSilentCount) || 0) + 1;
+      const tr = heartflowTransition({
+        state: heartflowStateOf(st),
+        silentCount: st.heartflowSilentCount,
+        idleMs: Date.now() - (st.lastIncomingAt || 0),
+        interestScore: null,
+        focusedCount: countFocusedStreams(key),
+        ...heartflowCfg()
+      });
+      if (tr.changed) {
+        st.heartflowState = tr.state;
+        log(`[heart] ${key} 心流 → ${tr.state}（${tr.reason}）`);
+        saveSocialV2State();
+      }
+    } catch { /* 心流回填绝不影响主链路 */ }
+  }
+  // B4 兴趣评估（LLM，节流由调用方控制）：读最近 N 条 → want 0~1；失败/解析不了 → null
+  async function runInterestEvalV2(key, st, { lifeLabel = '', planTopics = [] } = {}) {
+    if (!heartEnabled()) return null;
+    try {
+      const sessionId = await ensureMemorySession();
+      if (!sessionId) return null;
+      const recent = (Array.isArray(st.recentMessages) ? st.recentMessages : [])
+        .filter((m) => m && !m.isSelf)
+        .slice(-(Number(cfg.heart?.interest?.maxMessages) || 20))
+        .map((m) => `${String(m.sender || '未知')}：${String(m.plain || m.text || '').slice(0, 100)}`);
+      const prompt = buildInterestPrompt({ streamLabel: key, lifeLabel, recentLines: recent, planTopics });
+      await api.sessions.prompt({ sessionId, mode: 'queue', content: [{ type: 'text', text: prompt }] });
+      const text = await waitLearnerTurn(sessionId, Number(cfg.heart?.interest?.timeoutMs) || 60000);
+      const parsed = parseInterestResult(text);
+      if (!parsed) return null;
+      st.heartflowInterest = { score: parsed.want, reason: parsed.reason, at: Date.now() };
+      log(`[heart] ${key} 兴趣评估：${parsed.want.toFixed(2)}（${parsed.reason}）`);
+      return st.heartflowInterest;
+    } catch (error) {
+      log('[heart] 兴趣评估失败（已忽略）:', error?.message ?? error);
+      return null;
+    }
   }
 
   // ── 阶段 6：自主改配置的「服务端硬边界 + 审计 + 回滚」 ────────────────────
@@ -11372,6 +12423,12 @@ async function main() {
       if (socialV2.paused) return skip('已暂停');
       if (currentMode !== 'reserved2') return skip(`当前模式 ${currentMode} 不是 reserved2`);
       if (!cfg.ownerQQ) return skip('没配置主人 QQ');
+      // 鲸鲸 2.0 B1：生活状态机接管作息——睡眠不主动开口，摸鱼降频一半
+      if (heartEnabled()) {
+        const lifeState = heartLifeNow().state;
+        if (lifeState === 'sleeping') return skip('生活状态：睡眠');
+        if (lifeState === 'slacking' && Math.random() < 0.5) return skip('生活状态：摸鱼降频');
+      }
       const key = `private:${String(cfg.ownerQQ)}`;
       if (!isSessionAllowedInCurrentMode(key)) return skip(`${key} 不在当前模式白名单`);
       const st = getSocialV2State(key);
@@ -11408,7 +12465,7 @@ async function main() {
         return;
       }
       // 每日主动机会是共享额度：她自己开口也算一次，用完就等明天（见 proactiveQuotaPerDay）。
-      const quota = proactiveQuotaPerDay();
+      const quota = proactiveQuotaPerDay(key);
       if (quota >= 0 && proactiveUsedToday(key, nowMs) >= quota) {
         appendInitiativeLog({ type: 'blocked-quota', v: 1, ts: nowMs, id: entry.id, key, quota, used: proactiveUsedToday(key, nowMs) });
         log(`[initiative] 想开口但今日主动额度已用完（${quota} 次），留到明天`);
@@ -11453,6 +12510,83 @@ async function main() {
     }
   }
 
+  // B2 接线：今日计划话题（读 plans.jsonl，供 C 层 topicMatchScore 挑时机）
+  function getTodayPlanTopics() {
+    const plan = getTodayPlan();
+    return plan ? planTopicsOf(plan) : [];
+  }
+
+  // 鲸鲸 2.0 B4/C：主动机会检查（异步）——生活状态 + 心流三态 + 活跃度/话题信号接管时机
+  async function proactiveCheckTickV2(key, st, p) {
+    ensureWakeableV2(st, { key });
+    const nowMs = Date.now();
+    const hour = new Date(nowMs).getHours();
+    const idleThreshold = Number(p.idleThresholdMs) || 5 * 60 * 1000;
+    const idle = nowMs - (st.lastIncomingAt || 0);
+    const recent = Array.isArray(st.recentMessages) ? st.recentMessages : [];
+
+    // B1 生活状态（睡眠/摸鱼/正常/专注）：直接决定主动频率倍率
+    const lifeFx = LIFE_EFFECTS[heartLifeNow(nowMs).state];
+
+    // B4 心流维护：兴趣评估（节流 5min；absent 且无近期消息连评估都省）→ 状态迁移
+    const activity = groupActivityScore(recent, nowMs);
+    let interest = st.heartflowInterest || null;
+    if (heartEnabled()) {
+      const hfc = heartflowCfg();
+      const fresh = interest && nowMs - Number(interest.at) < hfc.evalThrottleMs;
+      if (!fresh && (activity > 0 || heartflowStateOf(st) !== 'absent')) {
+        const evaluated = await runInterestEvalV2(key, st, { lifeLabel: lifeFx.label });
+        if (evaluated) interest = evaluated;
+      }
+      const tr = heartflowTransition({
+        state: heartflowStateOf(st),
+        silentCount: Number(st.heartflowSilentCount) || 0,
+        idleMs: idle,
+        interestScore: interest?.score ?? null,
+        focusedCount: countFocusedStreams(key),
+        ...hfc
+      });
+      if (tr.changed) {
+        log(`[heart] ${key} 心流 ${heartflowStateOf(st)} → ${tr.state}（${tr.reason}）`);
+        st.heartflowState = tr.state;
+        saveSocialV2State();
+      }
+    }
+    const hfFx = HEARTFLOW_EFFECTS[heartflowStateOf(st)];
+
+    // 概率：原有因子（想法/精力/好感/发言密度）× B1 生活倍率 × B4 心流倍率 × C 活跃/话题加成
+    const probBase = Number(p.probability);
+    let prob = Math.min(1, Math.max(0, Number.isFinite(probBase) ? probBase : 0.4));
+    const pendingThoughts = Array.isArray(st.pendingThoughts) ? st.pendingThoughts.filter((t) => t && (!t.expiresAt || nowMs < Number(t.expiresAt))).length : 0;
+    if (pendingThoughts > 0) prob = Math.min(1, prob * 1.4);
+    if (st.lastAiReplyAt && nowMs - Number(st.lastAiReplyAt) < 30 * 60 * 1000) prob *= 0.5;
+    // P7-D：精力曲线（按时段平滑调节，深夜自然趋零）、晨起话头加成、好感度加权
+    prob *= proactiveEnergy(hour);
+    if (hour >= 8 && hour < 12 && pendingThoughts > 0) prob = Math.min(1, prob * 1.5);
+    prob = Math.min(1, prob * affinityBoostFor(key));
+    const aiCount = recent.filter((m) => m && m.isSelf && nowMs - Number(m.time || 0) < 60 * 60 * 1000).length;
+    if (aiCount >= 5) prob *= 0.3;
+    // B1/B4 合流：睡眠/absent 倍率为 0 → 自然不冒泡
+    prob *= lifeFx.proactiveMult * hfFx.proactiveMult;
+    // C：群活跃度信号（最近 10 分钟越热闹越值得插话）+ 话题匹配（今日计划话题）
+    if (activity > 0) prob = Math.min(1, prob * (1 + 0.25 * activity));
+    const recentText = recent.filter((m) => m && !m.isSelf).slice(-10).map((m) => String(m.plain || m.text || '')).join(' ');
+    const tm = topicMatchScore(recentText, getTodayPlanTopics());
+    if (tm > 0) prob = Math.min(1, prob * (1 + 0.2 * tm));
+    if (idle >= idleThreshold && Math.random() < prob && !isConversationBusyV2(key, st)) {
+      // P0-2：配额检查放在最后一步（概率已过、对话也确实空闲），日志才说明得了
+      // 「本来想说话、但今天额度用完了」，而不是每次抽查都刷一行噪音。
+      const quota = proactiveQuotaPerDay(key);
+      const used = proactiveUsedToday(key);
+      if (!proactiveAllowed(quota, used)) {
+        log(`[reserved2] 主动消息今日配额已用完（${used}/${quota}），本次不主动 ${key}`);
+      } else {
+        if (quota >= 0) bumpProactiveQuota(key);
+        await sendWakePromptV2(key, 'proactiveCheck');
+      }
+    }
+  }
+
   function scheduleProactiveCheckV2(key) {
     if (cfg.socialV2?.proactive?.enabled === false) return;
     if (socialV2.paused || currentMode !== 'reserved2') return;
@@ -11462,41 +12596,20 @@ async function main() {
     if (sbm && sendBlockActive(sbm[1])) return;
     const st = getSocialV2State(key);
     if (st.proactiveTimer) return;
-    const p = cfg.socialV2?.proactive ?? {};
+    // B5：qq_self_adjust 的运行时覆盖（概率/空闲阈值；配额走 proactiveQuotaPerDay）优先于 config
+    const p = {
+      ...(cfg.socialV2?.proactive ?? {}),
+      ...(selfAdjust.probability !== null ? { probability: selfAdjust.probability } : {}),
+      ...(selfAdjust.idleThresholdMs !== null ? { idleThresholdMs: selfAdjust.idleThresholdMs } : {})
+    };
     const min = Math.max(60 * 1000, Number(p.checkIntervalMinMs) || 30 * 60 * 1000);
     const max = Math.max(min, Number(p.checkIntervalMaxMs) || 90 * 60 * 1000);
     const delay = Math.floor(min + Math.random() * (max - min));
     st.proactiveTimer = setTimeout(() => {
       st.proactiveTimer = null;
-      ensureWakeableV2(st, { key });
-      const idleThreshold = Number(p.idleThresholdMs) || 15 * 60 * 1000;
-      const idle = Date.now() - (st.lastIncomingAt || 0);
-      const probBase = Number(p.probability);
-      let prob = Math.min(1, Math.max(0, Number.isFinite(probBase) ? probBase : 0.4));
-      const pendingThoughts = Array.isArray(st.pendingThoughts) ? st.pendingThoughts.filter((t) => t && (!t.expiresAt || Date.now() < Number(t.expiresAt))).length : 0;
-      if (pendingThoughts > 0) prob = Math.min(1, prob * 1.4);
-      if (st.lastAiReplyAt && Date.now() - Number(st.lastAiReplyAt) < 30 * 60 * 1000) prob *= 0.5;
-      // P7-D：精力曲线（按时段平滑调节，深夜自然趋零）、晨起话头加成、好感度加权
-      const hour = new Date().getHours();
-      prob *= proactiveEnergy(hour);
-      if (hour >= 8 && hour < 12 && pendingThoughts > 0) prob = Math.min(1, prob * 1.5);
-      prob = Math.min(1, prob * affinityBoostFor(key));
-      const recent = Array.isArray(st.recentMessages) ? st.recentMessages : [];
-      const aiCount = recent.filter((m) => m && m.isSelf && Date.now() - Number(m.time || 0) < 60 * 60 * 1000).length;
-      if (aiCount >= 5) prob *= 0.3;
-      if (idle >= idleThreshold && Math.random() < prob && !isConversationBusyV2(key, st)) {
-        // P0-2：配额检查放在最后一步（概率已过、对话也确实空闲），日志才说明得了
-        // 「本来想说话、但今天额度用完了」，而不是每次抽查都刷一行噪音。
-        const quota = proactiveQuotaPerDay();
-        const used = proactiveUsedToday(key);
-        if (!proactiveAllowed(quota, used)) {
-          log(`[reserved2] 主动消息今日配额已用完（${used}/${quota}），本次不主动 ${key}`);
-        } else {
-          if (quota >= 0) bumpProactiveQuota(key);
-          void sendWakePromptV2(key, 'proactiveCheck').catch((error) => log(`[reserved2] proactive 唤醒异常 ${key}:`, error?.message ?? error));
-        }
-      }
-      scheduleProactiveCheckV2(key);
+      void proactiveCheckTickV2(key, st, p)
+        .catch((error) => log(`[reserved2] proactive 检查异常 ${key}:`, error?.message ?? error))
+        .finally(() => scheduleProactiveCheckV2(key));
     }, delay);
     st.proactiveTimer.unref?.();
     log(`[reserved2] 已安排主动机会检查 ${key}，约 ${Math.round(delay / 60000)}min 后`);
@@ -12151,6 +13264,8 @@ async function main() {
                 const actionTaken = sendToolSucceededSessions.has(frame.sessionId) || (turnStart > 0 && st.lastActionAt >= turnStart);
                 if (actionTaken) {
                   st.wakeConfig.noActionCount = 0;
+                  // 鲸鲸 2.0 A3：她真的发言了 → 回合结束后异步提取人物事实（节流/防重/失败退避在函数内部）。
+                  try { scheduleFactExtractionV2(key); } catch {}
                 } else {
                   st.wakeConfig.noActionCount = (st.wakeConfig.noActionCount || 0) + 1;
                   const limit = Number(cfg.socialV2?.wake?.noActionLimit) || 3;
@@ -12246,6 +13361,7 @@ async function main() {
                 // 纯 Markdown/空白输出按“无文本”处理，避免后续 planSocialTimeline 拿空串崩溃。
                 if (!plain.trim()) {
                   log(`agent 回复为空（仅格式/空白）(${key})`);
+                  try { noteHeartflowOutcome(key, false); } catch {}
                   if (isFarewell) {
                     const st = socialState(key);
                     if (st.phase === 'exiting') {
@@ -12260,6 +13376,7 @@ async function main() {
                 // 社交模式静默标记：AI 主动选择“潜水/不接话”，不发送到 QQ
                 if (isSilentMarker(plain)) {
                   log(`社交模式：AI 选择静默（${SILENT_MARKER}）(${key})`);
+                  try { noteHeartflowOutcome(key, false); } catch {}
                   if (isFarewell) {
                     const st = socialState(key);
                     if (st.phase === 'exiting') {
@@ -12274,6 +13391,7 @@ async function main() {
                 // 本回合已经通过 MCP 发送工具成功发出消息：跳过自动转发，避免重复发送。
                 if (sendToolSucceeded) {
                   log(`工具已发送消息，跳过自动转发 (${key})`);
+                  try { noteHeartflowOutcome(key, true); } catch {}
                   if (isFarewell) {
                     const st = socialState(key);
                     if (st.phase === 'exiting') {

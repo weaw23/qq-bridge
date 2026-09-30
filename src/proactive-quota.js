@@ -30,6 +30,18 @@ export function quotaPerDayFromConfig(raw) {
   return v < 0 ? -1 : Math.floor(v);
 }
 
+// 鲸鲸 2.0 C 大胆档：配额支持按类型区分（群/私聊）。
+//   number / null / false → 单一值（兼容旧配置）
+//   {group, private}      → 按会话类型取值；缺的那边回退 default，再回退默认 10
+export function quotaPerDayFor(raw, isGroup) {
+  if (raw && typeof raw === 'object' && !Array.isArray(raw)) {
+    const v = isGroup ? raw.group : raw.private;
+    if (v === undefined || v === null) return quotaPerDayFromConfig(raw.default);
+    return quotaPerDayFromConfig(v);
+  }
+  return quotaPerDayFromConfig(raw);
+}
+
 // 配额是否还允许这次主动冒泡。quota < 0 表示不限制。
 // 边界：used 刚好等于 quota 时必须拒绝（「第 10 次用完就不再是第 11 次」）。
 export function proactiveAllowed(quota, used) {
