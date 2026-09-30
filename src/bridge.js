@@ -2884,7 +2884,8 @@ async function main() {
           let tokenLine = '';
           if (isV2) {
             const stV2 = getSocialV2State(key);
-            tokenLine = `【会话令牌】${stV2.agentToken}（调用二代状态/发送工具时请在参数中带上此令牌）\n\n`;
+            // Bug C 修复：控制台引导同样要带 key（见 buildWakePromptV2 注释）。
+            tokenLine = `【会话 key】${key}（调用二代工具的 key 参数就用这个值，别自己编）\n【会话令牌】${stV2.agentToken}（调用二代状态/发送工具时请在参数中带上此令牌）\n\n`;
           }
           const promptText = `${roleLine}${tokenLine}【后台控制端提醒】（来自控制台/管理端，不是群友消息）\n${message}\n\n这是后台给你的引导或提醒，请据此调整你的行为。绝对不要复述、转发或原样发送这条后台提醒，也不要发送其中的会话令牌；它只用于你内部调整行为。${isV2 ? '当前是二代仿真模式：你的文本输出不会自动发送到 QQ；如果需要在群里发言，请使用发送工具（qq_send_message / qq_reply）。如果不需要发言，可以 qq_mark_read 或 qq_set_wake_config 收尾。' : '如果不需要在群里发言，请不要输出会发到 QQ 的内容。'}`;
           let sessionId = null;
@@ -3126,7 +3127,7 @@ async function main() {
         if (req.method === 'GET' && url.pathname === '/api/socialV2/state') {
           const key = String(url.searchParams.get('key') ?? '').trim();
           if (!key) { sendJson({ ok: false, error: 'key 不能为空' }, 400); return; }
-          if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
+          if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效（key 或令牌与这个会话对不上：key 用唤醒提示里【会话 key】的原值，令牌用【会话令牌】的原值，别自己编）' }, 403); return; }
           if (req.headers['x-agent-token'] && !v2SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
           if (req.headers['x-agent-token'] && !v2ToolEnabled('socialState')) { sendJson({ ok: false, error: '工具未启用：qq_social_state' }, 403); return; }
           const st = getSocialV2State(key);
@@ -3145,7 +3146,7 @@ async function main() {
         if (req.method === 'GET' && url.pathname === '/api/socialV2/prompt') {
           const key = String(url.searchParams.get('key') ?? '').trim();
           if (!key) { sendJson({ ok: false, error: 'key 不能为空' }, 400); return; }
-          if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
+          if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效（key 或令牌与这个会话对不上：key 用唤醒提示里【会话 key】的原值，令牌用【会话令牌】的原值，别自己编）' }, 403); return; }
           if (req.headers['x-agent-token'] && !v2SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
           if (req.headers['x-agent-token'] && !v2ToolEnabled('getPrompt')) { sendJson({ ok: false, error: '工具未启用：qq_get_prompt' }, 403); return; }
           const st = getSocialV2State(key);
@@ -3230,7 +3231,7 @@ async function main() {
           const key = String(url.searchParams.get('key') ?? '').trim();
           const limit = Math.min(100, Math.max(1, Number(url.searchParams.get('limit')) || 30));
           if (!key) { sendJson({ ok: false, error: 'key 不能为空' }, 400); return; }
-          if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
+          if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效（key 或令牌与这个会话对不上：key 用唤醒提示里【会话 key】的原值，令牌用【会话令牌】的原值，别自己编）' }, 403); return; }
           if (req.headers['x-agent-token'] && !v2SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
           if (req.headers['x-agent-token'] && !v2ToolEnabled('getUnread')) { sendJson({ ok: false, error: '工具未启用：qq_get_unread_messages' }, 403); return; }
           const st = getSocialV2State(key);
@@ -3242,7 +3243,7 @@ async function main() {
           const limit = Math.min(100, Math.max(1, Number(url.searchParams.get('limit')) || 20));
           const offset = Math.max(0, Number(url.searchParams.get('offset')) || 0);
           if (!key) { sendJson({ ok: false, error: 'key 不能为空' }, 400); return; }
-          if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
+          if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效（key 或令牌与这个会话对不上：key 用唤醒提示里【会话 key】的原值，令牌用【会话令牌】的原值，别自己编）' }, 403); return; }
           if (req.headers['x-agent-token'] && !v2SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
           if (req.headers['x-agent-token'] && !v2ToolEnabled('getRecent')) { sendJson({ ok: false, error: '工具未启用：qq_get_recent_messages' }, 403); return; }
           const st = getSocialV2State(key);
@@ -3255,7 +3256,7 @@ async function main() {
           const body = await readBody();
           const key = String(body.key ?? '').trim();
           if (!key) { sendJson({ ok: false, error: 'key 不能为空' }, 400); return; }
-          if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
+          if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效（key 或令牌与这个会话对不上：key 用唤醒提示里【会话 key】的原值，令牌用【会话令牌】的原值，别自己编）' }, 403); return; }
           if (req.headers['x-agent-token'] && !v2SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
           if (req.headers['x-agent-token'] && !v2ToolEnabled('markRead')) { sendJson({ ok: false, error: '工具未启用：qq_mark_read' }, 403); return; }
           const st = getSocialV2State(key);
@@ -3298,7 +3299,7 @@ async function main() {
           const body = await readBody();
           const key = String(body.key ?? '').trim();
           if (!key) { sendJson({ ok: false, error: 'key 不能为空' }, 400); return; }
-          if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
+          if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效（key 或令牌与这个会话对不上：key 用唤醒提示里【会话 key】的原值，令牌用【会话令牌】的原值，别自己编）' }, 403); return; }
           if (req.headers['x-agent-token'] && !v2SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
           if (req.headers['x-agent-token'] && !v2ToolEnabled('setWakeConfig')) { sendJson({ ok: false, error: '工具未启用：qq_set_wake_config' }, 403); return; }
           const st = getSocialV2State(key);
@@ -3634,7 +3635,7 @@ async function main() {
             sendJson({ ok: false, error: '已禁用多条发送，请合并为一条消息' }, 403);
             return;
           }
-          if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
+          if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效（key 或令牌与这个会话对不上：key 用唤醒提示里【会话 key】的原值，令牌用【会话令牌】的原值，别自己编）' }, 403); return; }
           if (req.headers['x-agent-token'] && !v2SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
           if (req.headers['x-agent-token'] && !v2ToolEnabled('sendBurst')) { sendJson({ ok: false, error: '工具未启用：qq_send_burst' }, 403); return; }
           if (currentMode !== 'reserved2') {
@@ -3778,7 +3779,7 @@ async function main() {
             sendJson({ ok: false, error: '已禁用多条发送，请合并为一条消息' }, 403);
             return;
           }
-          if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
+          if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效（key 或令牌与这个会话对不上：key 用唤醒提示里【会话 key】的原值，令牌用【会话令牌】的原值，别自己编）' }, 403); return; }
           if (req.headers['x-agent-token'] && !v2SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
           if (req.headers['x-agent-token'] && !v2ToolEnabled('sendMessage')) { sendJson({ ok: false, error: '工具未启用：qq_send_message' }, 403); return; }
           if (currentMode !== 'reserved2') { sendJson({ ok: false, error: '该接口仅 reserved2 模式可用' }, 403); return; }
@@ -3907,7 +3908,7 @@ async function main() {
           if (!key) { sendJson({ ok: false, error: 'key 不能为空' }, 400); return; }
           if (currentMode !== 'reserved2') { sendJson({ ok: false, error: '该接口仅 reserved2 模式可用' }, 403); return; }
           if (!req.headers['x-agent-token']) { sendJson({ ok: false, error: 'reserved2 模式发送拍一拍必须携带 agent token' }, 403); return; }
-          if (!agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
+          if (!agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效（key 或令牌与这个会话对不上：key 用唤醒提示里【会话 key】的原值，令牌用【会话令牌】的原值，别自己编）' }, 403); return; }
           if (!v2SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
           if (!v2ToolEnabled('sendPoke')) { sendJson({ ok: false, error: '工具未启用：qq_send_poke' }, 403); return; }
           if (socialV2.paused) { sendJson({ ok: false, error: '二代 AI 已暂停，不能发送拍一拍' }, 403); return; }
@@ -3998,7 +3999,7 @@ async function main() {
           const key = String(url.searchParams.get('key') ?? '').trim();
           const stickerId = String(url.searchParams.get('stickerId') ?? '').trim();
           if (!key || !stickerId) { sendJson({ ok: false, error: 'key 和 stickerId 不能为空' }, 400); return; }
-          if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
+          if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效（key 或令牌与这个会话对不上：key 用唤醒提示里【会话 key】的原值，令牌用【会话令牌】的原值，别自己编）' }, 403); return; }
           if (req.headers['x-agent-token'] && !v2SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
           if (req.headers['x-agent-token'] && !v2ToolEnabled('getStickerImage')) { sendJson({ ok: false, error: '工具未启用：qq_get_sticker_image' }, 403); return; }
           try {
@@ -4031,7 +4032,7 @@ async function main() {
         if (req.method === 'GET' && url.pathname === '/api/socialV2/self-image') {
           const key = String(url.searchParams.get('key') ?? '').trim();
           if (!key) { sendJson({ ok: false, error: 'key 不能为空' }, 400); return; }
-          if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
+          if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效（key 或令牌与这个会话对不上：key 用唤醒提示里【会话 key】的原值，令牌用【会话令牌】的原值，别自己编）' }, 403); return; }
           if (req.headers['x-agent-token'] && !v2SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
           if (req.headers['x-agent-token'] && !v2ToolEnabled('getSelfImage')) { sendJson({ ok: false, error: '工具未启用：qq_get_self_image' }, 403); return; }
           const selfPath = path.join(ROOT, 'assets', 'deepseek娘.png');
@@ -4051,7 +4052,7 @@ async function main() {
           const key = String(body.key ?? '').trim();
           const stickerId = String(body.stickerId ?? '').trim();
           if (!key || !stickerId) { sendJson({ ok: false, error: 'key 和 stickerId 不能为空' }, 400); return; }
-          if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
+          if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效（key 或令牌与这个会话对不上：key 用唤醒提示里【会话 key】的原值，令牌用【会话令牌】的原值，别自己编）' }, 403); return; }
           if (req.headers['x-agent-token'] && !v2SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
           if (req.headers['x-agent-token'] && !v2ToolEnabled('stickerNote')) { sendJson({ ok: false, error: '工具未启用：qq_sticker_note' }, 403); return; }
           const note = body.note !== undefined && body.note !== null ? String(body.note).trim().slice(0, 200) : undefined;
@@ -4069,7 +4070,7 @@ async function main() {
           const key = String(body.key ?? '').trim();
           const stickerId = String(body.stickerId ?? '').trim();
           if (!key || !stickerId) { sendJson({ ok: false, error: 'key 和 stickerId 不能为空' }, 400); return; }
-          if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
+          if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效（key 或令牌与这个会话对不上：key 用唤醒提示里【会话 key】的原值，令牌用【会话令牌】的原值，别自己编）' }, 403); return; }
           if (req.headers['x-agent-token'] && !v2SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
           if (req.headers['x-agent-token'] && !v2ToolEnabled('setStickerRemark')) { sendJson({ ok: false, error: '工具未启用：qq_set_sticker_remark' }, 403); return; }
           try {
@@ -4095,7 +4096,7 @@ async function main() {
             sendJson({ ok: false, error: '表情消息不能附带文字；请先用 qq_send_message / qq_reply 把想说的话作为单独气泡发送，再单独 qq_send_sticker 发表情' }, 400);
             return;
           }
-          if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
+          if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效（key 或令牌与这个会话对不上：key 用唤醒提示里【会话 key】的原值，令牌用【会话令牌】的原值，别自己编）' }, 403); return; }
           if (req.headers['x-agent-token'] && !v2SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
           if (req.headers['x-agent-token'] && !v2ToolEnabled('sendSticker')) { sendJson({ ok: false, error: '工具未启用：qq_send_sticker' }, 403); return; }
           if (currentMode !== 'reserved2') { sendJson({ ok: false, error: '该接口仅 reserved2 模式可用' }, 403); return; }
@@ -4272,7 +4273,7 @@ async function main() {
           const fileSrc = String(body.file ?? '').trim();
           const remark = String(body.remark ?? '').trim();
           if (!key || (!messageRef && !fileSrc)) { sendJson({ ok: false, error: 'key 不能为空，且需提供 messageId/seq（收聊天里的图）或 file（收外部图源）' }, 400); return; }
-          if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
+          if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效（key 或令牌与这个会话对不上：key 用唤醒提示里【会话 key】的原值，令牌用【会话令牌】的原值，别自己编）' }, 403); return; }
           if (req.headers['x-agent-token'] && !v2SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
           if (req.headers['x-agent-token'] && !v2ToolEnabled('collectSticker')) { sendJson({ ok: false, error: '工具未启用：qq_collect_sticker' }, 403); return; }
           const keyMatch = /^(group|private):(\d+)$/.exec(key);
@@ -4324,7 +4325,7 @@ async function main() {
           const count = Math.min(500, Math.max(1, Math.min(Number(url.searchParams.get('count')) || 48, maxCount)));
           let force = url.searchParams.get('refresh') === '1' || url.searchParams.get('refresh') === 'true';
           if (!key) { sendJson({ ok: false, error: 'key 不能为空' }, 400); return; }
-          if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
+          if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效（key 或令牌与这个会话对不上：key 用唤醒提示里【会话 key】的原值，令牌用【会话令牌】的原值，别自己编）' }, 403); return; }
           if (req.headers['x-agent-token'] && !v2SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
           if (req.headers['x-agent-token'] && !v2ToolEnabled('listStickers')) { sendJson({ ok: false, error: '工具未启用：qq_list_stickers' }, 403); return; }
           // AI 强制刷新加最小间隔，避免反复调用 OneBot 表情接口造成限频/负载。
@@ -4362,7 +4363,7 @@ async function main() {
           const stickerId = String(body.stickerId ?? '').trim();
           const stateArg = String(body.state ?? '').trim().toLowerCase();
           if (!key || !stickerId) { sendJson({ ok: false, error: 'key 与 stickerId 不能为空' }, 400); return; }
-          if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
+          if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效（key 或令牌与这个会话对不上：key 用唤醒提示里【会话 key】的原值，令牌用【会话令牌】的原值，别自己编）' }, 403); return; }
           if (req.headers['x-agent-token'] && !v2SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
           if (req.headers['x-agent-token'] && !v2ToolEnabled('stickerState')) { sendJson({ ok: false, error: '工具未启用：qq_sticker_state' }, 403); return; }
           if (!STICKER_STATES.includes(stateArg)) {
@@ -4455,7 +4456,7 @@ async function main() {
           const body = await readBody();
           const key = String(body.key ?? '').trim();
           if (!key) { sendJson({ ok: false, error: 'key 不能为空' }, 400); return; }
-          if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
+          if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效（key 或令牌与这个会话对不上：key 用唤醒提示里【会话 key】的原值，令牌用【会话令牌】的原值，别自己编）' }, 403); return; }
           if (req.headers['x-agent-token'] && !v2SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
           if (req.headers['x-agent-token'] && !v2ToolEnabled('waitMessages')) { sendJson({ ok: false, error: '工具未启用：qq_wait_for_messages' }, 403); return; }
           if (socialV2.paused) {
@@ -4589,7 +4590,7 @@ async function main() {
             return;
           }
           if (!agentTokenOk(key, token)) {
-            sendJson({ ok: false, error: 'agent token 无效' }, 403);
+            sendJson({ ok: false, error: 'agent token 无效（key 或令牌与这个会话对不上：key 用唤醒提示里【会话 key】的原值，令牌用【会话令牌】的原值，别自己编）' }, 403);
             return;
           }
           if (!v2SessionAllowed(key)) {
@@ -4640,7 +4641,7 @@ async function main() {
           const level = body.level === 'warning' || body.level === 'error' ? body.level : 'info';
           const rawMessage = String(body.message ?? '').trim();
           if (!key || !rawMessage) { sendJson({ ok: false, error: 'key 和 message 不能为空' }, 400); return; }
-          if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
+          if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效（key 或令牌与这个会话对不上：key 用唤醒提示里【会话 key】的原值，令牌用【会话令牌】的原值，别自己编）' }, 403); return; }
           if (req.headers['x-agent-token'] && !v2SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
           if (req.headers['x-agent-token'] && !v2ToolEnabled('feedback')) { sendJson({ ok: false, error: '工具未启用：qq_report_feedback' }, 403); return; }
           // 反馈限频：防止持有会话 token 的调用方刷磁盘/日志。
@@ -4669,7 +4670,7 @@ async function main() {
           const key = String(url.searchParams.get('key') ?? '').trim();
           const limit = Math.min(50, Math.max(1, Number(url.searchParams.get('limit')) || 10));
           if (!key) { sendJson({ ok: false, error: 'key 不能为空' }, 400); return; }
-          if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
+          if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效（key 或令牌与这个会话对不上：key 用唤醒提示里【会话 key】的原值，令牌用【会话令牌】的原值，别自己编）' }, 403); return; }
           if (req.headers['x-agent-token'] && !v2SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
           if (req.headers['x-agent-token'] && !v2ToolEnabled('getMyRecent')) { sendJson({ ok: false, error: '工具未启用：qq_get_my_recent_messages' }, 403); return; }
           const st = getSocialV2State(key);
@@ -4686,7 +4687,7 @@ async function main() {
           const key = String(url.searchParams.get('key') ?? '').trim();
           const messageId = String(url.searchParams.get('messageId') ?? '').trim();
           if (!key || !messageId) { sendJson({ ok: false, error: 'key 和 messageId 不能为空' }, 400); return; }
-          if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
+          if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效（key 或令牌与这个会话对不上：key 用唤醒提示里【会话 key】的原值，令牌用【会话令牌】的原值，别自己编）' }, 403); return; }
           if (req.headers['x-agent-token'] && !v2SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
           if (req.headers['x-agent-token'] && !v2ToolEnabled('getMessageDetail')) { sendJson({ ok: false, error: '工具未启用：qq_get_message_detail' }, 403); return; }
           const keyMatch = /^(group|private):(\d+)$/.exec(key);
@@ -4747,7 +4748,7 @@ async function main() {
             return;
           }
           if (!agentTokenOk(key, agentToken)) {
-            sendJson({ ok: false, error: 'agent token 无效' }, 403);
+            sendJson({ ok: false, error: 'agent token 无效（key 或令牌与这个会话对不上：key 用唤醒提示里【会话 key】的原值，令牌用【会话令牌】的原值，别自己编）' }, 403);
             return;
           }
           const kind = keyMatch[1];
@@ -4828,7 +4829,7 @@ async function main() {
           const key = String(body.key ?? '').trim();
           const media = Array.isArray(body.media) ? body.media : [];
           if (!key) { sendJson({ ok: false, error: 'key 不能为空' }, 400); return; }
-          if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
+          if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效（key 或令牌与这个会话对不上：key 用唤醒提示里【会话 key】的原值，令牌用【会话令牌】的原值，别自己编）' }, 403); return; }
           if (req.headers['x-agent-token'] && !v2SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
           if (req.headers['x-agent-token'] && !v2ToolEnabled('getForwardMsg')) { sendJson({ ok: false, error: '工具未启用：qq_get_forward_msg' }, 403); return; }
           if (currentMode !== 'reserved2') { sendJson({ ok: false, error: '转发媒体读取仅 reserved2 模式可用' }, 403); return; }
@@ -4846,7 +4847,7 @@ async function main() {
           const key = String(url.searchParams.get('key') ?? '').trim();
           const limit = Math.min(20, Math.max(1, Number(url.searchParams.get('limit')) || 10));
           if (!key) { sendJson({ ok: false, error: 'key 不能为空' }, 400); return; }
-          if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
+          if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效（key 或令牌与这个会话对不上：key 用唤醒提示里【会话 key】的原值，令牌用【会话令牌】的原值，别自己编）' }, 403); return; }
           if (req.headers['x-agent-token'] && !v2SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
           if (req.headers['x-agent-token'] && !v2ToolEnabled('getActiveMembers')) { sendJson({ ok: false, error: '工具未启用：qq_get_active_members' }, 403); return; }
           const st = getSocialV2State(key);
@@ -4875,7 +4876,7 @@ async function main() {
           if (!key || !category || !content) { sendJson({ ok: false, error: 'key/category/content 不能为空' }, 400); return; }
           if (!['activeTopic', 'pendingThought', 'memberImpression'].includes(category)) { sendJson({ ok: false, error: 'category 必须是 activeTopic / pendingThought / memberImpression' }, 400); return; }
           if (category === 'memberImpression' && !String(extra.target || '').trim()) { sendJson({ ok: false, error: 'memberImpression 需要 extra.target 指定群友名字' }, 400); return; }
-          if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
+          if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效（key 或令牌与这个会话对不上：key 用唤醒提示里【会话 key】的原值，令牌用【会话令牌】的原值，别自己编）' }, 403); return; }
           if (req.headers['x-agent-token'] && !v2SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
           if (req.headers['x-agent-token'] && !v2ToolEnabled('memory')) { sendJson({ ok: false, error: '工具未启用：qq_memory_append' }, 403); return; }
           const st = getSocialV2State(key);
@@ -4903,7 +4904,7 @@ async function main() {
           if (!['activeTopic', 'pendingThought', 'memberImpression'].includes(category)) { sendJson({ ok: false, error: 'category 必须是 activeTopic / pendingThought / memberImpression' }, 400); return; }
           if (category === 'memberImpression' && !target) { sendJson({ ok: false, error: 'memberImpression 需要 target 指定原群友名字' }, 400); return; }
           if (category !== 'memberImpression' && !oldContent) { sendJson({ ok: false, error: '该类别需要 oldContent 指定要编辑的记忆内容' }, 400); return; }
-          if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
+          if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效（key 或令牌与这个会话对不上：key 用唤醒提示里【会话 key】的原值，令牌用【会话令牌】的原值，别自己编）' }, 403); return; }
           if (req.headers['x-agent-token'] && !v2SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
           if (req.headers['x-agent-token'] && !v2ToolEnabled('memory')) { sendJson({ ok: false, error: '工具未启用：qq_memory_*' }, 403); return; }
           const st = getSocialV2State(key);
@@ -4940,7 +4941,7 @@ async function main() {
           const key = String(url.searchParams.get('key') ?? '').trim();
           const category = String(url.searchParams.get('category') ?? '').trim();
           if (!key) { sendJson({ ok: false, error: 'key 不能为空' }, 400); return; }
-          if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
+          if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效（key 或令牌与这个会话对不上：key 用唤醒提示里【会话 key】的原值，令牌用【会话令牌】的原值，别自己编）' }, 403); return; }
           if (req.headers['x-agent-token'] && !v2SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
           if (req.headers['x-agent-token'] && !v2ToolEnabled('memory')) { sendJson({ ok: false, error: '工具未启用：qq_memory_query' }, 403); return; }
           const st = getSocialV2State(key);
@@ -4973,7 +4974,7 @@ async function main() {
           if (category === 'memberImpression' && !target) { sendJson({ ok: false, error: 'memberImpression 需要 target 指定群友名字' }, 400); return; }
           if (category === 'memberImpression' && ['__proto__', 'constructor', 'prototype'].includes(target)) { sendJson({ ok: false, error: '非法的群友名字' }, 400); return; }
           if (category !== 'memberImpression' && !content) { sendJson({ ok: false, error: '该类别需要 content 指定要删除的记忆内容' }, 400); return; }
-          if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
+          if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效（key 或令牌与这个会话对不上：key 用唤醒提示里【会话 key】的原值，令牌用【会话令牌】的原值，别自己编）' }, 403); return; }
           if (req.headers['x-agent-token'] && !v2SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
           if (req.headers['x-agent-token'] && !v2ToolEnabled('memory')) { sendJson({ ok: false, error: '工具未启用：qq_memory_remove' }, 403); return; }
           const st = getSocialV2State(key);
@@ -4994,7 +4995,7 @@ async function main() {
           const category = String(body.category ?? '').trim();
           if (!key) { sendJson({ ok: false, error: 'key 不能为空' }, 400); return; }
           if (category && !['activeTopic', 'pendingThought', 'memberImpression'].includes(category)) { sendJson({ ok: false, error: 'category 必须是 activeTopic / pendingThought / memberImpression' }, 400); return; }
-          if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
+          if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效（key 或令牌与这个会话对不上：key 用唤醒提示里【会话 key】的原值，令牌用【会话令牌】的原值，别自己编）' }, 403); return; }
           if (req.headers['x-agent-token'] && !v2SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
           if (req.headers['x-agent-token'] && !v2ToolEnabled('memory')) { sendJson({ ok: false, error: '工具未启用：qq_memory_clear' }, 403); return; }
           const st = getSocialV2State(key);
@@ -5010,7 +5011,7 @@ async function main() {
           const key = String(url.searchParams.get('key') ?? '').trim();
           const q = String(url.searchParams.get('q') ?? '').trim().toLowerCase();
           if (!key) { sendJson({ ok: false, error: 'key 不能为空' }, 400); return; }
-          if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
+          if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效（key 或令牌与这个会话对不上：key 用唤醒提示里【会话 key】的原值，令牌用【会话令牌】的原值，别自己编）' }, 403); return; }
           if (req.headers['x-agent-token'] && !v2SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
           if (req.headers['x-agent-token'] && !v2ToolEnabled('slangQuery')) { sendJson({ ok: false, error: '工具未启用：qq_slang_query' }, 403); return; }
           const list = confirmedSlangListV2().filter((e) => {
@@ -5036,7 +5037,7 @@ async function main() {
           const content = redactKnownTokensOnly(String(body.content ?? '')).trim();
           const context = redactKnownTokensOnly(String(body.context ?? '')).trim();
           if (!key) { sendJson({ ok: false, error: 'key 不能为空' }, 400); return; }
-          if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
+          if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效（key 或令牌与这个会话对不上：key 用唤醒提示里【会话 key】的原值，令牌用【会话令牌】的原值，别自己编）' }, 403); return; }
           if (req.headers['x-agent-token'] && !v2SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
           if (req.headers['x-agent-token'] && !v2ToolEnabled('slangSubmit')) { sendJson({ ok: false, error: '工具未启用：qq_slang_submit' }, 403); return; }
           if (cfg.slang?.enabled === false) { sendJson({ ok: false, error: '黑话学习已关闭（slang.enabled=false）' }, 403); return; }
@@ -5096,7 +5097,7 @@ async function main() {
             sendJson({ ok: false, error: 'reserved2 模式下旧只读工具不可用，请使用带会话令牌的 v2 读工具' }, 403);
             return;
           }
-          if (token && !agentTokenOk(key, token)) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
+          if (token && !agentTokenOk(key, token)) { sendJson({ ok: false, error: 'agent token 无效（key 或令牌与这个会话对不上：key 用唤醒提示里【会话 key】的原值，令牌用【会话令牌】的原值，别自己编）' }, 403); return; }
           const kind = keyMatch[1];
           const id = Number(keyMatch[2]);
           if (!Number.isFinite(id) || id <= 0 || !modeAllowed(key, kind, id, cfg, currentMode)) {
@@ -5123,7 +5124,7 @@ async function main() {
             return;
           }
           if (agentToken && !agentTokenOk(key, agentToken)) {
-            sendJson({ ok: false, error: 'agent token 无效' }, 403);
+            sendJson({ ok: false, error: 'agent token 无效（key 或令牌与这个会话对不上：key 用唤醒提示里【会话 key】的原值，令牌用【会话令牌】的原值，别自己编）' }, 403);
             return;
           }
           const kind = keyMatch[1];
@@ -5214,7 +5215,7 @@ async function main() {
           const token = pickAgentToken(req, body);
           const key = String(body.key ?? '').trim();
           if (currentMode !== 'reserved2') { sendJson({ ok: false, error: '该接口仅 reserved2 模式可用' }, 403); return; }
-          if (!key || !agentTokenOk(key, token)) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
+          if (!key || !agentTokenOk(key, token)) { sendJson({ ok: false, error: 'agent token 无效（key 或令牌与这个会话对不上：key 用唤醒提示里【会话 key】的原值，令牌用【会话令牌】的原值，别自己编）' }, 403); return; }
           const db = getMemoryDb();
           const now = Date.now();
           if (url.pathname.endsWith('/remember')) {
@@ -5277,7 +5278,7 @@ async function main() {
           const token = pickAgentToken(req, body);
           const key = String(body.key ?? '').trim();
           if (currentMode !== 'reserved2') { sendJson({ ok: false, error: '该接口仅 reserved2 模式可用' }, 403); return; }
-          if (!key || !agentTokenOk(key, token)) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
+          if (!key || !agentTokenOk(key, token)) { sendJson({ ok: false, error: 'agent token 无效（key 或令牌与这个会话对不上：key 用唤醒提示里【会话 key】的原值，令牌用【会话令牌】的原值，别自己编）' }, 403); return; }
           const db = getMemoryDb();
           const now = Date.now();
           if (url.pathname.endsWith('/set')) {
@@ -5327,7 +5328,7 @@ async function main() {
           const token = pickAgentToken(req, body);
           const key = String(body.key ?? '').trim();
           if (currentMode !== 'reserved2') { sendJson({ ok: false, error: '该接口仅 reserved2 模式可用' }, 403); return; }
-          if (!key || !agentTokenOk(key, token)) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
+          if (!key || !agentTokenOk(key, token)) { sendJson({ ok: false, error: 'agent token 无效（key 或令牌与这个会话对不上：key 用唤醒提示里【会话 key】的原值，令牌用【会话令牌】的原值，别自己编）' }, 403); return; }
           const obStatus = async (act, params) => {
             const httpUrlS = String(cfg.snowluma?.httpUrl || 'http://127.0.0.1:3000').replace(/\/+$/, '');
             const resS = await fetch(httpUrlS + '/' + act, {
@@ -5393,7 +5394,7 @@ async function main() {
           const token = pickAgentToken(req, body);
           const key = String(body.key ?? '').trim();
           if (currentMode !== 'reserved2') { sendJson({ ok: false, error: '该接口仅 reserved2 模式可用' }, 403); return; }
-          if (!key || !agentTokenOk(key, token)) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
+          if (!key || !agentTokenOk(key, token)) { sendJson({ ok: false, error: 'agent token 无效（key 或令牌与这个会话对不上：key 用唤醒提示里【会话 key】的原值，令牌用【会话令牌】的原值，别自己编）' }, 403); return; }
           const db = getMemoryDb();
           const now = Date.now();
           const action = String(body.action ?? 'list').trim();
@@ -5435,7 +5436,7 @@ async function main() {
           const token = pickAgentToken(req, body);
           const key = String(body.key ?? '').trim();
           if (currentMode !== 'reserved2') { sendJson({ ok: false, error: '该接口仅 reserved2 模式可用' }, 403); return; }
-          if (!key || !agentTokenOk(key, token)) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
+          if (!key || !agentTokenOk(key, token)) { sendJson({ ok: false, error: 'agent token 无效（key 或令牌与这个会话对不上：key 用唤醒提示里【会话 key】的原值，令牌用【会话令牌】的原值，别自己编）' }, 403); return; }
           const db = getMemoryDb();
           const action = String(body.action ?? 'list').trim();
           if (action === 'add') {
@@ -5460,7 +5461,7 @@ async function main() {
           const token = pickAgentToken(req, body);
           const key = String(body.key ?? '').trim();
           if (currentMode !== 'reserved2') { sendJson({ ok: false, error: '该接口仅 reserved2 模式可用' }, 403); return; }
-          if (!key || !agentTokenOk(key, token)) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
+          if (!key || !agentTokenOk(key, token)) { sendJson({ ok: false, error: 'agent token 无效（key 或令牌与这个会话对不上：key 用唤醒提示里【会话 key】的原值，令牌用【会话令牌】的原值，别自己编）' }, 403); return; }
           if (!v2ToolEnabled('goal')) { sendJson({ ok: false, error: '工具未启用：qq_goal' }, 403); return; }
           const action = String(body.action ?? 'list').trim();
           const nowMs = Date.now();
@@ -5520,7 +5521,7 @@ async function main() {
           const token = pickAgentToken(req, body);
           const key = String(body.key ?? '').trim();
           if (currentMode !== 'reserved2') { sendJson({ ok: false, error: '该接口仅 reserved2 模式可用' }, 403); return; }
-          if (!key || !agentTokenOk(key, token)) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
+          if (!key || !agentTokenOk(key, token)) { sendJson({ ok: false, error: 'agent token 无效（key 或令牌与这个会话对不上：key 用唤醒提示里【会话 key】的原值，令牌用【会话令牌】的原值，别自己编）' }, 403); return; }
           if (!v2ToolEnabled('selfAdjust')) { sendJson({ ok: false, error: '工具未启用：qq_self_adjust' }, 403); return; }
           const action = String(body.action ?? 'get').trim();
           const effective = () => ({
@@ -5571,7 +5572,7 @@ async function main() {
           const token = pickAgentToken(req, body);
           const key = String(body.key ?? '').trim();
           if (currentMode !== 'reserved2') { sendJson({ ok: false, error: '该接口仅 reserved2 模式可用' }, 403); return; }
-          if (!key || !agentTokenOk(key, token)) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
+          if (!key || !agentTokenOk(key, token)) { sendJson({ ok: false, error: 'agent token 无效（key 或令牌与这个会话对不上：key 用唤醒提示里【会话 key】的原值，令牌用【会话令牌】的原值，别自己编）' }, 403); return; }
           if (!v2ToolEnabled('requestState')) { sendJson({ ok: false, error: '工具未启用：qq_request_state' }, 403); return; }
           const st = getSocialV2State(key);
           const life = heartLifeNow(Date.now());
@@ -6820,7 +6821,7 @@ async function main() {
           const token = pickAgentToken(req, body);
           const key = String(body.key ?? '').trim();
           if (currentMode !== 'reserved2') { sendJson({ ok: false, error: '该接口仅 reserved2 模式可用' }, 403); return; }
-          if (!key || !agentTokenOk(key, token)) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
+          if (!key || !agentTokenOk(key, token)) { sendJson({ ok: false, error: 'agent token 无效（key 或令牌与这个会话对不上：key 用唤醒提示里【会话 key】的原值，令牌用【会话令牌】的原值，别自己编）' }, 403); return; }
           const db = getMemoryDb();
           const action = String(body.action ?? 'get').trim();
           const memberId = String(body.memberId ?? '').trim();
@@ -6861,7 +6862,7 @@ async function main() {
           const token = pickAgentToken(req, body);
           const key = String(body.key ?? '').trim();
           if (currentMode !== 'reserved2') { sendJson({ ok: false, error: '该接口仅 reserved2 模式可用' }, 403); return; }
-          if (!key || !agentTokenOk(key, token)) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
+          if (!key || !agentTokenOk(key, token)) { sendJson({ ok: false, error: 'agent token 无效（key 或令牌与这个会话对不上：key 用唤醒提示里【会话 key】的原值，令牌用【会话令牌】的原值，别自己编）' }, 403); return; }
           const db = getMemoryDb();
           const action = String(body.action ?? 'list').trim();
           if (action === 'list') {
@@ -6936,7 +6937,7 @@ async function main() {
           if (currentMode === 'reserved2' && !token) { sendJson({ ok: false, error: 'reserved2 模式发送必须携带 agent token' }, 403); return; }
           const keyMatchRich = /^(group|private):(\d+)$/.exec(key);
           if (!keyMatchRich) { sendJson({ ok: false, error: 'key 格式应为 group:群号 或 private:QQ号' }, 400); return; }
-          if (token && !agentTokenOk(key, token)) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
+          if (token && !agentTokenOk(key, token)) { sendJson({ ok: false, error: 'agent token 无效（key 或令牌与这个会话对不上：key 用唤醒提示里【会话 key】的原值，令牌用【会话令牌】的原值，别自己编）' }, 403); return; }
           if (token && !v2ToolEnabled('sendMessage')) { sendJson({ ok: false, error: '工具未启用：sendMessage' }, 403); return; }
           if (shouldBlockSilentReply(key)) { sendJson({ ok: false, error: '静默模式已开启，当前不允许发送' }, 403); return; }
           const kindRich = keyMatchRich[1];
@@ -7011,7 +7012,7 @@ async function main() {
           if (currentMode !== 'reserved2') { sendJson({ ok: false, error: '该接口仅 reserved2 模式可用' }, 403); return; }
           if (!/^\d+$/.test(userId)) { sendJson({ ok: false, error: 'userId 格式无效' }, 400); return; }
           const keyFH = 'private:' + userId;
-          if (!agentTokenOk(keyFH, token)) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
+          if (!agentTokenOk(keyFH, token)) { sendJson({ ok: false, error: 'agent token 无效（key 或令牌与这个会话对不上：key 用唤醒提示里【会话 key】的原值，令牌用【会话令牌】的原值，别自己编）' }, 403); return; }
           if (!modeAllowed(keyFH, 'private', Number(userId), cfg, currentMode)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
           const httpUrlFH = String(cfg.snowluma?.httpUrl || 'http://127.0.0.1:3000').replace(/\/+$/, '');
           try {
@@ -7069,7 +7070,7 @@ async function main() {
             return;
           }
           if (currentMode === 'reserved2' && !token) { sendJson({ ok: false, error: 'reserved2 模式发送必须携带 agent token' }, 403); return; }
-          if (token && !agentTokenOk(key, token)) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
+          if (token && !agentTokenOk(key, token)) { sendJson({ ok: false, error: 'agent token 无效（key 或令牌与这个会话对不上：key 用唤醒提示里【会话 key】的原值，令牌用【会话令牌】的原值，别自己编）' }, 403); return; }
           const flag = isPrivate ? 'sendPrivate' : (isReply ? 'reply' : 'sendGroup');
           if (token && !v2ToolEnabled(flag)) { sendJson({ ok: false, error: `工具未启用：${flag}` }, 403); return; }
           if (shouldBlockSilentReply(key)) {
@@ -11652,7 +11653,10 @@ async function main() {
     const roleState = readRoleState();
     const roleLine = roleState.role ? `【当前角色】${roleState.role}（完整角色卡请调用 qq_get_prompt 查看）\n\n` : '';
     const st = getSocialV2State(key);
-    const tokenLine = `【会话令牌】${st.agentToken}（调用二代状态工具时请在参数中带上此令牌）\n\n` + crossSessionLineV2(key);
+    // Bug C 修复（2026-09-30 403 报障）：令牌行必须同时给出会话 key。
+    // followup/reflect/care 等唤醒分支不带 ${key}，模型拿不到 key 就会瞎编一个群号，
+    // 拿真令牌配假 key 调工具 → agentTokenOk 查不到会话 → 报「agent token 无效」误导排查方向。
+    const tokenLine = `【会话 key】${key}（调用二代工具的 key 参数就用这个值，别自己编）\n【会话令牌】${st.agentToken}（调用二代状态工具时请在参数中带上此令牌）\n\n` + crossSessionLineV2(key);
     const memoryText = formatMemoryV2(st);
     const memoryLine = memoryText ? `${memoryText}\n\n` : '';
     // 注意：黑话表不在这里注入，deliverPromptNow 的 withSlangContext 会统一注入，
@@ -11774,7 +11778,8 @@ async function main() {
     const roleState = readRoleState();
     const roleLine = roleState.role ? `【当前角色】${roleState.role}（完整角色卡请调用 qq_get_prompt 查看）\n\n` : '';
     const st = getSocialV2State(key);
-    const tokenLine = `【会话令牌】${st.agentToken}（调用二代状态工具时请在参数中带上此令牌）\n\n`;
+    // Bug C 修复：提醒提示同样要带 key（见 buildWakePromptV2 注释）。
+    const tokenLine = `【会话 key】${key}（调用二代工具的 key 参数就用这个值，别自己编）\n【会话令牌】${st.agentToken}（调用二代状态工具时请在参数中带上此令牌）\n\n`;
     const preSleepMs = Math.max(0, Number(cfg.socialV2?.wake?.preSleepWaitMs) || 300000);
     return `${roleLine}${tokenLine}【提醒】你还没有完成回合收尾。请调用 qq_set_wake_config 设置下一次唤醒条件（例如继续潜水多久、@/名字/关键词/提问/概率/指定成员等），或者调用 qq_mark_read 表示你看过且决定不接。这是为了防止你忘记收尾后进入“永眠”。注意：设置潜水前先用 qq_wait_for_messages(timeoutMs=${preSleepMs}) 完成沉睡前观察；等待期间有人说话时查看 newMessages，判断不需要你参与即可收尾。`;
   }
@@ -12728,9 +12733,13 @@ async function main() {
     const roleState = readRoleState();
 
     // 若该会话有挂起的提问/审批，先当作回答处理（用当前消息自己的文字，不含引用原文）。
-    // 审批只有管理员消息会被消费；群友消息不能因为“审批挂起”而被吞掉，应继续走正常处理。
+    // 审批只有管理员消息会被消费；群聊里的提问同样只有管理员消息才算答案——
+    // Bug D 修复（2026-09-30）：原来群聊提问挂起时任何人的下一条消息都会被吞成答案，
+    // 曾发生群友复制粘贴❓原文被当成主人回答、直接喂给 agent 的答案劫持。
+    // 私聊提问仍由对方回答（那里只有对方一个人）。
+    // 群友消息不能因为“提问/审批挂起”而被吞掉，应继续走正常处理。
     const p = pending.get(key);
-    if (p && (p.kind === 'question' || isOwner)) {
+    if (p && ((p.kind === 'question' && (kind !== 'group' || isOwner)) || isOwner)) {
       await handlePendingAnswer(p, plainContent, key, isOwner);
       return;
     }
@@ -13581,7 +13590,11 @@ async function main() {
               }
               return s;
             });
-            await sendToQQ(key, '❓ agent 需要你回答：\n' + lines.join('\n') + '\n（直接回复选项文字或输入你的回答）');
+            // Bug D 配套：群聊里明确只有管理员回复才算数，避免群友好心回复后疑惑为什么没反应。
+            const questionNote = key.startsWith('group:')
+              ? '（只有管理员回复才算数；直接回复选项文字或输入你的回答）'
+              : '（直接回复选项文字或输入你的回答）';
+            await sendToQQ(key, '❓ agent 需要你回答：\n' + lines.join('\n') + '\n' + questionNote);
             await registerPending(key, { kind: 'question', rpcId: envelope.rpcId, sessionId: frame.sessionId, clientId: frame.clientId, eventId: frame.eventId, questions: frame.questions });
           } else if (frame.type === 'approval/requested') {
             const key = reverse.get(frame.sessionId);

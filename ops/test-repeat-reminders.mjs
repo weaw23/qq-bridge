@@ -146,6 +146,14 @@ say('── U 段：时间计算单测（固定 now，不依赖真实时刻）�
   check('接线：buildWakePromptV2 有 schedule 分支', src.includes("if (reason === 'schedule')"));
   check("接线：扫描器按 mode 分派 schedule/reminder", src.includes("isAi ? 'schedule' : 'reminder'"));
   check('接线：重复提醒触发后原地重排（不置 fired）', src.includes('UPDATE reminders SET fire_at = ? WHERE id = ? AND status = ?'));
+  // Bug C（2026-09-30 403 报障）：唤醒提示必须自带会话 key，否则 followup/reflect/care
+  // 这类不带 ${key} 的分支会让她拿不到 key、瞎编一个群号，真令牌配假 key 全线 403。
+  check('Bug C：唤醒提示令牌行带【会话 key】', (src.match(/【会话 key】\$\{key\}/g) || []).length >= 3);
+  check('Bug C：控制台引导令牌行也带【会话 key】', src.includes('【会话 key】${key}（调用二代工具的 key 参数就用这个值，别自己编）\\n【会话令牌】${stV2.agentToken}'));
+  // Bug D（2026-09-30 群聊答案劫持）：群聊提问挂起时，只有管理员消息可被当成答案；
+  // 原实现任何人的下一条消息都会被吞成 ask_user_question 的回答。
+  check('Bug D：群聊提问答案 owner-only', src.includes("(p.kind === 'question' && (kind !== 'group' || isOwner))"));
+  check('Bug D：群聊❓注明只有管理员回复才算数', src.includes('（只有管理员回复才算数；直接回复选项文字或输入你的回答）'));
 }
 
 // ── H 段：HTTP 端到端 ──────────────────────────────────────────────────────
