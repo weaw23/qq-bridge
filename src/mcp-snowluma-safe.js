@@ -1258,6 +1258,227 @@ if (cfg.socialV2?.tools?.sendImage !== false) {
   );
 }
 
+if (cfg.socialV2?.tools?.sendVoice !== false) {
+  server.tool(
+    'qq_send_voice',
+    '用鲸鲸的嗓音发一条语音（适合短句、卖萌、有情绪的话；长内容请改用文字）。',
+    {
+      key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
+      token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
+      text: z.string().max(400).describe('要说的话（建议 60 字以内，上限 120 字）；标点会影响停顿'),
+      replyToMessageId: z.union([z.number(), z.string()]).optional().describe('要引用/回复的消息 id（可选，非零整数）')
+    },
+    async ({ key, token, text, replyToMessageId }) => {
+      try {
+        const body = { key, parts: [{ type: 'record', text: String(text ?? '').trim() }], token };
+        if (replyToMessageId != null && String(replyToMessageId).trim() !== '') body.replyToMessageId = replyToMessageId;
+        const data = await agentApi('/api/send/rich', {
+          method: 'POST',
+          body: JSON.stringify(body),
+          headers: { 'x-agent-token': token },
+          timeoutMs: 200000 // TTS 冷启动最长 120s + 合成 + 发送
+        });
+        return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
+      } catch (error) {
+        return { content: [{ type: 'text', text: '发送语音失败：' + (error?.message ?? error) }], isError: true };
+      }
+    }
+  );
+}
+
+if (cfg.socialV2?.tools?.makeMeme !== false) {
+  server.tool(
+    'qq_make_meme',
+    '用 meme-generator 生成一张表情包/梗图并发到当前会话（摸头、贴贴、咬人、听懂掌声等 300+ 种）。',
+    {
+      key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
+      token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
+      memeKey: z.string().describe('梗名（英文 key，如 petpet/cuddle/bite/kiss；不确定就先调 qq_list_memes 搜）'),
+      texts: z.array(z.string()).optional().describe('梗图上的文字（部分梗需要，如 rage 说的话）'),
+      images: z.array(z.string()).optional().describe('用谁的头像做图（QQ 号数组，或 "me" 用你自己）；不填时多数人像梗用默认素材'),
+      atUserId: z.union([z.number(), z.string()]).optional().describe('发图同时 @ 的群成员 QQ 号（可选）'),
+      replyToMessageId: z.union([z.number(), z.string()]).optional().describe('要引用/回复的消息 id（可选）')
+    },
+    async ({ key, token, memeKey, texts, images, atUserId, replyToMessageId }) => {
+      try {
+        const body = { key, token, memeKey: String(memeKey ?? '').trim() };
+        if (Array.isArray(texts) && texts.length) body.texts = texts.map(String);
+        if (Array.isArray(images) && images.length) body.images = images.map(String);
+        if (atUserId != null && String(atUserId).trim() !== '') body.atUserId = atUserId;
+        if (replyToMessageId != null && String(replyToMessageId).trim() !== '') body.replyToMessageId = replyToMessageId;
+        const data = await agentApi('/api/meme/make', {
+          method: 'POST',
+          body: JSON.stringify(body),
+          headers: { 'x-agent-token': token },
+          timeoutMs: 120000
+        });
+        return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
+      } catch (error) {
+        return { content: [{ type: 'text', text: '生成表情包失败：' + (error?.message ?? error) }], isError: true };
+      }
+    }
+  );
+
+  server.tool(
+    'qq_list_memes',
+    '查可用的梗图（meme-generator 全部 300+ 种）：不带 query 返回全部 key；带 query 按中文/英文关键词搜（如「摸头」「咬」「亲亲」「爬」）。',
+    {
+      key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
+      token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
+      query: z.string().optional().describe('搜索词（可选，如 摸头/贴贴/咬/生气）')
+    },
+    async ({ key, token, query }) => {
+      try {
+        const body = { key, token };
+        const q = String(query ?? '').trim();
+        if (q) body.query = q;
+        const data = await agentApi('/api/meme/list', {
+          method: 'POST',
+          body: JSON.stringify(body),
+          headers: { 'x-agent-token': token },
+          timeoutMs: 30000
+        });
+        return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
+      } catch (error) {
+        return { content: [{ type: 'text', text: '查询梗图失败：' + (error?.message ?? error) }], isError: true };
+      }
+    }
+  );
+}
+
+if (cfg.socialV2?.tools?.generateImage !== false) {
+  server.tool(
+    'qq_generate_image',
+    '用 AI 画一张图并发到当前会话（gemai，计费接口，每日有配额默认 20 张）。适合：主人让你画东西、玩你画我猜、群活动配图。prompt 用中文或英文描述画面即可。别拿它刷屏或画违规内容。',
+    {
+      key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
+      token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
+      prompt: z.string().min(2).max(2000).describe('画面描述（越具体越好：主体+风格+细节）'),
+      replyToMessageId: z.union([z.number(), z.string()]).optional().describe('要引用/回复的消息 id（可选）')
+    },
+    async ({ key, token, prompt, replyToMessageId }) => {
+      try {
+        const body = { key, token, prompt: String(prompt ?? '').trim() };
+        if (replyToMessageId != null && String(replyToMessageId).trim() !== '') body.replyToMessageId = replyToMessageId;
+        const data = await agentApi('/api/imagegen/generate', {
+          method: 'POST',
+          body: JSON.stringify(body),
+          headers: { 'x-agent-token': token },
+          timeoutMs: 200000
+        });
+        return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
+      } catch (error) {
+        return { content: [{ type: 'text', text: '画图失败：' + (error?.message ?? error) }], isError: true };
+      }
+    }
+  );
+}
+
+// ── 鲸鲸 3.0 P3：后台任务四件套（白名单直跑 / 非白名单转主人审批） ──────
+if (cfg.socialV2?.tools?.agentJobs !== false) {
+  server.tool(
+    'qq_job_start',
+    '开一个后台长任务（如 ffmpeg 转码、python 跑脚本、curl 批量下载），不阻塞聊天。白名单命令直接跑；其他命令会转成待审批发去主人私聊，通过后自动开跑。任务结束你会被自动叫醒去报告结果。开之前先跟主人确认过。',
+    {
+      key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
+      token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
+      command: z.string().min(2).max(2000).describe('要执行的命令（如：ffmpeg -i in.mp4 out.mp3；python D:\\ai-tools\\xxx.py）'),
+      label: z.string().optional().describe('任务备注名（给人和你看的，如「转码晚安曲」）'),
+      timeoutMin: z.number().optional().describe('最长允许分钟数（默认 30，上限 180），超时自动终止'),
+      followup: z.boolean().optional().describe('完成后是否唤醒你报告（默认 true；只对不需要汇报的任务关掉）')
+    },
+    async ({ key, token, command, label, timeoutMin, followup }) => {
+      try {
+        const body = { key, token, command: String(command ?? '').trim() };
+        if (label != null && String(label).trim() !== '') body.label = String(label).slice(0, 60);
+        if (timeoutMin != null && Number.isFinite(Number(timeoutMin))) body.timeoutMin = Math.max(1, Math.min(Number(timeoutMin), 180));
+        if (followup === false) body.followup = false;
+        const data = await agentApi('/api/jobs/start', {
+          method: 'POST',
+          body: JSON.stringify(body),
+          headers: { 'x-agent-token': token },
+          timeoutMs: 60000
+        });
+        return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
+      } catch (error) {
+        return { content: [{ type: 'text', text: '后台任务启动失败：' + (error?.message ?? error) }], isError: true };
+      }
+    }
+  );
+  server.tool(
+    'qq_job_status',
+    '看后台任务状态：带 id 看单个任务；不带 id 看全部（运行中/最近/待审批）。',
+    {
+      key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
+      token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
+      id: z.string().optional().describe('任务 id（可选，不给就看全部）')
+    },
+    async ({ key, token, id }) => {
+      try {
+        const body = { key, token };
+        const jid = String(id ?? '').trim();
+        if (jid) body.id = jid;
+        const data = await agentApi('/api/jobs/status', {
+          method: 'POST',
+          body: JSON.stringify(body),
+          headers: { 'x-agent-token': token },
+          timeoutMs: 30000
+        });
+        return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
+      } catch (error) {
+        return { content: [{ type: 'text', text: '查询任务失败：' + (error?.message ?? error) }], isError: true };
+      }
+    }
+  );
+  server.tool(
+    'qq_job_output',
+    '看某个后台任务的输出日志（stdout/stderr 尾部）。任务 id 用 qq_job_status 查。',
+    {
+      key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
+      token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
+      id: z.string().min(1).describe('任务 id'),
+      tailChars: z.number().optional().describe('最多看多少字符（默认 4000）')
+    },
+    async ({ key, token, id, tailChars }) => {
+      try {
+        const body = { key, token, id: String(id ?? '').trim() };
+        if (tailChars != null && Number.isFinite(Number(tailChars))) body.tailChars = Math.max(200, Math.min(Number(tailChars), 8000));
+        const data = await agentApi('/api/jobs/output', {
+          method: 'POST',
+          body: JSON.stringify(body),
+          headers: { 'x-agent-token': token },
+          timeoutMs: 30000
+        });
+        return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
+      } catch (error) {
+        return { content: [{ type: 'text', text: '读任务输出失败：' + (error?.message ?? error) }], isError: true };
+      }
+    }
+  );
+  server.tool(
+    'qq_job_kill',
+    '终止一个运行中的后台任务（id 用 qq_job_status 查）。',
+    {
+      key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
+      token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
+      id: z.string().min(1).describe('任务 id')
+    },
+    async ({ key, token, id }) => {
+      try {
+        const data = await agentApi('/api/jobs/kill', {
+          method: 'POST',
+          body: JSON.stringify({ key, token, id: String(id ?? '').trim() }),
+          headers: { 'x-agent-token': token },
+          timeoutMs: 30000
+        });
+        return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
+      } catch (error) {
+        return { content: [{ type: 'text', text: '终止任务失败：' + (error?.message ?? error) }], isError: true };
+      }
+    }
+  );
+}
+
 if (cfg.socialV2?.tools?.sendFace !== false) {
   server.tool(
     'qq_send_face',

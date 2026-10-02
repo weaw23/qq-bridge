@@ -19,6 +19,12 @@ import { mdToPlain, splitForQQ } from './md-to-plain.js';
 import { SENSITIVE_RE, sensitiveVerdict, maskTokens } from './sensitive.js';
 import { looksLikeUnfinished } from './v2-wait.js';
 import { safeFetchBuffer, looksLikeImageBuffer } from './safe-fetch.js';
+// 鲸鲸 3.0 P1：语音模块（TTS 出向 / silk 编解码 / whisper ASR 入向）
+import { createVoiceModule, downloadRecordBuffer } from './voice.js';
+import { createMemeModule } from './meme.js';
+import { createImageGenModule } from './imagegen.js';
+// 鲸鲸 3.0 P3：受控后台长任务（Agent 干实事：白名单直跑 / 非白名单主人审批）
+import { createAgentJobsModule } from './agentjobs.js';
 import { extractForwardIds, forwardIdFromData, sanitizeForwardId, formatForwardResponse } from './forward.js';
 // 升级阶段 1/2/3 的四块新能力（都是纯函数模块，逻辑与阈值都在各自 ops/test-*.mjs 里锁住）：
 //   refusal-guard 官方口吻兜底改写 / splitter 分条与间隔 / deai 去 AI 腔打分 / persona-state 心情精力
@@ -648,6 +654,15 @@ function loadConfig() {
     ...(file.heart ?? {})
   };
 
+  // 鲸鲸 3.0 功能段（voice/meme/imagegen/agentJobs）与 pcControl/memory/autonomy/expressions
+  // 透传：上面各段是「默认+file 合并」风格，这里这些段由各模块内部自带默认值
+  // （cfg.xxx ?? {} 再逐项 ?? 兜底），所以只需把 file 里写了的自定义值原样带进 cfg，
+  // 不写则保持 undefined → 模块走默认。_configPath 供 agentjobs 等定位 state 目录。
+  cfg._configPath = p;
+  for (const k of ['voice', 'meme', 'imagegen', 'agentJobs', 'pcControl', 'memory', 'autonomy', 'expressions']) {
+    if (file[k] !== undefined) cfg[k] = file[k];
+  }
+
   // 新版 DSH 的 launch token 每次启动会变；配置里没填时自动从 DSH guard 日志发现。
   if (!cfg.dsh.authToken) cfg.dsh.authToken = discoverDshLaunchToken();
 
@@ -776,7 +791,15 @@ async function segmentsToText(segments, options = {}) {
       }
       case 'face': out.push(`[表情${d.id ?? ''}]`); break;
       case 'image': out.push('[图片]'); break;
-      case 'record': out.push('[语音]'); break;
+      case 'record': {
+        // 鲸鲸 3.0 P1：入向语音经 ASR 后带 d._asr（enrichRecordsWithAsr 挂上），
+        // 未识别/失败/旧格式时回落 [语音] 占位。
+        const asr = d._asr;
+        if (typeof asr === 'string' && asr.trim()) out.push(`[语音] ${asr.trim()}`);
+        else if (d._asrNote) out.push(`[语音]${d._asrNote}`);
+        else out.push('[语音]');
+        break;
+      }
       case 'video': out.push('[视频]'); break;
       case 'file': out.push(`[文件${d.name ?? ''}]`); break;
       case 'reply': {
@@ -884,6 +907,63 @@ async function main() {
   let stickerEntries = loadStickerStore(STICKER_FILE);
   let stickerSyncedAt = 0; // 上次从 SnowLuma 拉取收藏表情的时间戳（毫秒）
   let lastForcedAgentStickerSync = 0; // AI 强制刷新表情库的最小间隔保护
+
+  // ── 鲸鲸 3.0 语音（出向 TTS 合成 + 入向 ASR，见 src/voice.js） ──────────
+  const voice = createVoiceModule({ cfg, log, appendActivity });
+
+  // ── 鲸鲸 3.0 P2：表情包 + AI 画图（见 src/meme.js / src/imagegen.js） ──
+  const meme = createMemeModule({ cfg, log, appendActivity });
+  const imagegen = createImageGenModule({ cfg, log, appendActivity });
+
+  // ── 鲸鲸 3.0 P3：受控后台长任务（见 src/agentjobs.js） ─────────────────
+  // 完成/失败 → 给发起会话插一条「现场发挥」提醒（30s 扫描器会唤醒她报告结果）；
+  // 需审批 → 私聊通知主人，主人回 /job ok|no。
+  const agentJobs = createAgentJobsModule({
+    cfg, log, appendActivity,
+    onFinished: (job) => {
+      try {
+        const key = job.followupKey || job.requestedBy;
+        if (!key || !/^(group|private):\d+$/.test(key)) return;
+        const kind = key.startsWith('group:') ? 'group' : 'private';
+        const num = Number(key.split(':')[1]);
+        if (!allowed(kind, num, cfg)) return;
+        const db = getMemoryDb();
+        const st = job.status === 'done' ? '完成' : job.status === 'timeout' ? '超时被终止' : '失败';
+        const text = `后台任务报告：「${job.label || job.id}」${st}（exit ${job.exitCode ?? '?'}，跑了 ${Math.round((job.runtimeSec ?? 0) / 60)} 分钟）。用 qq_job_output(id='${job.id}') 看输出，把结果整理成一句话告诉主人；失败了就说明原因。`;
+        const r = db.prepare('INSERT INTO reminders (conv_key, text, fire_at, created_at, repeat_kind, repeat_at, repeat_days, every_ms, mode) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)')
+          .run(key, text, Date.now() + 3000, Date.now(), '', '', '', 0, 'ai');
+        log(`[agent-jobs] ${job.id} 完成提醒 #${r.lastInsertRowid} -> ${key}`);
+      } catch (error) { log('agent-jobs onFinished 失败: ' + (error?.message ?? error)); }
+    },
+    onNeedApproval: (entry) => {
+      const ownerKey = 'private:' + (cfg.ownerQQ || 1918594889);
+      return sendToQQ(ownerKey, `🐳 后台任务待审批（来自 ${entry.requestedBy || '未知会话'}）：\n${entry.command.slice(0, 400)}\n回复 /job ok ${entry.id} 允许执行，/job no ${entry.id} 拒绝。`).catch((e) => log('审批通知发送失败: ' + e));
+    }
+  });
+
+  // 入向语音→文字：下载 record → silk 解码 → whisper ASR → 把文字挂到段上（d._asr）。
+  // segmentsToText 的 record 分支会优先输出 d._asr；失败/旧格式回落占位。
+  // 每条语音最多拖慢 20s 下载 + 60s ASR（超时/熔断后直接回落占位，不阻塞消息流）。
+  async function enrichRecordsWithAsr(segments, key) {
+    if (!voice.enabled() || cfg.voice?.asrEnabled === false) return;
+    const records = (segments ?? []).filter((s) => s && typeof s === 'object' && s.type === 'record' && s.data && typeof s.data === 'object');
+    if (!records.length) return;
+    for (const seg of records) {
+      const d = seg.data;
+      try {
+        const buf = await downloadRecordBuffer(d.url || d.file || d.path);
+        const r = await voice.transcribeRecord(buf);
+        if (r && r.ok && r.text) {
+          d._asr = r.text;
+          appendActivity(`${key} 语音→文字：${r.text.slice(0, 60)}`);
+        } else if (r && r.reason === 'format') {
+          d._asrNote = '（旧格式语音，暂时听不了）';
+        }
+      } catch (error) {
+        log(`[voice] 语音识别失败 ${key}: ${error?.message ?? error}`);
+      }
+    }
+  }
 
   function stickerEnabled() {
     return cfg.socialV2?.sticker?.enabled !== false;
@@ -6946,7 +7026,7 @@ async function main() {
           if (replyToMessageId != null && String(replyToMessageId).trim() !== '' && !/^-?[1-9]\d*$/.test(String(replyToMessageId).trim())) { sendJson({ ok: false, error: 'replyToMessageId 必须是非零整数' }, 400); return; }
           if (!parts.length) { sendJson({ ok: false, error: 'parts 不能为空' }, 400); return; }
           if (token && JSON.stringify(parts).includes(token)) { sendJson({ ok: false, error: '内容包含会话令牌，已阻止发送' }, 400); return; }
-          // 段白名单化：text / image(base64://、https?://、file:///D:/qqbot/outbox/) / face
+          // 段白名单化：text / image(base64://、https?://、file:///D:/qqbot/outbox/) / face / record(鲸鲸 3.0 语音)
           const segments = [];
           if (replyToMessageId != null && String(replyToMessageId).trim() !== '') segments.push({ type: 'reply', data: { id: String(replyToMessageId).trim() } });
           if (atUserId != null && String(atUserId).trim() !== '') {
@@ -6972,6 +7052,28 @@ async function main() {
               if (isB64 && src.length > 12000000) { sendJson({ ok: false, error: '图片 base64 过大（上限约 9MB）' }, 400); return; }
               if (!isB64 && !isHttp && !isFile) { sendJson({ ok: false, error: '图片仅支持 base64://、http(s):// 或 file:///D:/qqbot/outbox/ 下的本地文件' }, 400); return; }
               segments.push({ type: 'image', data: { file: isB64 ? src : norm } });
+            } else if (type === 'record') {
+              // 鲸鲸 3.0 P1：语音段。text → GPT-SoVITS 合成 → silk → record base64；
+              // file 支持 base64:// 的现成 silk 数据。同文本走短语缓存。
+              if (!voice.enabled()) { sendJson({ ok: false, error: '语音功能未开启（config.json voice.enabled）' }, 400); return; }
+              if (token && !v2ToolEnabled('sendVoice')) { sendJson({ ok: false, error: '工具未启用：sendVoice' }, 403); return; }
+              const vt = String(p?.text ?? '').trim();
+              const vf = String(p?.file ?? '').trim();
+              let silkB64 = '';
+              if (vt) {
+                try {
+                  const r = await voice.synthesize(vt);
+                  silkB64 = r.silk.toString('base64');
+                } catch (error) {
+                  sendJson({ ok: false, error: '语音合成失败：' + (error?.message ?? error) }, 500); return;
+                }
+              } else if (vf.startsWith('base64://')) {
+                silkB64 = vf.slice('base64://'.length);
+              } else {
+                sendJson({ ok: false, error: '语音段需要 text（现场合成）或 base64:// 的 silk 数据' }, 400); return;
+              }
+              if (silkB64.length > 12000000) { sendJson({ ok: false, error: '语音数据过大（上限约 9MB）' }, 400); return; }
+              segments.push({ type: 'record', data: { file: 'base64://' + silkB64 } });
             } else {
               sendJson({ ok: false, error: '不支持的段类型：' + type }, 400); return;
             }
@@ -6999,6 +7101,199 @@ async function main() {
             log('富媒体发送失败 (' + key + '): ' + (error?.message ?? error));
             sendJson({ ok: false, error: String(error?.message ?? error) }, 500);
           }
+          return;
+        }
+
+        // ── 表情包生成端点（鲸鲸 3.0 P2：qq_make_meme / qq_list_memes 走这里） ──
+        if (req.method === 'POST' && url.pathname === '/api/meme/make') {
+          const body = await readBody();
+          const token = pickAgentToken(req, body);
+          const key = String(body.key ?? '').trim();
+          if (currentMode === 'chat' || currentMode === 'reserved') { sendJson({ ok: false, error: '发送工具仅限 closed-agent / reserved2 模式使用' }, 403); return; }
+          if (socialV2.paused && token) { sendJson({ ok: false, error: 'AI 已暂停，当前不允许执行发送工具' }, 403); return; }
+          if (currentMode === 'reserved2' && !token) { sendJson({ ok: false, error: 'reserved2 模式必须携带 agent token' }, 403); return; }
+          const keyMatchM = /^(group|private):(\d+)$/.exec(key);
+          if (!keyMatchM) { sendJson({ ok: false, error: 'key 格式应为 group:群号 或 private:QQ号' }, 400); return; }
+          if (token && !agentTokenOk(key, token)) { sendJson({ ok: false, error: 'agent token 无效（key 或令牌与这个会话对不上）' }, 403); return; }
+          if (token && !v2ToolEnabled('makeMeme')) { sendJson({ ok: false, error: '工具未启用：makeMeme' }, 403); return; }
+          if (shouldBlockSilentReply(key)) { sendJson({ ok: false, error: '静默模式已开启，当前不允许发送' }, 403); return; }
+          const kindM = keyMatchM[1];
+          const idM = Number(keyMatchM[2]);
+          if (!Number.isFinite(idM) || idM <= 0 || !modeAllowed(key, kindM, idM, cfg, currentMode)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
+          const memeKey = String(body.memeKey ?? '').trim();
+          if (!memeKey) { sendJson({ ok: false, error: 'memeKey 不能为空（先用 /api/meme/list 查可用 key）' }, 400); return; }
+          const texts = (Array.isArray(body.texts) ? body.texts : []).map((t) => String(t ?? '').slice(0, 100)).slice(0, 10);
+          const imagesIn = (Array.isArray(body.images) ? body.images : []).slice(0, 4).map((im) => String(im ?? '').trim()).filter(Boolean);
+          const replyToMessageId = body.replyToMessageId;
+          const dryRun = body.dryRun === true;
+          try {
+            const made = await meme.makeMeme({
+              key: memeKey, texts, imageSources: imagesIn,
+              selfId: Number(selfUserId || cfg.botQQ || 0) || undefined
+            });
+            if (dryRun) { sendJson({ ok: true, dryRun: true, key: memeKey, file: made.file, size: made.size }); return; }
+            const segmentsM = [];
+            if (replyToMessageId != null && String(replyToMessageId).trim() !== '' && /^-?[1-9]\d*$/.test(String(replyToMessageId).trim())) segmentsM.push({ type: 'reply', data: { id: String(replyToMessageId).trim() } });
+            if (body.atUserId != null && /^\d+$/.test(String(body.atUserId))) segmentsM.push({ type: 'at', data: { qq: String(body.atUserId) } });
+            segmentsM.push({ type: 'image', data: { file: 'base64://' + made.bytes.toString('base64') } });
+            const actionM = kindM === 'private' ? 'send_private_msg' : 'send_group_msg';
+            const paramsM = kindM === 'private' ? { user_id: idM, message: segmentsM } : { group_id: idM, message: segmentsM };
+            const resM = await fetch(String(cfg.snowluma?.httpUrl || 'http://127.0.0.1:3000').replace(/\/+$/, '') + '/' + actionM, {
+              method: 'POST',
+              headers: { 'content-type': 'application/json', ...(cfg.snowluma?.accessToken ? { authorization: 'Bearer ' + cfg.snowluma.accessToken } : {}) },
+              body: JSON.stringify(paramsM),
+              signal: AbortSignal.timeout(30000)
+            });
+            const rbM = await resM.json().catch(() => ({}));
+            if (!resM.ok || rbM.status !== 'ok' || rbM.retcode !== 0) {
+              const muteNoteM = await diagnoseGroupSendFailure(kindM, idM, rbM);
+              throw new Error('OneBot ' + actionM + ' 失败: ' + (rbM.wording || rbM.retcode || resM.status) + muteNoteM);
+            }
+            log('[reserved2] 表情包发送 ' + key + ': ' + memeKey);
+            sendJson({ ok: true, messageId: rbM?.data?.message_id ?? null, file: made.file });
+          } catch (error) {
+            log('表情包生成/发送失败 (' + key + '): ' + (error?.message ?? error));
+            sendJson({ ok: false, error: String(error?.message ?? error) }, 500);
+          }
+          return;
+        }
+
+        // ── 表情包列表端点（qq_list_memes 走这里） ────────────────────────────
+        if (req.method === 'POST' && url.pathname === '/api/meme/list') {
+          const body = await readBody();
+          const token = pickAgentToken(req, body);
+          const key = String(body.key ?? '').trim();
+          if (currentMode === 'reserved2' && !token) { sendJson({ ok: false, error: 'reserved2 模式必须携带 agent token' }, 403); return; }
+          if (token && key) {
+            const keyMatchL = /^(group|private):(\d+)$/.exec(key);
+            if (!keyMatchL || !agentTokenOk(key, token)) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
+          }
+          if (token && !v2ToolEnabled('makeMeme')) { sendJson({ ok: false, error: '工具未启用：makeMeme' }, 403); return; }
+          const query = String(body.query ?? '').trim().slice(0, 60);
+          try {
+            const items = await meme.listMemes(query || undefined);
+            sendJson({ ok: true, query: query || null, count: items.length, memes: items.slice(0, 320) });
+          } catch (error) {
+            sendJson({ ok: false, error: String(error?.message ?? error) }, 500);
+          }
+          return;
+        }
+
+        // ── AI 画图端点（鲸鲸 3.0 P2：qq_generate_image 走这里，生成+发送一步） ──
+        if (req.method === 'POST' && url.pathname === '/api/imagegen/generate') {
+          const body = await readBody();
+          const token = pickAgentToken(req, body);
+          const key = String(body.key ?? '').trim();
+          if (currentMode === 'chat' || currentMode === 'reserved') { sendJson({ ok: false, error: '发送工具仅限 closed-agent / reserved2 模式使用' }, 403); return; }
+          if (socialV2.paused && token) { sendJson({ ok: false, error: 'AI 已暂停，当前不允许执行发送工具' }, 403); return; }
+          if (currentMode === 'reserved2' && !token) { sendJson({ ok: false, error: 'reserved2 模式必须携带 agent token' }, 403); return; }
+          const keyMatchG = /^(group|private):(\d+)$/.exec(key);
+          if (!keyMatchG) { sendJson({ ok: false, error: 'key 格式应为 group:群号 或 private:QQ号' }, 400); return; }
+          if (token && !agentTokenOk(key, token)) { sendJson({ ok: false, error: 'agent token 无效（key 或令牌与这个会话对不上）' }, 403); return; }
+          if (token && !v2ToolEnabled('generateImage')) { sendJson({ ok: false, error: '工具未启用：generateImage' }, 403); return; }
+          if (shouldBlockSilentReply(key)) { sendJson({ ok: false, error: '静默模式已开启，当前不允许发送' }, 403); return; }
+          const kindG = keyMatchG[1];
+          const idG = Number(keyMatchG[2]);
+          if (!Number.isFinite(idG) || idG <= 0 || !modeAllowed(key, kindG, idG, cfg, currentMode)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
+          const prompt = String(body.prompt ?? '').trim();
+          if (!prompt) { sendJson({ ok: false, error: 'prompt 不能为空' }, 400); return; }
+          const replyToMessageId = body.replyToMessageId;
+          const dryRun = body.dryRun === true;
+          try {
+            const gen = await imagegen.generate(prompt, { n: 1 });
+            if (dryRun) { sendJson({ ok: true, dryRun: true, images: gen.images, remaining: gen.remaining }); return; }
+            const segmentsG = [];
+            if (replyToMessageId != null && String(replyToMessageId).trim() !== '' && /^-?[1-9]\d*$/.test(String(replyToMessageId).trim())) segmentsG.push({ type: 'reply', data: { id: String(replyToMessageId).trim() } });
+            for (const im of gen.images) segmentsG.push({ type: 'image', data: { file: im.file } });
+            const actionG = kindG === 'private' ? 'send_private_msg' : 'send_group_msg';
+            const paramsG = kindG === 'private' ? { user_id: idG, message: segmentsG } : { group_id: idG, message: segmentsG };
+            const resG = await fetch(String(cfg.snowluma?.httpUrl || 'http://127.0.0.1:3000').replace(/\/+$/, '') + '/' + actionG, {
+              method: 'POST',
+              headers: { 'content-type': 'application/json', ...(cfg.snowluma?.accessToken ? { authorization: 'Bearer ' + cfg.snowluma.accessToken } : {}) },
+              body: JSON.stringify(paramsG),
+              signal: AbortSignal.timeout(30000)
+            });
+            const rbG = await resG.json().catch(() => ({}));
+            if (!resG.ok || rbG.status !== 'ok' || rbG.retcode !== 0) {
+              const muteNoteG = await diagnoseGroupSendFailure(kindG, idG, rbG);
+              throw new Error('OneBot ' + actionG + ' 失败: ' + (rbG.wording || rbG.retcode || resG.status) + muteNoteG);
+            }
+            log('[reserved2] AI 画图发送 ' + key + ': ' + prompt.slice(0, 60));
+            sendJson({ ok: true, messageId: rbG?.data?.message_id ?? null, images: gen.images, remaining: gen.remaining, model: gen.model });
+          } catch (error) {
+            log('AI 画图失败 (' + key + '): ' + (error?.message ?? error));
+            sendJson({ ok: false, error: String(error?.message ?? error) }, 500);
+          }
+          return;
+        }
+
+        // ── 后台任务端点（鲸鲸 3.0 P3：qq_job_* 四件套走这里） ─────────────
+        // start：白名单命令直接跑；非白名单转主人审批（/job ok|no）。
+        if (req.method === 'POST' && url.pathname === '/api/jobs/start') {
+          const body = await readBody();
+          const token = pickAgentToken(req, body);
+          const key = String(body.key ?? '').trim();
+          if (currentMode !== 'reserved2') { sendJson({ ok: false, error: '该接口仅 reserved2 模式可用' }, 403); return; }
+          if (!key || !agentTokenOk(key, token)) { sendJson({ ok: false, error: 'agent token 无效（key 或令牌与这个会话对不上）' }, 403); return; }
+          if (!v2ToolEnabled('agentJobs')) { sendJson({ ok: false, error: '工具未启用：agentJobs' }, 403); return; }
+          const keyMatchJ = /^(group|private):(\d+)$/.exec(key);
+          if (!keyMatchJ || !modeAllowed(key, keyMatchJ[1], Number(keyMatchJ[2]), cfg, currentMode)) { sendJson({ ok: false, error: '会话不在当前模式允许范围内' }, 403); return; }
+          const command = String(body.command ?? '').trim();
+          if (!command) { sendJson({ ok: false, error: 'command 不能为空（如 ffmpeg 转码、python 跑脚本、curl 下载）' }, 400); return; }
+          const label = body.label != null ? String(body.label).slice(0, 60) : null;
+          const timeoutMin = Number(body.timeoutMin);
+          try {
+            const resJ = agentJobs.start({
+              command, label,
+              requestedBy: key,
+              timeoutMin: Number.isFinite(timeoutMin) && timeoutMin > 0 ? timeoutMin : undefined,
+              followupKey: body.followup === false ? null : key
+            });
+            sendJson(resJ);
+          } catch (error) {
+            log('后台任务启动失败 (' + key + '): ' + (error?.message ?? error));
+            sendJson({ ok: false, error: String(error?.message ?? error) }, 500);
+          }
+          return;
+        }
+        if (req.method === 'POST' && url.pathname === '/api/jobs/status') {
+          const body = await readBody();
+          const token = pickAgentToken(req, body);
+          const key = String(body.key ?? '').trim();
+          if (currentMode !== 'reserved2') { sendJson({ ok: false, error: '该接口仅 reserved2 模式可用' }, 403); return; }
+          if (!key || !agentTokenOk(key, token)) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
+          if (!v2ToolEnabled('agentJobs')) { sendJson({ ok: false, error: '工具未启用：agentJobs' }, 403); return; }
+          const id = body.id != null && String(body.id).trim() !== '' ? String(body.id) : null;
+          try { sendJson(agentJobs.status(id)); }
+          catch (error) { sendJson({ ok: false, error: String(error?.message ?? error) }, 500); }
+          return;
+        }
+        if (req.method === 'POST' && url.pathname === '/api/jobs/output') {
+          const body = await readBody();
+          const token = pickAgentToken(req, body);
+          const key = String(body.key ?? '').trim();
+          if (currentMode !== 'reserved2') { sendJson({ ok: false, error: '该接口仅 reserved2 模式可用' }, 403); return; }
+          if (!key || !agentTokenOk(key, token)) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
+          if (!v2ToolEnabled('agentJobs')) { sendJson({ ok: false, error: '工具未启用：agentJobs' }, 403); return; }
+          const idJ = String(body.id ?? '').trim();
+          if (!idJ) { sendJson({ ok: false, error: 'id 不能为空' }, 400); return; }
+          try {
+            const resO = agentJobs.output(idJ, { tailBytes: Number(body.tailBytes) });
+            sendJson({ ...resO, outTail: resO.outTail?.slice(-(Number(body.tailChars) || 4000)), errTail: resO.errTail?.slice(-1000) });
+          } catch (error) { sendJson({ ok: false, error: String(error?.message ?? error) }, 500); }
+          return;
+        }
+        if (req.method === 'POST' && url.pathname === '/api/jobs/kill') {
+          const body = await readBody();
+          const token = pickAgentToken(req, body);
+          const key = String(body.key ?? '').trim();
+          if (currentMode !== 'reserved2') { sendJson({ ok: false, error: '该接口仅 reserved2 模式可用' }, 403); return; }
+          if (!key || !agentTokenOk(key, token)) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
+          if (!v2ToolEnabled('agentJobs')) { sendJson({ ok: false, error: '工具未启用：agentJobs' }, 403); return; }
+          const idK = String(body.id ?? '').trim();
+          if (!idK) { sendJson({ ok: false, error: 'id 不能为空' }, 400); return; }
+          try { sendJson(agentJobs.kill(idK)); }
+          catch (error) { sendJson({ ok: false, error: String(error?.message ?? error) }, 500); }
           return;
         }
 
@@ -11668,6 +11963,21 @@ async function main() {
     const stickerLine = stickerCfg.enabled !== false && stickerCfg.includeInPrompt !== false
       ? `${buildStickerStrategyHint()}\n${buildStickerContext(stickerEntries, stickerCfg.promptMaxStickers ?? 8)}\n\n`
       : '';
+    // 鲸鲸 3.0：新能力提示。她得知道自己会语音/表情包/画图/跑后台任务了，否则工具躺在
+    // 列表里也想不起来用。按模块实际启用状态拼装（哪个没开就别提哪个，免得她调了被拒）。
+    // 作用域修正（2026-09-30）：v2ToolEnabled 定义在 HTTP 处理器闭包里，这里够不着
+    // （上线后首个计划唤醒即抛 "v2ToolEnabled is not defined"，唤醒全部中断）。
+    // 直接内联同一判定：cfg.socialV2.tools.<flag> !== false。
+    const v2ToolOn = (flag) => cfg.socialV2?.tools?.[flag] !== false;
+    const capBits = [];
+    if (voice && voice.enabled() && v2ToolOn('sendVoice')) capBits.push('发语音 qq_send_voice（说一句想说的，比打字更像真人；用在重要或亲昵的场合，不用每句都说）');
+    if (meme && meme.enabled() && v2ToolOn('makeMeme')) capBits.push('做表情包 qq_list_memes / qq_make_meme（拿群友或你自己的头像合成梗图，图乐子优先）');
+    if (imagegen && imagegen.enabled() && v2ToolOn('generateImage')) capBits.push('AI 画图 qq_generate_image（每天配额有限，好钢用在刀刃上；画你自己时保持蓝卷发小女仆裙的固定形象）');
+    if (agentJobs && agentJobs._enabled() && v2ToolOn('agentJobs')) capBits.push('跑后台任务 qq_job_start / qq_job_status / qq_job_output / qq_job_kill（ffmpeg 转码、批量处理这类长活；陌生命令会先请主人审批，任务完成你会被自动唤醒汇报）');
+    if (voice && voice.enabled() && cfg.voice?.asrEnabled !== false) capBits.push('收到语音消息会自动转成文字，当普通文本理解即可');
+    const capabilityLine = capBits.length
+      ? `【新能力（3.0）】${capBits.join('；')}。挑场合用，别逢人炫技。\n\n`
+      : '';
     const preSleepMs = Math.max(0, Number(cfg.socialV2?.wake?.preSleepWaitMs) || 300000);
     const proactiveLine = '【积极性】不要习惯性潜水：群里有你能接的话题就主动参与，偶尔插一句别人的话题也很正常；只有确实没话可说、对方已明确结束、或长时间没人说话时才潜水。\n\n';
     const preSleepLine = `【沉睡前强制等待】除非对方明确说“不聊了/晚安/下了/拜拜”等结束语，否则每次设置潜水/下一次唤醒前，必须先调用 qq_wait_for_messages(timeoutMs=${preSleepMs}) 完成一次沉睡前观察；短等待（30秒/60秒/180秒）不能代替这次完整观察。若 ${Math.round(preSleepMs / 60000)} 分钟内没人说话，返回 preSleepWaitSatisfied=true，可以设置下一次唤醒并沉睡；若期间有人发新消息，先查看返回的 newMessages——判断不需要你参与就可以直接沉睡，若你选择参与回复，则下次想睡时需要重新等待观察窗口。如果返回里带 preSleepWaitRemainingMs，就按剩余时间继续等待。\n\n`;
@@ -11724,7 +12034,7 @@ async function main() {
     // B2/B3：今日计划 + 目标队列注入（所有唤醒都带上——她随时知道自己今天想干嘛）
     const planLine = renderPlanLines(getTodayPlan());
     const goalLine = renderGoalLines(listActiveGoals());
-    const base = roleLine + tokenLine + antiAiLine + proactiveLine + stickerLine + preSleepLine + statusLine + personaLine + heartLine + planLine + goalLine + wakeLine + memoryLine + v2EpisodeLine + factLine + participationLine;
+    const base = roleLine + tokenLine + antiAiLine + proactiveLine + stickerLine + capabilityLine + preSleepLine + statusLine + personaLine + heartLine + planLine + goalLine + wakeLine + memoryLine + v2EpisodeLine + factLine + participationLine;
     if (reason === 'reflect') {
       return `${base}【每日复盘】现在是今天的自我整理时间，不需要给任何人发消息（除非你确实想对主人说一句）。\n请按顺序做五件事：\n1) 回顾今天：用 qq_db_recall 看看近期记忆，用 qq_affinity(action=list) 看关系变化；\n2) 核对今日计划（见上方【今日计划】）：逐项想想做到了没、为什么没做到；值得记的经过/教训用 qq_db_remember 写进日记（1~3 条，像写给自己看的日记，别记流水账）；\n3) 目标闭环（见上方【她的目标】）：有进展的用 qq_goal(action=note, id, note) 记一笔；完成了 action=done；确定不做了 action=abandon 并写一句放弃原因；都还在推进就留着；\n4) 沉淀与洞见：对某人的观感变了就 qq_affinity(action=bump/set) 更新；今天悟出的 2~3 条高阶洞见（关于自己怎么跟人相处/什么场合说什么话/自己的风格偏好）用 qq_self_note(kind=insight) 写下来；\n5) 给明天留话头：想主动聊的话题/想问的事，用 qq_memory_append(category=pendingThought, extra.expiresAtMs=从现在到明早合适时间的毫秒数，一般 10~16 小时后过期) 记 1~2 条，明早被叫醒时你会自然带着这个话题开口；也可以 qq_set_reminder 设具体提醒。\n注意：已被移出或停用的群不要规划话题。做完用 qq_mark_read 或 qq_set_wake_config 正常收尾即可。`;
     }
@@ -11760,7 +12070,7 @@ async function main() {
       const quotaNote = quota >= 0
         ? `【今日主动机会】本次是第 ${proactiveUsedToday(key)}/${quota} 次（每天上限，用完后不会再被主动唤醒，只能等主人说话）。请把额度留给真正想说的那一句，别为冒泡而冒泡。\n`
         : '';
-      return `${base}【主动机会】${key}\n原因：群里已经安静了一段时间，这是一次你可以主动冒泡的机会。\n${quotaNote}${nightNote}优先主动开个话题、追问上次没聊完的事、分享一个刚想到的想法；如果一时想不到，可以用 mcp__web-search-safe__web_search 搜一下当前热点/时事/网络热梗，再结合记忆里的群友兴趣挑一个自然角度。只要内容自然，就大胆开口；如果实在没话想说，再安静收尾（qq_mark_read 或 qq_set_wake_config）。`;
+      return `${base}【主动机会】${key}\n原因：群里已经安静了一段时间，这是一次你可以主动冒泡的机会。\n${quotaNote}${nightNote}开口前最后自评一句：这个话头现在说出来自然吗？和群里正在聊的东西搭吗？不搭就换一句更贴的，或者安静收尾——比硬发一句尬的强。\n优先主动开个话题、追问上次没聊完的事、分享一个刚想到的想法；如果一时想不到，可以用 mcp__web-search-safe__web_search 搜一下当前热点/时事/网络热梗，再结合记忆里的群友兴趣挑一个自然角度。只要内容自然，就大胆开口；如果实在没话想说，再安静收尾（qq_mark_read 或 qq_set_wake_config）。`;
     }
     if (reason === 'reminder') {
       return `${base}【定时提醒到点】未读里的 [定时提醒] 是你自己此前定下的提醒，现在到点了。\n把这件事自然地转达或处理掉——像平时说话一样，别照着念通知原文，也别说明“这是我设的提醒”。如果这件事已经不需要提了，说明一句或直接收尾。收尾照常（qq_mark_read 或 qq_set_wake_config）。`;
@@ -12419,6 +12729,33 @@ async function main() {
     };
   }
 
+  // 鲸鲸 3.0 P4：冒泡预检——proactiveCheck 唤醒前的最后一道轻量自评（纯启发式，不烧 token）。
+  // 动机：随机冒泡经常是「群里安静、她手里也没话头」→ 被叫醒→ 没话找话，烧一轮模型
+  // 还可能发一句尬的。现有 quota / quietMinutes / heartflow 机制都不动，只在「决定叫醒她」
+  // 这最后一跳前打分：分数低 → 不唤醒、不扣当天主动额度（bumpProactiveQuota 在闸后）。
+  // 分数维度来自方案原文：话题 × 近 10 分钟群内动静 × 她的参与度。阈值 ≥2 放行。
+  function proactiveGateV2(key, st, nowMs, planThoughtText = '') {
+    const reasons = [];
+    let score = 0;
+    // ① 话题：这次开口带着她记的话头（本轮已选中的念头），或池子里还挂着没过期的 pendingThought
+    const hasThought = !!String(planThoughtText || '').trim()
+      || !!(st.initiativeThought && String(st.initiativeThought.text || '').trim())
+      || (Array.isArray(st.pendingThoughts) && st.pendingThoughts.some((t) => t && String(t.content ?? '').trim() && (!t.expiresAt || nowMs < Number(t.expiresAt))));
+    if (hasThought) { score += 2; reasons.push('有话头+2'); }
+    // ② 近 10 分钟群内动静（别人在聊 = 有上下文可接）
+    const recent = Array.isArray(st.recentMessages) ? st.recentMessages : [];
+    const last10 = recent.filter((m) => m && !m.isSelf && nowMs - Number(m.time || 0) <= 10 * 60 * 1000);
+    const her10 = recent.filter((m) => m && m.isSelf && nowMs - Number(m.time || 0) <= 10 * 60 * 1000).length;
+    if (last10.length > 0) { score += 1; reasons.push(`近10分钟有动静+1(${last10.length}条)`); }
+    // ③ 她的参与度：近 30 条里她自己说过话（插话更像顺着聊，而不是空降）
+    if (recent.slice(-30).some((m) => m && m.isSelf)) { score += 1; reasons.push('近30条她参与过+1'); }
+    // ④ 反向：话题已经聊热（>8 条）但完全没有她——硬插进热聊最扣分
+    if (last10.length > 8 && her10 === 0) { score -= 2; reasons.push(`话题热但她0参与-2(${last10.length}条)`); }
+    // ⑤ 反向：没话头 + 群里也没动静 = 典型的没话找话
+    if (!hasThought && last10.length === 0) { score -= 1; reasons.push('无话头且群冷清-1'); }
+    return { score, reasons, pass: score >= 2 };
+  }
+
   // 心跳为什么没参与：只在**原因变化**时写一行，避免每 5 分钟刷屏。
   // 没有这行的话，"主动性一直没动静"只能靠猜（是没到条件？还是被前置闸门挡了？）。
   let initiativeSkipReason = '';
@@ -12494,6 +12831,15 @@ async function main() {
       if (quota >= 0 && proactiveUsedToday(key, nowMs) >= quota) {
         appendInitiativeLog({ type: 'blocked-quota', v: 1, ts: nowMs, id: entry.id, key, quota, used: proactiveUsedToday(key, nowMs) });
         log(`[initiative] 想开口但今日主动额度已用完（${quota} 次），留到明天`);
+        return;
+      }
+
+      // 鲸鲸 3.0 P4 冒泡预检：额度之外再过一道「话头×动静×参与度」。
+      // 不过 → 不叫醒（不烧模型），也不扣额度；念头留在池子里，下个心跳条件变了再来。
+      const gate = proactiveGateV2(key, st, nowMs, plan.thought?.text);
+      if (!gate.pass) {
+        appendInitiativeLog({ type: 'blocked-gate', v: 1, ts: nowMs, id: entry.id, key, score: gate.score, reasons: gate.reasons, thoughtText: entry.thoughtText });
+        log(`[initiative] 冒泡预检拦下（分数 ${gate.score}：${gate.reasons.join('，')}），念头留池子下次再说`);
         return;
       }
 
@@ -12608,6 +12954,14 @@ async function main() {
       if (!proactiveAllowed(quota, used)) {
         log(`[reserved2] 主动消息今日配额已用完（${used}/${quota}），本次不主动 ${key}`);
       } else {
+        // 鲸鲸 3.0 P4 冒泡预检：概率和额度都过了，最后自评一次「值不值得为这句叫醒她」。
+        // 分数低 → 不唤醒、不扣额度（bumpProactiveQuota 放闸后），安静等下一轮。
+        const gate = proactiveGateV2(key, st, nowMs);
+        if (!gate.pass) {
+          log(`[reserved2] 冒泡预检拦下 ${key}（分数 ${gate.score}：${gate.reasons.join('，') || '无有效信号'}）`);
+          appendInitiativeLog({ type: 'blocked-gate', v: 1, ts: nowMs, id: `pct:${nowMs}`, key, score: gate.score, reasons: gate.reasons });
+          return;
+        }
         if (quota >= 0) bumpProactiveQuota(key);
         await sendWakePromptV2(key, 'proactiveCheck');
       }
@@ -12702,6 +13056,9 @@ async function main() {
       return resolveGroupMemberName(event.group_id, qq);
     };
     const resolveReply = (messageId) => resolveReplyInfo(kind, id, messageId, event.self_id);
+    // 鲸鲸 3.0 P1：先把语音段转文字（下载→silk 解码→whisper），textContent/plainContent 才能带上内容；
+    // 关键词/名字唤醒（evaluateWakeTriggerV2）同样吃这两份文本，语音里叫「鲸鲸」也能唤醒。
+    await enrichRecordsWithAsr(event.message ?? [], key);
     // textContent 带引用对象信息，供 DSH 判断“这句话在对谁说”；
     // plainContent 只保留当前消息自己的文字，用于命令/指向性判断，避免被引用原文干扰。
     const textContent = await segmentsToText(event.message ?? [], { resolveAtName, resolveReply });
@@ -12845,6 +13202,79 @@ async function main() {
         writeRoleState(roleState.role, 'active');
         await sendToQQ(key, '已退出静默模式，恢复正常回复。');
         return;
+      }
+      // ── 后台任务管理（鲸鲸 3.0 P3：审批 + 看板，仅管理员） ──
+      if (plainContent === '/jobs') {
+        const st = agentJobs.status();
+        const lines = [];
+        const running = st.jobs.filter((j) => j.status === 'running');
+        const recent = st.jobs.filter((j) => j.status !== 'running').slice(-8);
+        if (running.length) lines.push('▶ 运行中：' + running.map((j) => `${j.id}${j.label ? '「' + j.label + '」' : ''}(${Math.round((Date.now() - j.startedAt) / 60000)}分钟)`).join('、'));
+        if (st.pendingApprovals.length) lines.push('⏳ 待审批：' + st.pendingApprovals.map((p) => `${p.id}：${(p.label || p.command).slice(0, 40)}`).join('；'));
+        if (recent.length) lines.push('📜 最近：' + recent.map((j) => `${j.id} ${j.status}${j.exitCode != null ? '(exit' + j.exitCode + ')' : ''}`).join('、'));
+        if (!lines.length) { await sendToQQ(key, '没有后台任务。'); return; }
+        await sendToQQ(key, lines.join('\n'));
+        return;
+      }
+      if (plainContent.startsWith('/job ')) {
+        const parts = plainContent.slice(5).trim().split(/\s+/);
+        const sub = (parts[0] || '').toLowerCase();
+        const arg = parts.slice(1).join(' ');
+        if (sub === 'ok' && arg) {
+          const rJ = agentJobs.approve(arg);
+          await sendToQQ(key, rJ.ok ? `✅ 已批准并启动任务 ${rJ.job.id}` : `❌ ${rJ.error}`);
+          if (rJ.ok && rJ.job.followupKey && rJ.job.followupKey !== key) {
+            await sendToQQ(rJ.job.followupKey, `你申请的后台任务「${rJ.job.label || rJ.job.command.slice(0, 40)}」已获主人批准，开始执行（id ${rJ.job.id}）。`).catch(() => {});
+          }
+          return;
+        }
+        if (sub === 'no' && arg) {
+          const rJ = agentJobs.reject(arg);
+          await sendToQQ(key, rJ.ok ? '❌ 已拒绝该任务' : `❌ ${rJ.error}`);
+          if (rJ.ok && rJ.requestedBy && rJ.requestedBy !== key) {
+            await sendToQQ(rJ.requestedBy, '你申请的后台任务被主人拒绝了。').catch(() => {});
+          }
+          return;
+        }
+        if (sub === 'kill' && arg) {
+          const rJ = agentJobs.kill(arg);
+          await sendToQQ(key, rJ.ok ? `⛔ 已终止任务 ${rJ.job.id}` : `❌ ${rJ.error}`);
+          return;
+        }
+        if (sub === 'out' && arg) {
+          const rJ = agentJobs.output(arg, { tailBytes: 4096 });
+          await sendToQQ(key, rJ.ok ? `任务 ${rJ.job.id} ${rJ.job.status}（exit ${rJ.job.exitCode ?? '?'}）：\n${(rJ.outTail || rJ.errTail || '(无输出)').slice(-600)}` : `❌ ${rJ.error}`);
+          return;
+        }
+        await sendToQQ(key, '用法：/job ok <审批id>｜/job no <审批id>｜/job kill <任务id>｜/job out <任务id>；/jobs 看板。');
+        return;
+      }
+      // ── 自然语言审批（主人懒得打 /job ok 时） ──
+      // 仅当：私聊管理员 + 消息是裸批准/拒绝词（≤6字）+ 存在待审批任务 → 作用于最早的一条。
+      // 带其他内容的句子不碰（避免把闲聊里的「好」误当审批）。
+      {
+        const bare = plainContent.trim().replace(/[~～!！。.\s]+$/, '');
+        const pending = agentJobs.status().pendingApprovals;
+        if (pending.length && kind === 'private' && bare.length <= 6) {
+          if (/^(允许|同意|批准|准了|可以|好的?|行|ok|OK|Ok|approve)$/i.test(bare)) {
+            const p = pending[0];
+            const rJ = agentJobs.approve(p.id);
+            await sendToQQ(key, rJ.ok ? `✅（自然语言识别）已批准并启动任务 ${rJ.job.id}：${(rJ.job.label || rJ.job.command).slice(0, 60)}` : `❌ ${rJ.error}`);
+            if (rJ.ok && rJ.job.followupKey && rJ.job.followupKey !== key) {
+              await sendToQQ(rJ.job.followupKey, `你申请的后台任务「${rJ.job.label || rJ.job.command.slice(0, 40)}」已获主人批准，开始执行（id ${rJ.job.id}）。`).catch(() => {});
+            }
+            return;
+          }
+          if (/^(拒绝|驳回|不准|不行|不要|no|NO|No|reject)$/i.test(bare)) {
+            const p = pending[0];
+            const rJ = agentJobs.reject(p.id);
+            await sendToQQ(key, rJ.ok ? '❌（自然语言识别）已拒绝该任务' : `❌ ${rJ.error}`);
+            if (rJ.ok && p.requestedBy && p.requestedBy !== key) {
+              await sendToQQ(p.requestedBy, '你申请的后台任务被主人拒绝了。').catch(() => {});
+            }
+            return;
+          }
+        }
       }
       // 其余 / 开头内容照常发给 DSH（DSH 的斜杠命令原样执行，如 /model）
     }

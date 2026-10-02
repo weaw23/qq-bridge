@@ -39,6 +39,7 @@
     "@snowluma/mcp": "^1.14.10",
     "@snowluma/sdk": "^1.14.0",
     "js-yaml": "^4.3.2",
+    "silk-wasm": "^3.7.1",
     "zod": "^4.4.3"
   }
 }
