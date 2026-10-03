@@ -6211,6 +6211,12 @@ async function main() {
           const model = String(body.model ?? '').trim();
           const effort = String(body.reasoningEffort ?? 'default').trim();
           if (!provider || !model) { sendJson({ ok: false, error: 'provider / model 不能为空' }, 400); return; }
+          // best-effort 档位兼容性预检：本地表里没记录的就跳过着一步。
+          const caps = lookupModelCaps(provider, model);
+          const warnings = [];
+          if (caps && effort && effort !== 'default' && !caps.efforts.includes(effort)) {
+            warnings.push(`所选模型 ${provider}/${model} 不支持 effort=${effort}（已知支持 ${caps.efforts.join('/')}）。已按你的选择保存，但新建会话时会自动降级到模型默认档（${caps.defaultEffort ?? 'default'}），识图能力不会被锁掉。`);
+          }
           cfg.dsh.provider = provider;
           cfg.dsh.model = model;
           cfg.dsh.reasoningEffort = effort;
@@ -6220,8 +6226,13 @@ async function main() {
             file.dsh = { ...(file.dsh ?? {}), provider, model, reasoningEffort: effort };
             fs.writeFileSync(configFile, JSON.stringify(file, null, 2) + '\n');
           } catch (error) { sendJson({ ok: false, error: '保存失败：' + (error?.message ?? error) }, 500); return; }
-          log(`[panel] 模型切换为 ${provider}/${model}（effort=${effort}）`);
-          sendJson({ ok: true, note: `已保存 ${provider}/${model}（新会话生效；点「重建全部会话」立即生效）` });
+          log(`[panel] 模型切换为 ${provider}/${model}（effort=${effort}${caps && effort && effort !== 'default' && !caps.efforts.includes(effort) ? ' [预警：会自动降级]' : ''}）`);
+          sendJson({
+            ok: true,
+            note: `已保存 ${provider}/${model}（新会话生效；点「重建全部会话」立即生效）`,
+            warnings,
+            caps: caps || null,
+          });
           return;
         }
 
@@ -6271,16 +6282,32 @@ async function main() {
                 api: String(p?.api || 'openai-completions'),
                 baseURL: String(p?.baseURL || ''),
                 apiKeyEnv: String(p?.apiKeyEnv || ''),
-                models: (Array.isArray(p?.models) ? p.models : []).map((m) => ({
-                  id: String(m?.id ?? ''),
-                  name: String(m?.name ?? m?.id ?? '')
-                })).filter((m) => m.id)
+                models: (Array.isArray(p?.models) ? p.models : []).map((m) => {
+                  const mid = String(m?.id ?? '');
+                  const caps = lookupModelCaps(id, mid);
+                  return {
+                    id: mid,
+                    name: String(m?.name ?? m?.id ?? ''),
+                    vision: !!caps?.vision,
+                    efforts: caps?.efforts ?? null,
+                    defaultEffort: caps?.defaultEffort ?? null,
+                    note: caps?.note ?? null,
+                  };
+                }).filter((m) => m.id)
               });
             }
             const builtins = [];
-            const deepModels = (Array.isArray(nsDeep?.value?.models) ? nsDeep.value.models : []).map((m) => ({
-              id: String(m?.id ?? ''), name: String(m?.name ?? m?.id ?? '')
-            })).filter((m) => m.id);
+            const deepModels = (Array.isArray(nsDeep?.value?.models) ? nsDeep.value.models : []).map((m) => {
+              const mid = String(m?.id ?? '');
+              const caps = lookupModelCaps('deepseek-official', mid);
+              return {
+                id: mid, name: String(m?.name ?? m?.id ?? ''),
+                vision: !!caps?.vision,
+                efforts: caps?.efforts ?? null,
+                defaultEffort: caps?.defaultEffort ?? null,
+                note: caps?.note ?? null,
+              };
+            }).filter((m) => m.id);
             if (deepModels.length) {
               builtins.push({
                 id: 'deepseek-official', label: 'DeepSeek 官方（DSH 内置）', api: 'official',
@@ -6291,11 +6318,22 @@ async function main() {
             const admProvider = String(nsAdm?.value?.provider ?? '');
             const admModel = String(nsAdm?.value?.model ?? '');
             if (admProvider && admModel && !providers.some((p) => p.id === admProvider) && !builtins.some((b) => b.id === admProvider)) {
-              builtins.push({ id: admProvider, label: `${admProvider}（账号内置）`, api: 'official', baseURL: '', apiKeyEnv: '', models: [{ id: admModel, name: admModel }], keyConfigured: true, builtIn: true, account: true });
+              const admCaps = lookupModelCaps(admProvider, admModel);
+              builtins.push({
+                id: admProvider, label: `${admProvider}（账号内置）`, api: 'official', baseURL: '', apiKeyEnv: '',
+                models: [{ id: admModel, name: admModel, vision: !!admCaps?.vision, efforts: admCaps?.efforts ?? null, defaultEffort: admCaps?.defaultEffort ?? null, note: admCaps?.note ?? null }],
+                keyConfigured: true, builtIn: true, account: true
+              });
             }
             const cred = await describeCredentials(providers.map((p) => p.apiKeyEnv).concat(builtins.map((b) => b.apiKeyEnv)));
             for (const p of providers) p.keyConfigured = !!(p.apiKeyEnv && cred[p.apiKeyEnv]?.configured);
             for (const b of builtins) if (b.apiKeyEnv && !b.account) b.keyConfigured = !!cred[b.apiKeyEnv]?.configured;
+            // current 段：聚合当前 provider/model 的 caps + 实际应用的 effort + 是否发生过降级（任何会话 lastAppliedEffortReason 非空）。
+            const curProvider = String(cfg.dsh?.provider ?? '');
+            const curModel = String(cfg.dsh?.model ?? '');
+            const curCaps = lookupModelCaps(curProvider, curModel);
+            const fellBackReasons = [...lastAppliedEffortReason.values()].filter(Boolean);
+            const fellBack = fellBackReasons.length > 0;
             sendJson({
               ok: true,
               providers,
@@ -6306,8 +6344,12 @@ async function main() {
               } : null,
               webSearchKeySet: !!(nsWs?.secrets ?? []).some((s) => s?.set === true),
               current: {
-                provider: String(cfg.dsh?.provider ?? ''), model: String(cfg.dsh?.model ?? ''),
-                reasoningEffort: String(cfg.dsh?.reasoningEffort ?? ''), profile: cfg.dsh?.activeProfile ?? null
+                provider: curProvider, model: curModel,
+                reasoningEffort: String(cfg.dsh?.reasoningEffort ?? ''), profile: cfg.dsh?.activeProfile ?? null,
+                effectiveEffort: fellBack ? (curCaps?.defaultEffort ?? '(默认)') : String(cfg.dsh?.reasoningEffort ?? ''),
+                fellBack,
+                fellBackReason: fellBackReasons[0] ?? null,
+                caps: curCaps || null,
               },
               profiles: cfg.dsh?.profiles ?? {}
             });
@@ -6594,10 +6636,27 @@ async function main() {
               warnings.push(`供应商 ${provider} 不在 DSH 供应商目录里，模型选择可能被拒`);
             }
           } catch { /* 预警 best-effort */ }
-          log(`[panel] 档案「${name}」已应用：${provider}/${model}（effort=${effort}），热切换 ${hot}/${uniq.length} 个会话`);
+          // C3+ bug m10688：检测本次应用是否触发了「档位不兼容→自动降级」。若降级，把人话原因推到 warnings
+          // 让前端能看到「你选了 max 实际跑的是默认档，识图不会丢」之类的提示，避免静默。
+          const fellBackReasons = [...lastAppliedEffortReason.entries()].filter(([, reason]) => reason);
+          const caps = lookupModelCaps(provider, model);
+          let effectiveEffort = effort;
+          let fellBack = false;
+          if (fellBackReasons.length) {
+            fellBack = true;
+            // 所有降级原因来自同一组档案参数，pick 一份最有信息量的展示即可。
+            const sampleReason = fellBackReasons[0][1];
+            effectiveEffort = caps?.defaultEffort ?? '(默认)';
+            warnings.unshift(`档位不兼容（已自动降级）：${sampleReason}`);
+          } else if (caps && effort && effort !== 'default' && !caps.efforts.includes(effort)) {
+            // 本地表有记录、effort 在已知列表外但这次没触发降级（罕见，理论上 ensureChatModel 一定会触发）。
+            warnings.unshift(`所选模型 ${provider}/${model} 不支持 effort=${effort}（已知支持 ${caps.efforts.join('/')}），新建会话时会自动改用模型默认档。`);
+          }
+          log(`[panel] 档案「${name}」已应用：${provider}/${model}（effort=${effort}${fellBack ? ` → 实际 ${effectiveEffort}` : ''}），热切换 ${hot}/${uniq.length} 个会话`);
           sendJson({
             ok: true,
-            applied: { name, provider, model, reasoningEffort: effort },
+            applied: { name, provider, model, reasoningEffort: effort, effectiveEffort, fellBack },
+            caps: caps || null,
             sessionsTotal: uniq.length,
             sessionsHot: hot,
             failedSessions,
@@ -8682,10 +8741,27 @@ async function main() {
     return true;
   }
 
+  // ─── 模型能力查询（best-effort：DSH 没暴露 listModels RPC，本地表仅用于面板预警 / 失败解释）──
+  // 真正的"是否支持"以 DSH 抛错为准，这里只在调用前先给人话提示。
+  // 数据来源：
+  //   - DeepSeek 官方：DSH settings.llm-deepseek.models[].inputModalities 含 image ⇒ vision
+  //   - pi-ai 路由（dk/al/...）：走 pi-ai SDK catalog，DSH 不外露，本地表只贴常用组合做事前警告
+  const KNOWN_MODEL_CAPS = Object.freeze({
+    'deepseek-official/deepseek-flash':     { efforts: ['off', 'low', 'high', 'max'], defaultEffort: 'high', vision: true,  note: '多模态，支持识图' },
+    'deepseek-official/deepseek-chat':      { efforts: ['off', 'low', 'high', 'max'], defaultEffort: 'high', vision: false, note: '纯文本' },
+    'deepseek-official/deepseek-reasoner':  { efforts: ['off', 'low', 'high', 'max'], defaultEffort: 'high', vision: false, note: '推理增强，不接图' },
+    'dk/deepseek-flash':                    { efforts: ['low', 'high'],               defaultEffort: 'high', vision: true,  note: 'pi-ai 路由不一定支持 max；支持识图' },
+  });
+  const lookupModelCaps = (provider, model) => KNOWN_MODEL_CAPS[`${provider}/${model}`] ?? null;
+
   // 会话模型应用去重：每个 DSH 会话在本进程内只 selectModel 一次。
   // 四种 QQ 模式共用 DSH 会话，统一强制使用多模态模型 DeepSeek-V41-Flash（id: deepseek-flash）+ max 思考强度；
   // 它同时支持 text/image 输入，取代已下线的 deepseek-v4-flash-vision-exp。
   const modelAppliedSessions = new Set();
+  // 每个会话上次实际应用的 effort（用于面板显示「你选了 X 但实际跑的是 Y」）。
+  const lastAppliedEffort = new Map();
+  // 每个会话上次发生降级的人话原因（null/undefined = 上次无降级；其他 = 降级原因）。
+  const lastAppliedEffortReason = new Map();
   async function ensureChatModel(sessionId) {
     if (modelAppliedSessions.has(sessionId)) return;
     const provider = String(cfg.dsh?.provider || 'deepseek-official');
@@ -8695,17 +8771,50 @@ async function main() {
     const effort = rawEffort === undefined || rawEffort === null || String(rawEffort) === '' || String(rawEffort) === 'default'
       ? undefined
       : String(rawEffort);
+    let result = null, userEffort = effort, effortUsed = effort, fellBack = false, lastErr = null;
     for (let attempt = 1; attempt <= 2; attempt += 1) {
       try {
-        const result = unwrap(await api.sessions.selectModel({ sessionId, provider, model, reasoningEffort: effort }), 'session.selectModel');
-        modelAppliedSessions.add(sessionId);
-        log(`已设置会话模型 ${sessionId} -> ${result.selected.provider}/${result.selected.model} (${result.selected.reasoningEffort ?? '默认'})`);
-        return;
+        result = unwrap(await api.sessions.selectModel({ sessionId, provider, model, reasoningEffort: effort }), 'session.selectModel');
+        lastErr = null;
+        break;
       } catch (error) {
-        log(`设置会话模型失败 ${sessionId}（第 ${attempt}/2 次）: ${error?.message ?? error}`);
+        const msg = String(error?.message ?? error);
+        const isUnsupportedEffort = /UNSUPPORTED_REASONING_EFFORT|does not support reasoning effort/i.test(msg);
+        if (isUnsupportedEffort) {
+          // 档位不被支持（spec 错、本地表映射错、provider 路由错都落这里）。
+          // 不要打 sleep 重试 — 换 effort 再试：放弃 effort 让 DSH 选模型内置默认档。
+          log(`设置会话模型 ${sessionId}: ${provider}/${model} 不支持 effort=${userEffort ?? '(default)'}，降级到模型默认档`);
+          try {
+            result = unwrap(await api.sessions.selectModel({ sessionId, provider, model, reasoningEffort: undefined }), 'session.selectModel');
+            fellBack = true;
+            effortUsed = undefined;
+            lastErr = null;
+            break;
+          } catch (error2) {
+            lastErr = error2;
+            break;
+          }
+        }
+        // 其他错误（网络/provider 离线/密钥错等）：重试一次
+        log(`设置会话模型失败 ${sessionId}（第 ${attempt}/2 次）: ${msg}`);
+        lastErr = error;
         if (attempt < 2) await sleep(1000);
       }
     }
+    if (!result) {
+      const msg = String(lastErr?.message ?? lastErr);
+      log(`设置会话模型失败 ${sessionId}: ${msg}`);
+      lastAppliedEffortReason.set(sessionId, `selectModel 失败：${msg}`);
+      return;
+    }
+    modelAppliedSessions.add(sessionId);
+    lastAppliedEffort.set(sessionId, effortUsed);
+    if (fellBack) {
+      lastAppliedEffortReason.set(sessionId, `档位 ${userEffort ?? '(default)'} 不被 ${provider}/${model} 支持，已自动改用模型内置默认档`);
+    } else {
+      lastAppliedEffortReason.delete(sessionId);
+    }
+    log(`已设置会话模型 ${sessionId} -> ${result.selected.provider}/${result.selected.model} (${result.selected.reasoningEffort ?? '默认'}${fellBack ? ' [自动降级]' : ''})`);
   }
 
   async function ensureSession(key) {
