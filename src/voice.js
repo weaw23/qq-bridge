@@ -126,8 +126,14 @@ export function createVoiceModule({ cfg, log, appendActivity }) {
   // ── 短语缓存 ─────────────────────────────────────────────────────────
   function cacheDir() { return String(voiceCfg().cacheDir || 'D:/qqbot/qq-bridge/state/voice-cache'); }
   function voiceFingerprint() {
+    // 缓存指纹必须覆盖所有会传给 GPT-SoVITS 的合成参数，否则改参数后旧 silk 复用 → 听着音色对但发声细节陈旧。
+    // 漏字段会导致 Bug #6：topK/topP/temperature/textSplitMethod 改了但 cache 不失效。
     const v = voiceCfg();
-    const parts = [v.refAudioPath, v.promptText, v.promptLang, v.textLang, v.speedFactor, v.ttsModel];
+    const parts = [
+      v.refAudioPath, v.promptText, v.promptLang, v.textLang,
+      v.speedFactor, v.ttsModel,
+      v.topK, v.topP, v.temperature, v.textSplitMethod,
+    ];
     return crypto.createHash('sha1').update(JSON.stringify(parts)).digest('hex').slice(0, 10);
   }
   function cacheGet(text) {
