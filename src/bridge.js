@@ -6346,7 +6346,7 @@ async function main() {
               current: {
                 provider: curProvider, model: curModel,
                 reasoningEffort: String(cfg.dsh?.reasoningEffort ?? ''), profile: cfg.dsh?.activeProfile ?? null,
-                effectiveEffort: fellBack ? (curCaps?.defaultEffort ?? '(默认)') : String(cfg.dsh?.reasoningEffort ?? ''),
+                effectiveEffort: fellBack ? (curCaps?.defaultEffort ?? null) : String(cfg.dsh?.reasoningEffort ?? ''),
                 fellBack,
                 fellBackReason: fellBackReasons[0] ?? null,
                 caps: curCaps || null,
@@ -6646,7 +6646,7 @@ async function main() {
             fellBack = true;
             // 所有降级原因来自同一组档案参数，pick 一份最有信息量的展示即可。
             const sampleReason = fellBackReasons[0][1];
-            effectiveEffort = caps?.defaultEffort ?? '(默认)';
+            effectiveEffort = caps?.defaultEffort ?? null;
             warnings.unshift(`档位不兼容（已自动降级）：${sampleReason}`);
           } else if (caps && effort && effort !== 'default' && !caps.efforts.includes(effort)) {
             // 本地表有记录、effort 在已知列表外但这次没触发降级（罕见，理论上 ensureChatModel 一定会触发）。
@@ -8741,18 +8741,91 @@ async function main() {
     return true;
   }
 
-  // ─── 模型能力查询（best-effort：DSH 没暴露 listModels RPC，本地表仅用于面板预警 / 失败解释）──
-  // 真正的"是否支持"以 DSH 抛错为准，这里只在调用前先给人话提示。
-  // 数据来源：
-  //   - DeepSeek 官方：DSH settings.llm-deepseek.models[].inputModalities 含 image ⇒ vision
-  //   - pi-ai 路由（dk/al/...）：走 pi-ai SDK catalog，DSH 不外露，本地表只贴常用组合做事前警告
+  // ─── 模型能力查询（m10688 二期：DSH 实际暴露 `llm.resolveModelInfo(provider, model)` 远程调用）──
+  // 返回 LlmResolvedModelInfo 含 inputModalities（vision）+ reasoning.efforts + defaultEffort，
+  // 实时反映当前 adapter 注册情况，比硬编码本地表准很多。本地表仅作离线兜底。
+  //
+  // 类型契约（dsh-llm/lib/typert.host.js:334-351）：
+  //   interface LlmModelInfo       { inputModalities?: readonly ModelModality[] }
+  //   interface LlmModelReasoningInfo { efforts: readonly { id, name, description? }[]; defaultEffort?: ReasoningEffortId }
+  //   interface LlmResolvedModelInfo extends LlmModelInfo { reasoning?: LlmModelReasoningInfo }
   const KNOWN_MODEL_CAPS = Object.freeze({
+    // 仅在 DSH 不可达时降级使用——主路径走 resolveLiveCaps() 实时拉。
     'deepseek-official/deepseek-flash':     { efforts: ['off', 'low', 'high', 'max'], defaultEffort: 'high', vision: true,  note: '多模态，支持识图' },
     'deepseek-official/deepseek-chat':      { efforts: ['off', 'low', 'high', 'max'], defaultEffort: 'high', vision: false, note: '纯文本' },
     'deepseek-official/deepseek-reasoner':  { efforts: ['off', 'low', 'high', 'max'], defaultEffort: 'high', vision: false, note: '推理增强，不接图' },
-    'dk/deepseek-flash':                    { efforts: ['low', 'high'],               defaultEffort: 'high', vision: true,  note: 'pi-ai 路由不一定支持 max；支持识图' },
+    'dk/deepseek-flash':                    { efforts: [],                              defaultEffort: null,     vision: true,  note: 'pi-ai 路由整体不接受 reasoningEffort 字段（实测：选 low/high/max 都报"does not support"）；支持识图' },
   });
   const lookupModelCaps = (provider, model) => KNOWN_MODEL_CAPS[`${provider}/${model}`] ?? null;
+  // 实时缓存：5 分钟 TTL（面板预览频繁，DSH RPC 不需要每次重拉）
+  const LIVE_CAPS_TTL_MS = 5 * 60 * 1000;
+  const liveCapsCache = new Map();
+  // effort 强度排序（用于降级时挑最大非 off 档；未在表里视为最低 0）
+  const EFFORT_PRIORITY = ['off', 'low', 'medium', 'high', 'xhigh', 'max'];
+  const effortRank = (e) => {
+    const i = EFFORT_PRIORITY.indexOf(String(e));
+    return i === -1 ? 0 : i;
+  };
+  // 实时拉取模型能力（DSH `session.modelCatalog()` 真暴露的 RPC；m10688 二期经验：
+  // typert.host.js 声明的 `llm.resolveModelInfo/listModels` 在当前 DSH 桌面版实际返回 404，
+  // 只有 `session.modelCatalog()` 和 `llm.listProviders` 真的挂出来）。
+  // catalog 返回结构（实测）：
+  //   {
+  //     default: {provider, model},
+  //     routableProviders: string[],
+  //     groups: [{id, name, models: [{id, name, description?, reasoning?: {efforts:[{id,name,description}], defaultEffort}}]}]
+  //   }
+  // 注意：catalog **没有** inputModalities / vision 字段——vision 信息仍来自本地表。
+  async function resolveLiveCaps(provider, model, { signal } = {}) {
+    const key = `${provider}/${model}`;
+    const now = Date.now();
+    const cached = liveCapsCache.get(key);
+    if (cached && cached.expiresAtMs > now) return cached.caps;
+    let efforts = null, defaultEffort = null, description = null;
+    try {
+      const catalog = unwrap(
+        await api.callUnary('session.modelCatalog', {}),
+        'session.modelCatalog',
+      );
+      // 在 groups 里按 provider+model 精确匹配
+      for (const g of (catalog?.groups ?? [])) {
+        if (String(g?.id) !== String(provider)) continue;
+        for (const m of (g?.models ?? [])) {
+          if (String(m?.id) !== String(model)) continue;
+          description = m?.description ? String(m.description) : null;
+          if (Array.isArray(m?.reasoning?.efforts)) {
+            efforts = m.reasoning.efforts.map((e) => String(e?.id ?? e)).filter(Boolean);
+          }
+          if (m?.reasoning?.defaultEffort) {
+            defaultEffort = String(m.reasoning.defaultEffort);
+          }
+          break;
+        }
+      }
+    } catch (err) {
+      log(`[model-caps] 实时拉 ${key} catalog 失败（${err?.message ?? err}），仅用本地表`);
+    }
+    // vision + note 信息本地表独享（DSH catalog 没暴露）
+    const local = lookupModelCaps(provider, model);
+    const caps = {
+      efforts: efforts && efforts.length ? efforts : (local?.efforts ?? null),
+      defaultEffort: defaultEffort ?? local?.defaultEffort ?? null,
+      vision: local?.vision === true,
+      note: description ?? local?.note ?? null,
+      live: Array.isArray(efforts) && efforts.length > 0, // 标记是否真的从 DSH 拉到了非空 reasoning 元数据
+    };
+    liveCapsCache.set(key, { caps, expiresAtMs: now + LIVE_CAPS_TTL_MS });
+    return caps;
+  }
+  // 给定"档位不被支持"场景，从 efforts 列表里挑出最大非 off 档。
+  // 没有可用非 off 档时返 undefined（让 DSH 完全不传 reasoningEffort 字段走 SDK 默认）。
+  function pickHighestNonOffEffort(efforts) {
+    if (!Array.isArray(efforts) || !efforts.length) return undefined;
+    const nonOff = efforts.map(String).filter((e) => e !== 'off');
+    if (!nonOff.length) return undefined;
+    nonOff.sort((a, b) => effortRank(a) - effortRank(b));
+    return nonOff[nonOff.length - 1];
+  }
 
   // 会话模型应用去重：每个 DSH 会话在本进程内只 selectModel 一次。
   // 四种 QQ 模式共用 DSH 会话，统一强制使用多模态模型 DeepSeek-V41-Flash（id: deepseek-flash）+ max 思考强度；
@@ -8779,20 +8852,51 @@ async function main() {
         break;
       } catch (error) {
         const msg = String(error?.message ?? error);
-        const isUnsupportedEffort = /UNSUPPORTED_REASONING_EFFORT|does not support reasoning effort/i.test(msg);
+        // unwrap() 把 DSH 的 code 编进 message：`${label} failed: ${code}: ${message}`。
+        // 优先用机器可读的 code 字段（部分路径会通过 err.code 抛），其次 parse message。
+        const codeMatch = msg.match(/^[^:]+ failed:\s*([A-Z0-9_/-]+):/);
+        const code = String(error?.code ?? codeMatch?.[1] ?? '');
+        const isUnsupportedEffort = code === 'UNSUPPORTED_REASONING_EFFORT' || /does not support reasoning effort/i.test(msg);
         if (isUnsupportedEffort) {
-          // 档位不被支持（spec 错、本地表映射错、provider 路由错都落这里）。
-          // 不要打 sleep 重试 — 换 effort 再试：放弃 effort 让 DSH 选模型内置默认档。
-          log(`设置会话模型 ${sessionId}: ${provider}/${model} 不支持 effort=${userEffort ?? '(default)'}，降级到模型默认档`);
+          // 档位不被支持（spec 错、provider 路由错、本地表映射错都落这里）。
+          // 降级策略（m10688 二期 + m10847 三期兜底）：
+          //   第 1 次降级：实时拉 DSH `session.modelCatalog()` + 本地表合并的 efforts 列表，
+          //                挑最大非 off 档重试——保证用户尽量跑在强力档而不是 off/无档。
+          //   第 2 次兜底：catalog 已知档位仍被拒（如 pi-ai 路由 SDK 整体不接受 reasoning 字段），
+          //                再退到「完全不发 reasoningEffort」，让 DSH/SDK 自己选默认档。
+          let fallbackEffort = undefined;
+          let liveCapsNote = '';
           try {
-            result = unwrap(await api.sessions.selectModel({ sessionId, provider, model, reasoningEffort: undefined }), 'session.selectModel');
+            const liveCaps = await resolveLiveCaps(provider, model);
+            const picked = pickHighestNonOffEffort(liveCaps?.efforts);
+            if (picked) {
+              fallbackEffort = picked;
+              liveCapsNote = `（DSH 实时能力：${(liveCaps.efforts || []).join('/')}）`;
+            }
+          } catch (capsErr) {
+            log(`[ensure-chat-model] 实时拉能力失败: ${capsErr?.message ?? capsErr}`);
+          }
+          log(`设置会话模型 ${sessionId}: ${provider}/${model} 不支持 effort=${userEffort ?? '(default)'}，降级到 ${fallbackEffort ?? '不传effort (走SDK默认)'}${liveCapsNote}`);
+          try {
+            result = unwrap(await api.sessions.selectModel({ sessionId, provider, model, reasoningEffort: fallbackEffort }), 'session.selectModel');
             fellBack = true;
-            effortUsed = undefined;
+            effortUsed = fallbackEffort;
             lastErr = null;
             break;
           } catch (error2) {
-            lastErr = error2;
-            break;
+            // Bug #5：catalog 已知档位仍被拒（典型：pi-ai 路由 SDK 整体不接受 reasoningEffort 字段）。
+            // 第二次兜底：完全不发该字段，让 DSH/SDK 自己选默认档。
+            log(`设置会话模型 ${sessionId}: ${fallbackEffort ?? '不传effort'} 也被拒，再退到完全默认: ${String(error2?.message ?? error2).slice(0, 200)}`);
+            try {
+              result = unwrap(await api.sessions.selectModel({ sessionId, provider, model }), 'session.selectModel');
+              fellBack = true;
+              effortUsed = undefined;
+              lastErr = null;
+              break;
+            } catch (error3) {
+              lastErr = error3;
+              break;
+            }
           }
         }
         // 其他错误（网络/provider 离线/密钥错等）：重试一次
