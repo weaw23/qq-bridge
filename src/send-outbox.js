@@ -86,7 +86,38 @@ export function classifySendFailure(input = {}) {
     return { retryable: true, klass: 'network', reason: '网络错误（连接被拒/超时/中断）' };
   }
 
-  // ⑤ OneBot retcode 分类
+  // ⑤ 先抠 QQ 真码：SnowLuma 把真正的失败码塞在 wording 里。
+  //
+  // 【实测 SnowLuma 真实形态（2026-10-03，直接打 OneBot /send_group_msg 复现）】
+  //   {status:"failed", retcode:100, data:null,
+  //    wording:"send group message rejected: result=110 err=发送失败，你已被移出该群，请重新加群。"}
+  //   {status:"failed", retcode:100, data:null, wording:"send private message rejected: result=15 err="}
+  //
+  // 两条要点：
+  //   ① 外层 retcode 对**所有**发送失败恒为 100 —— 它是「网关侧发送失败」的包装码，
+  //      不是「参数错误」。照旧按 retcode===100 判 bad_param 会把被移出群写成参数错。
+  //   ② 真正的 QQ 结果码在 `result=NNN`（110 被移出群 / 120 风控 / 15 非好友），
+  //      且 wording 里恒含 "rejected" 字样 —— 所以下面那条 /rejected/i 会把**每一个**
+  //      发送失败都吞成「被禁言」，并让 110/120/102/104 分支永远不命中。
+  //      必须先把 result= 抠出来单独判，才谈得上分类准确。
+  const qqM = wording.match(/\bresult=(-?\d+)\b/);
+  const qqCode = qqM ? Number(qqM[1]) : NaN;
+  if (qqCode === 110) {
+    return { retryable: false, klass: 'kicked', reason: '已被移出该群（QQ result=110）' };
+  }
+  if (qqCode === 120) {
+    return { retryable: false, klass: 'muted_or_risk', reason: '被禁言/风控拒绝（QQ result=120）' };
+  }
+  if (qqCode === 15) {
+    return { retryable: false, klass: 'unreachable', reason: '目标不可达（QQ result=15，非好友/不在会话）' };
+  }
+  if (Number.isFinite(qqCode)) {
+    // 认不出来的 QQ 码：不足以判定是瞬时故障 → 保守不重投（宁可漏，不可刷屏）。
+    // 这里也是「网关重启/客户端重连」之外的绝大多数真实失败，重投只会空烧并加重风控。
+    return { retryable: false, klass: 'qq_rejected', reason: `QQ 侧拒绝（result=${qqCode}）` };
+  }
+
+  // ⑥ 其它 OneBot 实现没有 result= 包裹，退回按外层 retcode 分类（兼容保留）。
   if (Number.isFinite(retcode)) {
     if (retcode === 110 || /移出|重新加群/.test(wording)) {
       return { retryable: false, klass: 'kicked', reason: '已被移出该群' };
@@ -109,7 +140,7 @@ export function classifySendFailure(input = {}) {
     }
   }
 
-  // ⑥ 认不出来 → 保守不重投。宁可漏，不可刷屏。
+  // ⑦ 认不出来 → 保守不重投。宁可漏，不可刷屏。
   return { retryable: false, klass: 'unknown', reason: '无法识别的失败，保守起见不重投' };
 }
 

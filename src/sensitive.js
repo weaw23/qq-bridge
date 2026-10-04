@@ -14,8 +14,17 @@ export const TOKEN_MASK = '***';
 export function maskTokens(text, tokens) {
   let s = String(text ?? '');
   let masked = false;
-  for (const t of tokens ?? []) {
-    if (t && s.includes(t)) { s = s.split(t).join(TOKEN_MASK); masked = true; }
+  // Bug #11：必须按长度降序替换。若短令牌是长令牌的前缀（ownerMasterToken 是人手设的，
+  // 完全可能是 agentToken 的前几个字符），先打短的会把长的打成 `***abc...`，尾段照样出站。
+  // 长优先可保证任何一条令牌整体命中时被完整吃掉。
+  //
+  // 注意 tokens 不保证是数组：bridge.js 的 KNOWN_AGENT_TOKENS 是 Set，所以先手工收敛成
+  // 字符串数组，不能直接 `.filter()`（那会在启动阶段就抛 tokens.filter is not a function）。
+  const list = [];
+  if (tokens) for (const t of tokens) { const v = String(t ?? ''); if (v) list.push(v); }
+  const ordered = [...new Set(list)].sort((a, b) => b.length - a.length);
+  for (const t of ordered) {
+    if (s.includes(t)) { s = s.split(t).join(TOKEN_MASK); masked = true; }
   }
   return { text: s, masked };
 }

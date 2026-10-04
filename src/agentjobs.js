@@ -63,6 +63,17 @@ export function createAgentJobsModule({ cfg, log, appendActivity, onFinished, on
   const defaultMaxMinutes = Math.max(1, Math.min(Number(section.maxMinutes) || 30, MAX_MINUTES_CAP));
   const cwd = section.cwd || process.cwd();
   const timers = new Map(); // jobId -> timeout
+  // Bug #8/#9：日志流必须集中托管，否则 kill() 与 spawn 同步抛错两条路径
+  // 都拿不到流 → 永不 end → 文件句柄泄漏 + 缓冲不刷盘（日志尾部丢失）。
+  const streams = new Map(); // jobId -> { out, err }
+
+  function closeStreams(id) {
+    const s = streams.get(id);
+    if (!s) return;
+    streams.delete(id);
+    try { s.out.end(); } catch {}
+    try { s.err.end(); } catch {}
+  }
 
   let reg = { jobs: [], approvals: {}, pendingApprovals: [] };
   try {
@@ -146,6 +157,7 @@ export function createAgentJobsModule({ cfg, log, appendActivity, onFinished, on
     const errFile = path.join(jobsDir, id + '.err.log');
     const outStream = fs.createWriteStream(outFile, { flags: 'a' });
     const errStream = fs.createWriteStream(errFile, { flags: 'a' });
+    streams.set(id, { out: outStream, err: errStream });
     outStream.write(`# ${new Date().toISOString()} start: ${j.command}\n`);
     let child;
     try {
@@ -153,6 +165,9 @@ export function createAgentJobsModule({ cfg, log, appendActivity, onFinished, on
         cwd, windowsHide: true
       });
     } catch (error) {
+      // Bug #9：cwd 不存在等情况 Node 会同步抛 ENOENT —— 流已建但没人管，
+      // 不显式关就是句柄泄漏 + 空日志文件留盘。
+      closeStreams(id);
       j.status = 'failed'; j.finishedAt = Date.now(); j.note = 'spawn 失败: ' + (error?.message ?? error);
       save();
       return { ok: false, error: j.note };
@@ -170,8 +185,7 @@ export function createAgentJobsModule({ cfg, log, appendActivity, onFinished, on
       j.runtimeSec = Math.round((j.finishedAt - j.startedAt) / 1000);
       const t = timers.get(id);
       if (t) { clearTimeout(t); timers.delete(id); }
-      try { outStream.end(); } catch {}
-      try { errStream.end(); } catch {}
+      closeStreams(id);
       save();
       trimHistory(); save();
       log(`[agent-jobs] ${id} ${status} exit=${code ?? '?'} (${j.label || j.command.slice(0, 60)})`);
@@ -250,6 +264,12 @@ export function createAgentJobsModule({ cfg, log, appendActivity, onFinished, on
   function approve(approvalId) {
     const idx = reg.pendingApprovals.findIndex((p) => p.id === String(approvalId));
     if (idx < 0) return { ok: false, error: `找不到待审批 ${approvalId}` };
+    // Bug #7：start() 有并发上限检查，但这条审批路径原本直接 actuallyStart。
+    // 待审批积压时连点「ok」会一口气起满，绕过 maxConcurrent。这里补齐，
+    // 且命中上限时把 entry 放回队列（刚才 splice 出来了），否则审批请求被吞掉。
+    if (reg.jobs.filter((j) => j.status === 'running').length >= maxConcurrent) {
+      return { ok: false, error: `并发任务已达上限（${maxConcurrent}），等一个结束再审批` };
+    }
     const entry = reg.pendingApprovals.splice(idx, 1)[0];
     const hash = commandHash(entry.command);
     reg.approvals[hash] = { command: entry.command.slice(0, 200), at: Date.now(), by: 'owner' };
@@ -303,6 +323,10 @@ export function createAgentJobsModule({ cfg, log, appendActivity, onFinished, on
     j.status = 'killed'; j.finishedAt = Date.now();
     if (j.startedAt) j.runtimeSec = Math.round((j.finishedAt - j.startedAt) / 1000);
     const t = timers.get(j.id); if (t) { clearTimeout(t); timers.delete(j.id); }
+    // Bug #8：kill 后 child.on('close') 会进 finish，但 finish 开头
+    // `if (j.status !== 'running') return` 直接挡掉 → 日志流永远不 end。
+    // 手动终止这条路径必须自己收尾，否则句柄泄漏 + 日志尾部丢缓冲。
+    closeStreams(j.id);
     save();
     log(`[agent-jobs] ${j.id} 被手动终止`);
     return { ok: true, job: publicJob(j) };

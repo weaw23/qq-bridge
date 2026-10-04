@@ -29,7 +29,7 @@ import { extractForwardIds, forwardIdFromData, sanitizeForwardId, formatForwardR
 // 升级阶段 1/2/3 的四块新能力（都是纯函数模块，逻辑与阈值都在各自 ops/test-*.mjs 里锁住）：
 //   refusal-guard 官方口吻兜底改写 / splitter 分条与间隔 / deai 去 AI 腔打分 / persona-state 心情精力
 import { guardOutgoing } from './refusal-guard.js';
-import { planSend } from './splitter.js';
+import { planSend, planGaps } from './splitter.js';
 import { scanAiTone } from './deai.js';
 import {
   STATE_EVENTS,
@@ -7858,9 +7858,31 @@ async function main() {
       try {
         const plan = planSend(work, {}, Math.random);
         if (Array.isArray(plan?.parts) && plan.parts.length > 1) {
-          out.parts = plan.parts;
-          out.gaps = Array.isArray(plan.gaps) ? plan.gaps : [];
-          log(`[layers] 分条 ${key}：${out.parts.length} 条，间隔 ${out.gaps.map((g) => Math.round(g)).join('/')}ms`);
+          // Bug #10：splitter 的 capParts 会把超出 maxParts 的碎片全并进最后一条
+          // （splitter.js 的设计取舍：宁可超长也不丢字）。长回复时那条尾巴会远超
+          // QQ 单条上限——实测 >600 字的回复，尾条能到 550+ 字。planSocialTimeline
+          // 那条旧路径有 splitLongSegment 兜底，这里没有，补上。
+          const rawMaxChars = Number(cfg.socialV2?.maxReplyChars ?? 500);
+          const maxChars = Number.isFinite(rawMaxChars) && rawMaxChars >= 1 ? Math.floor(rawMaxChars) : 500;
+          const hard = [];
+          let split = false;
+          for (const p of plan.parts) {
+            if (typeof p !== 'string' || !p) continue;
+            if (p.length <= maxChars) { hard.push(p); continue; }
+            split = true;
+            for (const chunk of splitLongSegment(p, maxChars)) hard.push(singleLineForQQ(chunk));
+          }
+          const finalParts = hard.filter(Boolean);
+          if (finalParts.length > 1) {
+            out.parts = finalParts;
+            // 硬拆会改变条数，间隔必须重算：gaps.length 恒等于 parts.length-1，
+            // 直接复用旧 gaps 会让 sendMessagesV2 的 delays 错位。
+            out.gaps = split ? planGaps(finalParts, {}, Math.random) : (Array.isArray(plan.gaps) ? plan.gaps : []);
+            log(
+              `[layers] 分条 ${key}：${finalParts.length} 条，间隔 ${out.gaps.map((g) => Math.round(g)).join('/')}ms`
+              + (split ? `（含 ${maxChars} 字硬拆）` : '')
+            );
+          }
         }
       } catch (error) {
         log('[layers] 分条失败（已忽略，按单条发）:', error?.message ?? error);
