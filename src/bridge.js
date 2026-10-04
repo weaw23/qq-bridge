@@ -2759,13 +2759,18 @@ async function main() {
           file.allow = allow;
           file.deny = deny;
           file.ownerQQ = ownerQQ;
-          // P7-A：手工把被自动停用的群填回白名单视为主动恢复——清除停用标记与失败计数
+          // P7-A→P9-N 修订：白名单 POST 不再隐式「恢复」被自动停用的群。
+          // 旧逻辑会把「白名单里出现某 gid」等价于「想恢复它」，导致 cfg.groupsDisabled 在不该清空时被清空，
+          // 配合 scheduleProactiveCheckV2 闸就漏过本不该排程的群（17:26:40 1132819177 复盘事件）。
+          // 恢复意图必须显式走 case 'restore-group'（:6908），由面板单独按钮触发，留有日志可审计。
           {
             const disabledList = (file.groupsDisabled ?? []).map(String);
             const allowSet = new Set(allow.groups.map(String));
-            file.groupsDisabled = disabledList.filter((g) => !allowSet.has(g));
-            for (const g of disabledList) if (allowSet.has(g)) clearGroupStrikes(g);
-            cfg.groupsDisabled = file.groupsDisabled;
+            const wouldRestore = disabledList.filter((g) => allowSet.has(g));
+            if (wouldRestore.length > 0) {
+              log(`[whitelist] 注意：allow.groups 含 ${wouldRestore.join(',')}，但它们仍在 groupsDisabled 中——如确要恢复请走面板「恢复群」按钮（restore-group），此处不自动清空`);
+            }
+            // 仅同步允许列表到 cfg，不再改 groupsDisabled / 不再清失败计数。
           }
           atomicWriteJson(configFile, file);
           cfg.allow = { private: allow.private, groups: allow.groups };
@@ -13136,6 +13141,11 @@ async function main() {
 
   // 鲸鲸 2.0 B4/C：主动机会检查（异步）——生活状态 + 心流三态 + 活跃度/话题信号接管时机
   async function proactiveCheckTickV2(key, st, p) {
+    // P9-N：scheduleProactiveCheckV2 在排程时已经过 isSessionAllowedInCurrentMode 闸，
+    // 但若排程后才被移出/自动停用（旧排程先于 P7-A 触发），这里的闸此时也挡不住旧的 setTimeout。
+    // 二次把关：闸不过直接 return；外层 setTimeout 的 .finally() 会再调一次 scheduleProactiveCheckV2，
+    // 那个闸此时（key 已不在白名单/已在 groupsDisabled）会自然停掉后续排程，不再刷 [heart]/[reserved2] 日志。
+    if (!isSessionAllowedInCurrentMode(key)) return;
     ensureWakeableV2(st, { key });
     const nowMs = Date.now();
     const hour = new Date(nowMs).getHours();
