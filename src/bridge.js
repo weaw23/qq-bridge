@@ -7483,7 +7483,8 @@ async function main() {
           }
           // 出站三层（阶段 1 兜底改写 / 阶段 3 分条+间隔）：决策全部收在 applyOutboundLayers 里，
           // 单条时 parts=[message]、gaps=[]，与改动前逐字一致。
-          const layers = applyOutboundLayers(key, message, url.pathname);
+          // body.noSplit=true 供机器调用跳过 AI 式分条（把她/脚本写好的段落原样发出），见 applyOutboundLayers 注释。
+          const layers = applyOutboundLayers(key, message, url.pathname, { split: body.noSplit !== true });
           message = layers.text;
           const parts = layers.parts.length ? layers.parts : [message];
           const gaps = layers.gaps;
@@ -7832,7 +7833,7 @@ async function main() {
     };
   }
 
-  function applyOutboundLayers(key, text, where = '') {
+  function applyOutboundLayers(key, text, where = '', opts = {}) {
     const out = { text, parts: [text], gaps: [], guard: 'pass', toneScore: 0, kinds: [] };
     const lc = outboundLayerCfg();
     if (!lc.enabled || typeof text !== 'string' || !text.trim()) return out;
@@ -7871,7 +7872,14 @@ async function main() {
 
     // 3) 分条 + 间隔：只有真的分成 ≥2 条才改发送方式。
     //    单条时保留原文——splitter 的归一化会吃掉换行，不该影响普通单条发送。
-    if (lc.split) {
+    //
+    //    opts.split === false：机器调用（运维脚本发简报等）显式跳过 AI 式分条。
+    //    为什么需要：planSend 是为「像真人一样说短句」设计的，SPLIT_DEFAULTS.maxLen 只有 25 字、
+    //    maxParts 只有 4，且 capParts 会把超出 maxParts 的碎片全并进最后一条。
+    //    实测 2026-10-04 22:23：一份 288 字的运维简报被切成 6 / 25 / 24 / 217 字四条，
+    //    还在「…发送校验的时」和「候正则…」中间硬断开——对人是看得懂的报告，对主人是坏掉的消息。
+    //    注意只跳过「分条」，兜底改写（refusal-guard）与去 AI 腔打分照常执行。
+    if (lc.split && opts.split !== false) {
       try {
         const plan = planSend(work, {}, Math.random);
         if (Array.isArray(plan?.parts) && plan.parts.length > 1) {
