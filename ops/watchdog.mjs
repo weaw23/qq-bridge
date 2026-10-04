@@ -91,9 +91,15 @@ function startSnowluma() {
 // pythonw.exe 是 GUI 子系统（PE subsystem=2），从不分配控制台，因此永远不可能弹窗；
 // stdout/stderr 仍被重定向到日志文件，所以 print() 照常可用（不是 pythonw 那种 stdout=None 的坑）。
 function pythonExe(venvDir) {
-  const gui = path.join(venvDir, 'Scripts', 'pythonw.exe');
-  const con = path.join(venvDir, 'Scripts', 'python.exe');
-  return fs.existsSync(gui) ? gui : con;   // 退回 python.exe 只为兼容，理论上不该走到
+  // 两种环境布局都要认：venv 把可执行文件放在 Scripts/ 下，conda 环境放在环境根目录
+  // （如 D:\ai-tools\miniconda3\envs\sovits\pythonw.exe）。
+  // 只认 Scripts/ 会让 conda 环境静默退回 console 版 python.exe —— 弹窗会悄悄回来，所以两种都探。
+  const cands = [
+    path.join(venvDir, 'Scripts', 'pythonw.exe'),
+    path.join(venvDir, 'pythonw.exe'),
+  ];
+  for (const c of cands) { try { if (fs.existsSync(c)) return c; } catch {} }
+  return path.join(venvDir, 'Scripts', 'python.exe');   // 退回 console 版只为兼容，理论上不该走到
 }
 function startWhisper() {
   // 鲸鲸 3.0 语音识别常驻服务（127.0.0.1:9881，faster-whisper small cuda int8）

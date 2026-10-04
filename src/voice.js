@@ -87,6 +87,22 @@ export function createVoiceModule({ cfg, log, appendActivity }) {
     idleTimer.unref?.();
   }
 
+  // Bug #24（与 watchdog eb5598e 同源）：console 子系统解释器（PE subsystem=3）配 detached:true，
+  // 等于给「本来没有控制台」的进程传 DETACHED_PROCESS —— 系统会当场再分配一个新控制台。
+  // windowsHide:true 只在 CreateProcess 阶段设 SW_HIDE，管不了事后新建的控制台；
+  // Win11 默认终端把它显示成 Windows Terminal 窗口 → 主人看到「后台一直弹窗」。
+  // 换成同目录 pythonw.exe（subsystem=2，GUI）后永不分配控制台；stdout/stderr 已重定向到
+  // tts.out.log / tts.err.log，print() 照常可用（不是 pythonw 常见的 sys.stdout is None 那个坑）。
+  // 注意：不要写死 Scripts/ 子目录 —— conda 环境的 pythonw.exe 就在环境根目录，
+  // 只有 venv 才在 Scripts/ 下；用同目录探测对两者都成立。
+  function pythonwIfPossible(exe) {
+    try {
+      const cand = path.join(path.dirname(exe), 'pythonw.exe');
+      if (fs.existsSync(cand)) return cand;
+    } catch {}
+    return exe;
+  }
+
   async function ensureTtsServer() {
     if (await ttsAlive()) return true;
     if (ttsStarting) return ttsStarting;
@@ -97,11 +113,11 @@ export function createVoiceModule({ cfg, log, appendActivity }) {
           log('[voice] TTS 不在线且未配置自启动（voice.lazy=false），请用看门狗常驻方案');
           return await ttsAlive();
         }
-        const pythonExe = String(v.ttsPython || 'D:/ai-tools/miniconda3/envs/sovits/python.exe');
+        const pythonExe = pythonwIfPossible(String(v.ttsPython || 'D:/ai-tools/miniconda3/envs/sovits/python.exe'));
         const repoDir = String(v.ttsCwd || 'D:/ai-tools/GPT-SoVITS');
         const port = Number(new URL(ttsUrl()).port || 9880);
         const args = ['api_v2.py', '-a', '127.0.0.1', '-p', String(port), '-c', 'GPT_SoVITS/configs/tts_infer.yaml'];
-        log('[voice] 拉起 GPT-SoVITS api_v2（冷启动约 10-60s）…');
+        log(`[voice] 拉起 GPT-SoVITS api_v2（冷启动约 10-60s，解释器 ${path.basename(pythonExe)}）…`);
         const out = fs.openSync('D:/qqbot/logs/tts.out.log', 'a');
         const err = fs.openSync('D:/qqbot/logs/tts.err.log', 'a');
         ttsProc = spawn(pythonExe, args, { cwd: repoDir, detached: true, windowsHide: true, stdio: ['ignore', out, err] });
