@@ -276,11 +276,23 @@ function unquoteJsonString(value) {
   return value;
 }
 
+// Bug #18：日志时间戳原本是 `toISOString().slice(11, 19)` —— 那是 **UTC** 的时分秒，
+// 而 watchdog.log（toLocaleString('zh-CN')）、提醒、夜间维护的日志全是本地时间。
+// 排查「桥接为什么重启」必须把 bridge.out.log 与 watchdog.log 对表，两边差 8 小时
+// 且没有任何标记：2026-10-04 就把本地 09:53 读成了凌晨 01:53，白花时间。
+// 另外 state/qq-activity.log 会喂给 agent 汇报 QQ 动态，UTC 会直接误导它对「什么时候发生」的判断。
+// 消费方只按行读尾部、**不解析格式**（readActivityTail / ops/diag-live.mjs），所以改本地时间是安全的。
+const localHms = () => {
+  const d = new Date();
+  const p = (n) => String(n).padStart(2, '0');
+  return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+};
+
 // QQ 活动日志：每次收发都追加一行，供 WebUI 侧 agent 汇报 QQ 动态。
 function appendActivity(line) {
   try {
     fs.mkdirSync(STATE_DIR, { recursive: true });
-    const ts = new Date().toISOString().slice(11, 19);
+    const ts = localHms();
     fs.appendFileSync(ACTIVITY_LOG, `[${ts}] ${redactSensitiveText(String(line).replace(/[\r\n]+/g, ' '))}\n`);
     // 只保留最近 500 行
     const raw = fs.readFileSync(ACTIVITY_LOG, 'utf8');
@@ -748,7 +760,7 @@ function releaseLock() {
 // ── 工具 ────────────────────────────────────────────────────────────────────
 // 日志同时输出到 stdout 与 state/bridge.log（守护窗口不可见时也能排查）
 function log(...args) {
-  const line = `${new Date().toISOString().slice(11, 19)} [bridge] ${args.map((a) => redactSensitiveText(typeof a === 'string' ? a : JSON.stringify(a))).join(' ')}`.replace(/[\r\n]+/g, ' ');
+  const line = `${localHms()} [bridge] ${args.map((a) => redactSensitiveText(typeof a === 'string' ? a : JSON.stringify(a))).join(' ')}`.replace(/[\r\n]+/g, ' ');
   console.log(line);
   try {
     fs.mkdirSync(STATE_DIR, { recursive: true });
