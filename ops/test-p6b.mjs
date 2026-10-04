@@ -48,4 +48,9 @@ const { DatabaseSync } = await import('node:sqlite');
 const db = new DatabaseSync('D:/qqbot/qq-bridge/state/memory.db');
 const q = (sql) => { try { return db.prepare(sql).get()?.c ?? 0; } catch { return '?'; } };
 console.log('   facts:', q('SELECT COUNT(*) c FROM facts'), '| FTS:', q('SELECT COUNT(*) c FROM facts_fts'), '| followups:', q('SELECT COUNT(*) c FROM followups'), '| 画像非空:', q("SELECT COUNT(*) c FROM affinity WHERE profile != ''"));
-process.exit(0);
+db.close();
+// 不能写 process.exit(0)：SQLite 句柄还挂在事件循环上时强退，Node 24 在 Windows 上会撞
+// libuv 断言 `!(handle->flags & UV_HANDLE_CLOSING)`（src\win\async.c line 94），
+// 进程以 -1073740791(0xC0000409) 收场，把前面已经跑完的输出全糊掉（Bug #22 同款）。
+// 关掉库、交给事件循环自然退出即可。
+process.exitCode = 0;

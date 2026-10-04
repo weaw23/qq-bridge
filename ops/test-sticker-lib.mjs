@@ -37,7 +37,32 @@ const LIB_JS = path.join(ROOT, 'src', 'sticker-lib.js');
 const STORE = path.join(ROOT, 'state', 'stickers.json');
 const CONSOLE_TOKEN_FILE = path.join(ROOT, 'state', 'console-token');
 const PANEL = 'http://127.0.0.1:3100';
-const TARGET_KEY = 'group:1132819177';
+const CONFIG_FILE = path.join(ROOT, 'config.json');
+
+// 靶子 group 必须落在「当前模式允许范围」内。
+// 写类路由（sticker-state / send-sticker）带 x-agent-token 时先过 v2SessionAllowed，
+// 只要 key 落在 config.json 的 groupsDisabled 里，一律 403「目标不在当前模式允许范围内」——
+// 这跟表情库本身对不对没有任何关系。
+// 老版本这里硬编码 group:1132819177，后来该群被停用（进了 groupsDisabled），
+// A5~A11 整段就永久变红，看着像产品坏了，其实是靶子被禁用了。
+// 所以改成动态挑：allow.groups 减去 groupsDisabled，优先挑拿得到 agentToken 的群。
+function pickTargetKey() {
+  let cfg = {};
+  try { cfg = JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8')); } catch {}
+  const disabled = new Set((cfg?.groupsDisabled ?? []).map(String));
+  const allowed = (cfg?.allow?.groups ?? []).map(String).filter((g) => !disabled.has(g));
+  let convs = {};
+  try {
+    convs = JSON.parse(fs.readFileSync(path.join(ROOT, 'state', 'social-v2.json'), 'utf8'))?.conversations ?? {};
+  } catch {}
+  const hasTok = (g) => {
+    const v = convs[`group:${g}`];
+    return Boolean(v?.agentToken ?? v?.token);
+  };
+  const withTok = allowed.filter(hasTok);
+  return (withTok.length ? withTok : allowed).map((g) => `group:${g}`)[0] ?? '';
+}
+const TARGET_KEY = pickTargetKey();
 
 let pass = 0, fail = 0, skip = 0;
 const say = (s = '') => console.log(s);
@@ -435,8 +460,14 @@ if (!agentTok) {
   }
 }
 
-const a1 = await req('/api/socialV2/sticker-list?key=' + encodeURIComponent(TARGET_KEY));
-if (a1.status === 0) {
+if (!TARGET_KEY) {
+  // 挑不出靶子就明说，别拿一个必然 403 的 key 去撞、更别把 403 当成产品缺陷。
+  skipped('A 段全部', 'config.json 的 allow.groups 里没有可用的群靶子（全被 groupsDisabled 盖住了）');
+}
+const a1 = TARGET_KEY ? await req('/api/socialV2/sticker-list?key=' + encodeURIComponent(TARGET_KEY)) : { status: 0, err: 'no target key' };
+if (!TARGET_KEY) {
+  // 已跳段
+} else if (a1.status === 0) {
   skipped('A 段全部', `桥接没在跑（${a1.err}）`);
 } else {
   check('A0 面板可达', a1.status === 200, `HTTP ${a1.status}`);

@@ -89,25 +89,37 @@ check('FTS 索引条数与 facts 一致', nFacts === nFts, `(${nFacts}/${nFts})`
 const sv2 = JSON.parse(fs.readFileSync(path.join(ROOT, 'state', 'social-v2.json'), 'utf8'));
 const convs = sv2.conversations || {};
 let leak = 0, dupInBatch = 0, totalRecalled = 0;
+const dupDetail = [];
+// 与 src/bridge.js 里 recallFactLines 的 sigOf 逐字对应（改动请同步两边）。
+const sigOf = (s) => toBigrams(String(s ?? '').slice(0, 80)).split(' ').filter(Boolean);
 for (const k of Object.keys(convs)) {
   const st = convs[k];
   const res = recallFactLines(k, st, 4);
   totalRecalled += res.length;
   const ownerHere = k.startsWith('group:') && (st.recentMessages || []).some((m) => !m.isSelf && String(m.userId ?? '') === String(cfg.ownerQQ));
   console.log(`\n--- ${k}（recent ${Array.isArray(st.recentMessages) ? st.recentMessages.length : 0} 条，主人${k.startsWith('group:') ? (ownerHere ? '在场' : '不在场') : '—'}）→ ${res.length} 条`);
-  const heads = new Set();
+  // 判据必须跟产品一致：bridge.js 的召回去重是「前 80 字的二元词包含度 ≥ 0.6 视为同文变体」。
+  // 别拿「前 16 字相同」当同文判据 —— 事实句普遍带说话人前缀（[盖刚]、[Autmi]、[爱吃布拉瓦［猫又连结］]、
+  // [🔥❄🥷收藏家…]），同一个人的两条毫不相干的事实，前 16 字天然一模一样。
+  // 实测（2026-10-04，全库 1082 条）：16 组前 16 字相同的事实，包含度最高的一对也只有 56%，
+  // 全部低于 0.6 —— 旧写法只会在这些误报上开火，反倒漏掉真正该抓的 #1068/#1073（它俩前 16 字并不相同）。
+  const pickedSigs = [];
   for (const r of res) {
     const bad = k.startsWith('group:') && !ownerHere && String(r.src).startsWith('private:');
     if (bad) leak++;
-    const head = String(db.prepare('SELECT content FROM facts WHERE id=?').get(r.id)?.content ?? '').slice(0, 16);
-    if (heads.has(head)) dupInBatch++;
-    heads.add(head);
+    const content = String(db.prepare('SELECT content FROM facts WHERE id=?').get(r.id)?.content ?? '');
+    const sig = sigOf(content);
+    const dup = sig.length > 0 && pickedSigs.some((p) => p.sig.length > 0 &&
+      sig.filter((g) => p.sig.includes(g)).length / Math.min(sig.length, p.sig.length) >= 0.6);
+    if (dup) { dupInBatch++; dupDetail.push(`${k} 的 #${r.id} 与批内更靠前的一条包含度 ≥0.6`); }
+    pickedSigs.push({ id: r.id, sig });
     console.log(`   ${bad ? '❌泄漏' : '✅'} [id=${r.id} src=${r.src || '-'} s=${r.score}] ${r.line.slice(2, 92)}`);
   }
 }
 console.log('');
 check('私聊事实未外泄到群会话', leak === 0, `(泄漏 ${leak} 条)`);
-check('同批召回内无同文变体重复', dupInBatch === 0, `(重复 ${dupInBatch} 处)`);
+check('同批召回内无同文变体重复（前 80 字二元词包含度 ≥0.6）', dupInBatch === 0,
+  dupInBatch === 0 ? '' : `(重复 ${dupInBatch} 处：${dupDetail.join('；')})`);
 check('空会话不召回', recallFactLines('group:1', { recentMessages: [] }, 4).length === 0);
 check('有会话能召回到记忆', totalRecalled > 0, `(共 ${totalRecalled} 条)`);
 
@@ -170,17 +182,37 @@ console.log(`\n≥0.85 将合并 ${willMerge} 对；0.6~0.85 保留 ${pairs.leng
 //   已跑 → 库里不该再残留 ≥0.85 的近似重复（这才证明合并逻辑生效了）
 //   没跑 → 只要有候选，就要求 0.85 这条线两边都有样本（阈值确实能区分）
 let maintDone = false;
+let lastMaintainAt = 0;
 try {
   const autoM = JSON.parse(fs.readFileSync(path.join(ROOT, 'state', 'autonomy.json'), 'utf8'));
-  maintDone = shouldRun(new Date(), 1, Number(autoM.lastMaintainAt) || 0).fire === false;
+  lastMaintainAt = Number(autoM.lastMaintainAt) || 0;
+  maintDone = shouldRun(new Date(), 1, lastMaintainAt).fire === false;
 } catch { maintDone = false; }
-if (maintDone) {
-  check('维护已跑过 → 库内不应残留 ≥0.85 的近似重复', willMerge === 0,
+// 「维护跑过」只能推出「今天的 01:00 锚点被消费过了」，推不出「库里没有比它更新的事实」。
+// 维护是每天一次的：锚点之后白天新写进库的事实，要等下一轮 01:00 才会被合并，
+// 这期间残留 ≥0.85 的近似重复是设计内的正常状态，不是合并逻辑失效。
+// 实测（2026-10-04）：lastMaintainAt=01:00:00，而 #1068(21:51:57)/#1073(21:54:31) 都在它之后新增，
+// 期间共新增 57 条事实 —— 旧断言就是在这样的库里误报「合并逻辑可能失效」的。
+const newestFactAt = Number(db.prepare('SELECT MAX(created_at) AS c FROM facts').get()?.c ?? 0);
+const newSinceMaint = newestFactAt > lastMaintainAt;
+const fmtT = (v) => (v ? new Date(Number(v)).toLocaleString('sv-SE') : '—');
+const freshEnough = maintDone && !newSinceMaint;
+if (freshEnough) {
+  check('维护跑过且其后无新事实 → 库内不应残留 ≥0.85 的近似重复', willMerge === 0,
     willMerge === 0 ? '（重复已合并完毕，低包含度的对按设计保留）' : `（仍有 ${willMerge} 对未合并，合并逻辑可能失效）`);
+  check('近似合并有候选且阈值区分明显', pairs.length > 0 && willMerge > 0 && pairs.some((p) => p.c < 0.85));
 } else {
+  const why = !maintDone
+    ? `今天 01:00 锚点还没跑（lastMaintainAt=${fmtT(lastMaintainAt)}）`
+    : `01:00 维护（${fmtT(lastMaintainAt)}）之后又新增了事实（最新 ${fmtT(newestFactAt)}），今晚 01:00 才轮到合并`;
+  console.log(`⏭️  跳过「零残留」断言：${why}`);
   check('近似合并有候选且阈值区分明显', pairs.length > 0 && willMerge > 0 && pairs.some((p) => p.c < 0.85));
 }
 
 db.close();
 console.log(`\n===== ${failures === 0 ? '全部通过 ✅' : `${failures} 项失败 ❌`} =====`);
-process.exit(failures === 0 ? 0 : 1);
+// 不能写 process.exit(0)：库连接与 SQLite 句柄还挂在事件循环上时强退，
+// Node 24 在 Windows 上会撞 libuv 断言 `!(handle->flags & UV_HANDLE_CLOSING)`
+// （src\win\async.c line 94）→ 进程以 -1073740791 收场，把已经跑完的通过结果全糊掉。
+// 交给事件循环自然退出即可，db 已经 close 过了。
+process.exitCode = failures === 0 ? 0 : 1;
