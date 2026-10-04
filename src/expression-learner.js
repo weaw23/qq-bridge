@@ -23,7 +23,16 @@ export function loadExpressionStore(file) {
 export function saveExpressionStore(file, list) {
   try {
     fs.mkdirSync(path.dirname(file), { recursive: true });
-    const arr = (Array.isArray(list) ? list : []).slice(0, MAX_ENTRIES);
+    // 淘汰必须"留值钱的"而不是"留最早的"：list 是按插入顺序的（upsertExpression 只 push、从不淘汰），
+    // 原来的 slice(0, MAX_ENTRIES) 在学满 200 条之后把**新学的全部丢掉**，只留最旧那 200 条；
+    // 重启后 loadExpressionStore 一读，新句式就永久消失（实测：内存 250 条 → 盘上只有 001~200）。
+    // 现在按"分数优先、其次新鲜度"排——与 buildExpressionContext 的排序口径一致，
+    // 保证她真正会被注入的那批一定在盘上；同分时新的顶掉旧的（等价于 LRU）。
+    const arr = (Array.isArray(list) ? list : [])
+      .slice()
+      .sort((a, b) => (Number(b?.score) || 0) - (Number(a?.score) || 0)
+        || (Number(b?.lastSeenAt) || 0) - (Number(a?.lastSeenAt) || 0))
+      .slice(0, MAX_ENTRIES);
     fs.writeFileSync(file, JSON.stringify(arr, null, 2));
   } catch {}
 }
