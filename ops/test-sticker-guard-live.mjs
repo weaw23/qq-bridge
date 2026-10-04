@@ -136,12 +136,25 @@ const cfg = JSON.parse(fs.readFileSync(path.join(ROOT, 'config.json'), 'utf8'));
 const allowGroups = (cfg.allow?.groups ?? []).map(String);
 const targetGroup = TARGET_KEY.split(':')[1];
 if (!allowGroups.includes(targetGroup)) {
-  say(`❌ 靶子 ${TARGET_KEY} 不在白名单里（allow.groups=${allowGroups.join(',')}）：守卫跑不到，无法验证。`);
-  process.exit(2);
+  // 2026-10-04（Round-4 自检）：靶子群已被移出白名单（config.json groupsDisabled：
+  // 主人反馈 bot 已被移出该群），本脚本失去了唯一「白名单内 + 她被禁言」的零可见影响靶子。
+  // 这不是产品缺陷，是靶子没了 —— 记成跳过（exit 0）而不是 ❌（exit 2），否则每轮自检
+  // 都会挂一条永远修不好的假失败，把真失败淹掉。
+  say(`⏭️  跳过：靶子 ${TARGET_KEY} 不在白名单里（allow.groups=${allowGroups.join(',')}）。`);
+  say('    原因：该群已移出白名单，脚本没有「白名单内 + 她被禁言」的零可见影响靶子，守卫跑不到。');
+  say('    恢复：把某个白名单群的群号填到 TARGET_KEY（必须确认她在该群被禁言，否则测试表情会真的发出去）。');
+  // 出口也走 drain：stdout 是管道时立刻 process.exit() 会触发 libuv 的
+  // Assertion failed: !(handle->flags & UV_HANDLE_CLOSING)（Bug #22），把「跳过」变成「崩了」。
+  await new Promise((r) => setTimeout(r, 300));
+  process.exit(0);
 }
 const store = JSON.parse(fs.readFileSync(path.join(ROOT, 'state', 'stickers.json'), 'utf8'));
 const entries = (Array.isArray(store) ? store : (store.entries ?? [])).filter((e) => e && e.id && e.md5);
-if (entries.length < 1) { say('❌ 表情库为空，无法验证。'); process.exit(2); }
+if (entries.length < 1) {
+  say('❌ 表情库为空，无法验证。');
+  await new Promise((r) => setTimeout(r, 300));
+  process.exit(2);
+}
 const A = entries[0];
 say(`靶子：${TARGET_KEY}（白名单内且她被禁言到 2026-10-23，双保险）`);
 say(`种子表情 A：id=${A.id.slice(0, 28)}… md5=${String(A.md5).slice(0, 12)}…（只用于判定，不会真的发出去）`);

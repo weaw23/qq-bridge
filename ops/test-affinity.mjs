@@ -296,6 +296,14 @@ section('H 段：端到端（只碰合成 memberId，跑完删干净）');
     skipped('H5 真实入站消息自动累计熟识度', '新列未迁移，查询无意义');
   } else {
 
+    // 起手清理：收尾那段只保证「跑完就干净」，不保证「开跑时干净」。
+    // 上一次跑如果被并发/中断打断（2026-10-04 实测：与 test-mutual-guard 并发导致收尾没跑到），
+    // 库里会留下 member_id=SYNTH_ID 的脏行，而下面三条断言全部假定它是 0：
+    //   查前=1 查后=1 ／ get 后行数=1 ／ bump +5 却回带 score=10（那 5 是上次残留的）
+    // —— 三条全是假失败，看起来像产品坏了。起手删一次即可根治。
+    const stale = openDb().prepare('DELETE FROM affinity WHERE member_id = ?').run(SYNTH_ID).changes;
+    if (stale) say(`   ℹ 起手清理：删掉上次残留的探针行 ${stale} 行（不清的话本轮有 3 条断言会误报）`);
+
     // H3 只读端点绝不能偷偷建行 —— 合成 memberId 查完必须一点痕迹都没有
     const before = openDb().prepare('SELECT COUNT(*) AS n FROM affinity WHERE member_id = ?').get(SYNTH_ID).n;
     await req(`/api/panel/affinity?memberId=${SYNTH_ID}`);

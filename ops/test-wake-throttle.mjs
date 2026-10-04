@@ -309,15 +309,24 @@ const setWakeConfig = (body) => req('/api/socialV2/wake-config', { method: 'POST
 //      偏移量落点漂到某行中间，slice 出来是半行，正则永远匹配不上。实测症状：
 //      `读到字节=90 新鲜行字节=49`，而日志里那行确实在。偏移法在轮转面前没有出路。
 //   ② 改成整读之后，要能区分「本次探测写的那行」和「上一轮测试留下的同名历史行」。
-//      日志行只带 HH:MM:SS（**UTC**，文件 mtime 与进程时间是本地时间），所以把行的时刻
-//      拼到「今天(UTC)」上得到 epoch，只认 >= 探测开始时刻的行。
+//      日志行只带 HH:MM:SS，所以把行的时刻拼到「今天」上得到 epoch，只认 >= 探测开始时刻的行。
+//      ★ Bug #23：Bug #18（commit e6cf3e3）已把 bridge.js 的 log() 从 UTC 改成本地时间
+//      （localHms()），这里必须跟着用**本地**。原来写的是 Date.UTC(...)：把本地 22:28:02
+//      当成 UTC 22:28:02，比此刻晚 8 小时 → 命中下面的「跨零点」修正再减 24h → 每一行新鲜
+//      日志都被算成 16 小时前 → linesSince() 恒返回空 → A9/A10 变成永远修不好的假失败。
+//      实测 2026-10-04 22:28：state/bridge.log 里明明写着
+//      「唤醒节流命中（speak-cooldown）跳过 group:471975044（anyMessage）」，探针却报 命中=false。
+//      触发条件是「桥接重启」，因为 Bug #18 的日志格式改动要重启才生效（今天 22:10:43 重启）。
 const LOG_FILE = path.join(ROOT, 'state', 'bridge.log');
 const esc = (s) => String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 const lineEpoch = (line) => {
   const m = /^(\d{2}):(\d{2}):(\d{2})/.exec(line);
   if (!m) return null;
   const now = new Date();
-  let t = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), Number(m[1]), Number(m[2]), Number(m[3]));
+  let t = new Date(
+    now.getFullYear(), now.getMonth(), now.getDate(),
+    Number(m[1]), Number(m[2]), Number(m[3])
+  ).getTime();
   if (t - now.getTime() > 3600000) t -= 86400000; // 行时刻比此刻「晚」超过 1 小时 → 其实是昨天（跨零点）
   return t;
 };
@@ -341,22 +350,32 @@ async function waitFor(pred, timeoutMs = 6000) {
 // 被拦下时 sendWakePromptV2 直接 return，她**不会被唤醒**，所以这个探测是零副作用的。
 async function probeThrottle({ key, reason, config, expectStage, expectPark, attempts = 3 }) {
   const r = await setWakeConfig({ key, config });
-  const hitRe = new RegExp(`唤醒节流命中（${expectStage}）${expectPark ? '暂存' : '跳过'} ${esc(key)}（${esc(reason)}）`);
+  // ★ 唯一化探测原因（Bug #23 第二形态）：日志行 `…跳过 <key>（<reason>）` 与真实流量**同形**时，
+  //   这里就没法把「本次探测写的那一行」和「历史真实流量写的行」分开。实测证据：
+  //   `linesSince(now-2000)` 在 22:35 那次返回了 47 行，其钟点是 22:37:40…23:19:01 —— 全是
+  //   **未来**的钟点。因为 lineEpoch 把没有日期的 HH:MM:SS 拼到「今天」上，护栏只有
+  //   `晚超过 1 小时才算昨天`，于是**昨天同一钟点 ±1 小时**的历史行会被原样当成「刚写的」。
+  //   文件里此刻就有 14 条昨天的 `[reserved2] 唤醒 group:471975044（anyMessage）` 真投递行，
+  //   只要其钟点落进窗口，就会让「命中=true」的同时「被投递=true」→ A9/A10 假红。
+  //   所以给 reason 加子类型后缀：`wakeReasonBase()` 取冒号前的基名做分类（见 U1.1/U1.4，
+  //   `anyMessage:xxx` 仍是 ambient），判定语义完全不变，但日志里**不可能再出现第二行**。
+  const wireReason = `${reason}:probe`;
+  const hitRe = new RegExp(`唤醒节流命中（${expectStage}）${expectPark ? '暂存' : '跳过'} ${esc(key)}（${esc(wireReason)}）`);
   // ★「会话繁忙」这一支在桥接里排在节流判定**前面**（src/bridge.js:9621 → 9632）：
   // 她这个回合还没结束时，唤醒会被暂存并打 `会话繁忙，暂存唤醒原因` 就返回，
   // **根本走不到节流**。所以这时候"没有节流日志"不代表节流失效，只代表会话正忙 ——
   // 没有区分开的话，A9/A10 会变成随她忙不忙而随机红绿的假失败
   // （线上打开 L0「每条消息都看」之后她更常处于回合中，这个坑就更容易踩到）。
-  const busyRe = new RegExp(`会话繁忙，暂存唤醒原因 ${esc(key)}（${esc(reason)}@`);
+  const busyRe = new RegExp(`会话繁忙，暂存唤醒原因 ${esc(key)}（${esc(wireReason)}@`);
   // 9638 行那句「[reserved2] 唤醒 <key>（<reason>）」只有真投递了才会出现，与节流命中互斥。
-  const deliveredRe = new RegExp(`\\[reserved2\\] 唤醒 ${esc(key)}（${esc(reason)}）`);
+  const deliveredRe = new RegExp(`\\[reserved2\\] 唤醒 ${esc(key)}（${esc(wireReason)}）`);
   let hit = false;
   let delivered = false;
   let busy = false;
   let postStatus = 0;
   for (let i = 0; i < attempts; i += 1) {
     const t0 = Date.now() - 2000; // 留 2 秒余量：日志行只精确到秒
-    const post = await req('/api/socialV2/wake', { method: 'POST', body: { key, reason } });
+    const post = await req('/api/socialV2/wake', { method: 'POST', body: { key, reason: wireReason } });
     postStatus = post.status;
     let text = '';
     await waitFor(() => { text = linesSince(t0); return hitRe.test(text) || busyRe.test(text); });
