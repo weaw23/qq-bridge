@@ -79,10 +79,26 @@ function startSnowluma() {
   child.unref();
   return child.pid;
 }
+// Bug #24（第四轮自检 2026-10-04）：常驻 python 服务会弹出真窗口。
+// 机理：venv 的 python.exe 是 console 子系统程序（PE subsystem=3）。给它 detached:true
+// 就是让 libuv 传 DETACHED_PROCESS —— 「没有控制台」的 console 程序一启动，系统就再分配
+// 一个全新控制台。此时 windowsHide:true 已经不管用了（它只在 CreateProcess 阶段
+// 设 STARTF_USESHOWWINDOW/SW_HIDE，管不了系统事后新建的控制台），而 Windows 11 的默认
+// 终端会把新控制台交给 Windows Terminal 显示 —— 于是主人看到「后台一直弹窗」。
+// 实测（D:\qqbot\outbox\_spawnprobe.ps1 A/B 对照，同样参数只换解释器）：
+//   A python.exe  → 新增 OpenConsole 1 个，且新增 conhost 的父进程就是 python（=真分了新控制台）
+//   B pythonw.exe → 新增 OpenConsole 0 个，python 名下新增 conhost 0 个（=根本没分控制台）
+// pythonw.exe 是 GUI 子系统（PE subsystem=2），从不分配控制台，因此永远不可能弹窗；
+// stdout/stderr 仍被重定向到日志文件，所以 print() 照常可用（不是 pythonw 那种 stdout=None 的坑）。
+function pythonExe(venvDir) {
+  const gui = path.join(venvDir, 'Scripts', 'pythonw.exe');
+  const con = path.join(venvDir, 'Scripts', 'python.exe');
+  return fs.existsSync(gui) ? gui : con;   // 退回 python.exe 只为兼容，理论上不该走到
+}
 function startWhisper() {
   // 鲸鲸 3.0 语音识别常驻服务（127.0.0.1:9881，faster-whisper small cuda int8）
   // 模型缓存走 hf-mirror（huggingface.co 直连不通），并禁用 xet 协议（hf-mirror 不代理它）
-  const py = 'D:\\ai-tools\\whisper-venv\\Scripts\\python.exe';
+  const py = pythonExe('D:\\ai-tools\\whisper-venv');
   const script = 'D:\\ai-tools\\whisper-server.py';
   if (!fs.existsSync(py) || !fs.existsSync(script)) { log('whisper-server 文件不全，跳过'); return null; }
   const out = fs.openSync(path.join(LOGS, 'whisper.out.log'), 'a');
@@ -97,7 +113,7 @@ function startWhisper() {
 }
 function startMeme() {
   // 鲸鲸 3.0 P2：meme-generator 常驻服务（127.0.0.1:9882，Rust pyd，无模型下载）
-  const py = 'D:\\ai-tools\\meme-venv\\Scripts\\python.exe';
+  const py = pythonExe('D:\\ai-tools\\meme-venv');
   const script = 'D:\\ai-tools\\meme-server.py';
   if (!fs.existsSync(py) || !fs.existsSync(script)) { log('meme-server 文件不全，跳过'); return null; }
   const out = fs.openSync(path.join(LOGS, 'meme.out.log'), 'a');
