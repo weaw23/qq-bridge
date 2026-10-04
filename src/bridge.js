@@ -13922,9 +13922,25 @@ async function main() {
 
   // DSH 事件流 → QQ
   async function pumpMux() {
+    // DSH 侧断线后的重试退避。首轮仍是 3 秒 —— DSH Desktop 重启通常几秒内就绪，
+    // 退避太狠反而会拖慢恢复。但**必须封顶**：以前这里是无条件 sleep(3000) + for(;;)，
+    // DSH 长时间不在时（主人关了桌面端 / 端口没起）就变成每小时 1200 次无效握手，
+    // 而且每轮刷 2 行日志（「连接 DSH 事件流…」+「事件流中断: …」）。本文件 log() 的轮转
+    // 只保留最近 2000 行，2 行/3 秒 ≈ 50 分钟就把排查用的历史全冲掉 —— 自检时亲眼见过。
+    // 连接只要稳定活过 10 秒就认定 DSH 是好的，退避重置回 3 秒。
+    const MUX_RETRY_MIN_MS = 3000;
+    const MUX_RETRY_MAX_MS = 30000;
+    const MUX_STABLE_MS = 10000;
+    let muxRetryMs = MUX_RETRY_MIN_MS;
+    let muxFailStreak = 0;
     for (;;) {
+      const muxStartedAt = Date.now();
       try {
-        log('连接 DSH 事件流…');
+        log(
+          muxFailStreak === 0
+            ? '连接 DSH 事件流…'
+            : `连接 DSH 事件流…（连续失败 ${muxFailStreak} 次，已退避到 ${Math.round(muxRetryMs / 1000)} 秒）`
+        );
         for await (const envelope of api.events.mux({})) {
           const frame = envelope.payload;
           if (frame.type === 'session/event') {
@@ -14368,7 +14384,17 @@ async function main() {
         markReadCalledKeys.clear();
         wakeConfigMissCount.clear();
       }
-      await sleep(3000);
+      // 稳定活过 MUX_STABLE_MS 说明 DSH 是好的 → 重置退避，保持 3 秒快恢复；
+      // 秒断（连不上 / 刚连上就被踢）才逐次翻倍，最长 30 秒。
+      if (Date.now() - muxStartedAt >= MUX_STABLE_MS) {
+        muxFailStreak = 0;
+        muxRetryMs = MUX_RETRY_MIN_MS;
+        await sleep(MUX_RETRY_MIN_MS);
+      } else {
+        muxFailStreak += 1;
+        await sleep(muxRetryMs);
+        muxRetryMs = Math.min(MUX_RETRY_MAX_MS, muxRetryMs * 2);
+      }
     }
   }
 
