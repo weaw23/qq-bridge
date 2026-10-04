@@ -106,6 +106,10 @@ export function createVoiceModule({ cfg, log, appendActivity }) {
         const err = fs.openSync('D:/qqbot/logs/tts.err.log', 'a');
         ttsProc = spawn(pythonExe, args, { cwd: repoDir, detached: true, windowsHide: true, stdio: ['ignore', out, err] });
         ttsProc.unref();
+        // Bug #16：父进程不再需要这两个 fd（spawn 已把它们复制给子进程）。
+        // 不关会随每次 TTS 冷启动累积句柄，并把 tts.out.log / tts.err.log 锁住无法读取（同 watchdog Bug #13）。
+        try { fs.closeSync(out); } catch {}
+        try { fs.closeSync(err); } catch {}
         const t0 = Date.now();
         while (Date.now() - t0 < TTS_COLD_START_MS) {
           await new Promise((r) => setTimeout(r, 3000));

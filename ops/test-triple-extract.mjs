@@ -191,8 +191,11 @@ group('S 段 源码级接线检查（只证明写法还在，不是行为验证�
   ok('S1 bridge 导入了抽取器', /import \{ extractTriples, normalize, renderTriple \} from '\.\/triple-extract\.js'/.test(bridgeSrc));
   ok('S2 bridge 导入了三元组模块四个函数',
     /import \{ deserializeTriples, recallTriples, serializeTriples, upsertTriple \} from '\.\/memory-triples\.js'/.test(bridgeSrc));
+  // 原来要求 ingestTriplesFromFact 与 return 之间**零行**，加一行 mirrorLegacyFactToV2
+  // （鲸鲸 2.0 旧→v2 镜像）就假失败了。放宽成「同一块里抽取调用在 return 之前」，
+  // 依然能钉住「新增事实分支挂上了抽取」，但不会被后续插入的无关语句误伤。
   ok('S3 facts 写入路径挂上抽取（新增分支）',
-    /ingestTriplesFromFact\(\{ content, sourceKey, importance \}\);\s*\n\s*return \{ id, deduped: false \}/.test(bridgeSrc));
+    /ingestTriplesFromFact\(\{ content, sourceKey, importance \}\);[\s\S]{0,400}?return \{ id, deduped: false \}/.test(bridgeSrc));
   ok('S4 facts 写入路径挂上抽取（去重分支）',
     /ingestTriplesFromFact\(\{ content, sourceKey, importance \}\); \/\/ 重复事实也再抽一次/.test(bridgeSrc));
   ok('S5 召回复用同一套私聊隔离分寸', /if \(isGroupKey && !ownerPresent && String\(t\.source \?\? ''\)\.startsWith\('private:'\)\) continue;/.test(bridgeSrc));

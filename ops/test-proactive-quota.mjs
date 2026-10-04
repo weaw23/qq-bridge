@@ -21,7 +21,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
-import { localDayKey, quotaPerDayFromConfig, proactiveAllowed, nextLocalMidnight } from '../src/proactive-quota.js';
+import { localDayKey, quotaPerDayFromConfig, quotaPerDayFor, proactiveAllowed, nextLocalMidnight } from '../src/proactive-quota.js';
 import { stickerRepeatBlocked } from '../src/sticker-lib.js';
 
 const ROOT = path.resolve(import.meta.dirname, '..');
@@ -162,7 +162,7 @@ section('接线检查（源码级：只能证明那段代码还在，不等于�
   check('决定放行时确实计数了 bumpProactiveQuota', src.includes('bumpProactiveQuota(key)'));
   check('提示词里告诉了她今日额度余量', src.includes('【今日主动机会】'));
   check('发图前有同图不连发判定', src.includes('刚才已经发过这张表情了'));
-  check('接线：路由调用了纯函数 stickerRepeatBlocked', src.includes('stickerRepeatBlocked(resolved ?? { id: stickerId }'));
+  check('接线：路由调用了纯函数 stickerRepeatBlocked', /stickerRepeatBlocked\(\s*\w+\s*\?\?\s*\{\s*id:\s*stickerId\s*\}/.test(src));
   check('发图成功后记录 lastStickerId', src.includes('st.lastStickerId = '));
   // 会话状态是三处白名单（默认对象 / 加载 / 保存），漏任何一处都会静默不持久化
   const cnt = (src.match(/lastStickerId/g) || []).length;
@@ -201,7 +201,17 @@ section('H 段：HTTP 端到端');
 
   const ownerSess = sessionOf(st1, OWNER_KEY);
   check('H1 面板包含主人私聊会话', !!ownerSess);
-  check('H1 默认配额 = 10（配置里没写 quotaPerDay）', ownerSess?.proactiveQuota === 10, `实际=${ownerSess?.proactiveQuota}`);
+  // 配额来源有两个（与 proactiveQuotaPerDay 的优先级一致）：
+  //   ① state/self-adjust.json 的运行时覆盖（qq_self_adjust 写的）
+  //   ② config.socialV2.proactive.quotaPerDay.private
+  // 早先这里写死 10，配置改成 {group:40, private:30} 之后就成了**假失败** ——
+  // 假失败比没有测试更糟：它会让人习惯性忽略这一行，真回归就被埋在噪音里。
+  const selfAdjustRaw = (() => { try { return JSON.parse(fs.readFileSync(path.join(ROOT, 'state', 'self-adjust.json'), 'utf8')); } catch { return {}; } })();
+  const cfgRaw = (() => { try { return JSON.parse(fs.readFileSync(path.join(ROOT, 'config.json'), 'utf8')); } catch { return {}; } })();
+  const expectedPrivateQuota = Number.isFinite(Number(selfAdjustRaw?.quotaPerDayPrivate))
+    ? Number(selfAdjustRaw.quotaPerDayPrivate)
+    : quotaPerDayFor(cfgRaw?.socialV2?.proactive?.quotaPerDay, false);
+  check(`H1 私聊配额 = 配置值 ${expectedPrivateQuota}`, ownerSess?.proactiveQuota === expectedPrivateQuota, `实际=${ownerSess?.proactiveQuota}（selfAdjust=${selfAdjustRaw?.quotaPerDayPrivate} config=${JSON.stringify(cfgRaw?.socialV2?.proactive?.quotaPerDay)}）`);
   check('H1 每个会话都带 proactiveAllowed 布尔字段', typeof ownerSess?.proactiveAllowed === 'boolean');
 
   // H2 表结构：证明迁移真的跑过（读不存在的表会被 catch 吞掉、静默返回 0）
@@ -227,17 +237,22 @@ section('H 段：HTTP 端到端');
     check('H3 埋 count=0 → 端点读到 used=0 且允许', s?.proactiveUsedToday === 0 && s?.proactiveAllowed === true, `used=${s?.proactiveUsedToday}`);
     check('H3 ?key= 分支不该凭空造出会话', s?.known === false, `known=${s?.known}`);
 
-    put(9);
-    s = await read();
-    check('H3 埋 count=9 → 还剩 1 次，允许', s?.proactiveUsedToday === 9 && s?.proactiveAllowed === true, `used=${s?.proactiveUsedToday}`);
+    // 边界按**端点自报的配额**来打，不写死数字：配额是可配置的（config / selfAdjust 都改得动），
+    // 写死会让配额一变就假失败。这里要证明的始终是「count == quota 时拒绝、quota-1 时放行」。
+    const synthQuota = Number(s?.proactiveQuota);
+    check('H3 端点自报了该会话的今日配额', Number.isFinite(synthQuota) && synthQuota > 0, `quota=${synthQuota}`);
 
-    put(10);
+    put(synthQuota - 1);
     s = await read();
-    check('H3 埋 count=10（=配额）→ 拒绝（边界在真实读取路径上成立）', s?.proactiveUsedToday === 10 && s?.proactiveAllowed === false, `used=${s?.proactiveUsedToday} allowed=${s?.proactiveAllowed}`);
+    check(`H3 埋 count=${synthQuota - 1}（=配额-1）→ 还剩 1 次，允许`, s?.proactiveUsedToday === synthQuota - 1 && s?.proactiveAllowed === true, `used=${s?.proactiveUsedToday}`);
 
-    put(99);
+    put(synthQuota);
     s = await read();
-    check('H3 埋 count=99 → 仍然拒绝（不会因超额而放行）', s?.proactiveAllowed === false);
+    check(`H3 埋 count=${synthQuota}（=配额）→ 拒绝（边界在真实读取路径上成立）`, s?.proactiveUsedToday === synthQuota && s?.proactiveAllowed === false, `used=${s?.proactiveUsedToday} allowed=${s?.proactiveAllowed}`);
+
+    put(synthQuota + 59);
+    s = await read();
+    check('H3 埋 count=配额+59 → 仍然拒绝（不会因超额而放行）', s?.proactiveAllowed === false);
 
     // 昨天的行不能影响今天 —— 这就是「日期键」存在的意义
     const yesterday = localDayKey(Date.now() - 86400000);

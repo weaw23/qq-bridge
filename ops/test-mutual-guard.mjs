@@ -1,4 +1,11 @@
 // 双向守护实测：① 杀看门狗 → 桥接应在 ~3 分钟内拉回；② 杀桥接 → 看门狗应在 60 秒内拉回
+//
+// ⚠️⚠️ 破坏性测试 —— 会 `Stop-Process -Force` 杀掉**线上正在跑的**看门狗和桥接（硬杀，不走优雅退出）。
+// 后果：QQ 链路中断 1~5 分钟；被杀的桥接来不及清理 state/bridge.lock，下一个实例要靠
+// acquireLock() 的「过期锁文件」分支兜底；期间所有打真实端点的测试都会假失败。
+// 2026-10-04 实测踩坑：这个测试与 ops/test-affinity.mjs 并发跑，affinity 收尾那次
+// `/api/panel/affinity` 报 `fetch failed`（桥接正被本测试杀着），另外还留下了脏探针行。
+// 规则：**串行跑，别和其他打端点的测试并发**；跑之前先把主人会话安顿好（或确认他不在等回复）。
 import fs from 'node:fs';
 import { execFileSync } from 'node:child_process';
 const kill = (pat) => { try { execFileSync('powershell.exe', ['-NoProfile', '-Command', `Get-CimInstance Win32_Process -Filter "Name='node.exe'" | Where-Object { $_.CommandLine -like '*${pat}*' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }`], { timeout: 20000, windowsHide: true }); } catch {} };
