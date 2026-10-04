@@ -1,11 +1,3 @@
-// ⚠️ 这是 **线上 `D:\qqbot\watchdog.mjs` 的同步镜像**，不是可独立运行的脚本副本。
-// 真正在跑的是仓库外那一份（由桥接的"互相守护" `ensureWatchdog()` 拉起，路径写死在 `D:\qqbot\watchdog.mjs`）。
-// 2026-10-04 自检发现：本文件停在 2026-09-22 的 98 行版本，比线上少 84 行 —— 缺 whisper/meme
-// 健康检查、缺 SnowLuma 兜底，尤其**不含 Bug #13（spawn 后不关日志句柄）与 Bug #14（无单实例锁）的修复**，
-// 等于那两处修复完全没有版本控制，谁读仓库都会读到错的看门狗。
-// 规则：改线上那份之后**必须同步回这里**（`Copy-Item D:\qqbot\watchdog.mjs ops\watchdog.mjs -Force`，
-// 再把本段注释贴回文件头），否则归档就又开始说谎了。
-//
 // 鲸鲸看门狗：每 60 秒检查链路，缺什么补什么
 //   - 桥接（127.0.0.1:3100）不在 → 拉起
 //   - SnowLuma 网关（127.0.0.1:3000）不在 → 拉起
@@ -19,6 +11,9 @@ import { spawn } from 'node:child_process';
 const ROOT = 'D:\\qqbot\\qq-bridge';
 const LOGS = 'D:\\qqbot\\logs';
 const PAUSE_FILE = path.join(ROOT, 'state', 'watchdog-pause');
+// Bug #19（m13685）：主人嫌「meme 弹窗程序」烦（m12957）。留一个豁免标记，
+// 让看门狗在暂停解除后也不把它拉起来——否则一恢复巡检弹窗就回来。
+const MEME_NOSPAWN_FILE = path.join(ROOT, 'state', 'meme-nospawn');
 const WD_LOG = path.join(LOGS, 'watchdog.log');
 const BRIDGE = path.join(ROOT, 'src', 'bridge.js');
 const LAUNCHER = 'D:\\qqbot\\SnowLuma\\launcher.bat';
@@ -119,9 +114,35 @@ let lastBridgeStart = 0;
 let lastGatewayStart = 0;
 let lastWhisperStart = 0;
 let lastMemeStart = 0;
+let pausedSince = null;      // Bug #19：进入暂停的时刻（null=未暂停）
+let lastPauseLogAt = 0;      // Bug #19：上次复述暂停状态的时间，避免每分钟刷屏
+let memeNoSpawnLogged = false;
 
 async function tick() {
-  if (fs.existsSync(PAUSE_FILE)) { if (once) log('检测到人工停止标记，跳过本轮'); return; }
+  // Bug #19（m13685）：原来 PAUSE 存在时静默 return（只在 --once 模式记一行），
+  // 于是「看门狗被冻住」和「看门狗正常但无事可做」在 watchdog.log 里长得一模一样。
+  // 实测 2026-10-04 19:15:10 点了「停止全链」之后，看门狗静默近 3 小时，期间
+  // whisper-server(:9881) 和 meme-server(:9882) 双双死亡也没人拉——故障完全隐形，
+  // 直到手工查端口才发现语音识别已经挂了。
+  // 现在：进入暂停时立刻记一行，此后每 10 分钟复述一次，恢复时再记一行。
+  if (fs.existsSync(PAUSE_FILE)) {
+    const nowMs = Date.now();
+    if (pausedSince === null) {
+      pausedSince = nowMs;
+      lastPauseLogAt = 0;
+      log('⚠️ 检测到人工停止标记（state/watchdog-pause），看门狗已暂停：不再巡检桥接/网关/语音/表情服务。删除该文件或点「一键启动全链」即恢复。');
+    }
+    if (nowMs - lastPauseLogAt > 600000) {
+      lastPauseLogAt = nowMs;
+      log(`⏸ 仍处于人工暂停中（已 ${Math.round((nowMs - pausedSince) / 60000)} 分钟）：whisper/meme 等常驻服务在此期间不会被自动拉起。`);
+    }
+    return;
+  }
+  if (pausedSince !== null) {
+    log(`▶️ 人工停止标记已移除，看门狗恢复巡检（本次共暂停 ${Math.round((Date.now() - pausedSince) / 60000)} 分钟）。`);
+    pausedSince = null;
+    lastPauseLogAt = 0;
+  }
 
   if (!(await httpOk('http://127.0.0.1:3100/panel'))) {
     if (Date.now() - lastBridgeStart > 90000) {
@@ -149,7 +170,12 @@ async function tick() {
   }
 
   // 鲸鲸 3.0 P2：meme 服务常驻（冷启动预热全表约 3-10s）
-  if (!(await httpOk('http://127.0.0.1:9882/health'))) {
+  if (fs.existsSync(MEME_NOSPAWN_FILE)) {
+    if (!memeNoSpawnLogged) {
+      memeNoSpawnLogged = true;
+      log('meme-server 已被 state/meme-nospawn 标记禁用（主人要求关掉那个弹窗程序），跳过拉起。删除该文件即恢复。');
+    }
+  } else if (!(await httpOk('http://127.0.0.1:9882/health'))) {
     if (Date.now() - lastMemeStart > 300000) {
       const pid = startMeme();
       lastMemeStart = Date.now();
@@ -176,7 +202,17 @@ function otherWatchdogPid() {
 
 if (once) {
   await tick();
-  process.exit(0);
+  // Bug #20（m13754）：原来是直接 `process.exit(0)`。但 tick() 刚刚 spawn 过子进程
+  // （whisper/meme/bridge）并把日志 fd 交给了它，libuv 里对应的 async handle 还处在
+  // closing 状态，被 process.exit() 强行拆掉，Windows 上直接触发：
+  //   Assertion failed: !(handle->flags & UV_HANDLE_CLOSING), file src\win\async.c, line 94
+  // 进程以非 0 退出码 abort，计划任务会误报失败（而且这行 assert 只在调用方控制台，
+  // 从不落 watchdog.log，所以潜伏很久没人发现）。
+  // 改法：先设 exitCode 让主逻辑判成功，把控制权交回事件循环自然排空；再挂一个
+  // unref 的兜底定时器，万一还有句柄把循环吊住，5 秒后强退，保证 --once 永不会挂死。
+  process.exitCode = 0;
+  const guard = setTimeout(() => process.exit(0), 5000);
+  guard.unref();
 } else {
   const alive = otherWatchdogPid();
   if (alive !== null) {

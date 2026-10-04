@@ -8789,11 +8789,19 @@ async function main() {
   //   interface LlmModelReasoningInfo { efforts: readonly { id, name, description? }[]; defaultEffort?: ReasoningEffortId }
   //   interface LlmResolvedModelInfo extends LlmModelInfo { reasoning?: LlmModelReasoningInfo }
   const KNOWN_MODEL_CAPS = Object.freeze({
-    // 仅在 DSH 不可达时降级使用——主路径走 resolveLiveCaps() 实时拉。
+    // ⚠️ 这只是**离线兜底表**，DSH 可达时 vision 走 resolveLiveCaps() 实时读 settings。
+    //
+    // m13638 事故教训（主人报「又识不了图」三次）：真正决定 DSH 是否把图片块交给模型的，
+    // 是 settings.yaml 里每个模型的 `input` 数组（如 [text, image]）。本表漏了某个供应商时，
+    // /panel 会谎报 vision:false，而图片会被 DSH 悄悄替换成文本桩：
+    //   [image unavailable: image/jpeg; model "MiniMax-M3" does not declare image input;
+    //    raw image data remains available to programmatic callers]
+    // 排查「识不了图」时不要只看这张表，要看 settings 的 input 声明 + 会话记录里有没有上面这行桩。
     'deepseek-official/deepseek-flash':     { efforts: ['off', 'low', 'high', 'max'], defaultEffort: 'high', vision: true,  note: '多模态，支持识图' },
     'deepseek-official/deepseek-chat':      { efforts: ['off', 'low', 'high', 'max'], defaultEffort: 'high', vision: false, note: '纯文本' },
     'deepseek-official/deepseek-reasoner':  { efforts: ['off', 'low', 'high', 'max'], defaultEffort: 'high', vision: false, note: '推理增强，不接图' },
     'dk/deepseek-flash':                    { efforts: [],                              defaultEffort: null,     vision: true,  note: 'pi-ai 路由整体不接受 reasoningEffort 字段（实测：选 low/high/max 都报"does not support"）；支持识图' },
+    'minimaxj/MiniMax-M3':                  { efforts: [],                              defaultEffort: null,     vision: true,  note: '原生多模态（实测直连 API 读图正确）；pi-ai 路由同样不接受 reasoningEffort。真正生效仍取决于 settings 里 input 含 image' },
   });
   const lookupModelCaps = (provider, model) => KNOWN_MODEL_CAPS[`${provider}/${model}`] ?? null;
   // 实时缓存：5 分钟 TTL（面板预览频繁，DSH RPC 不需要每次重拉）
@@ -8844,12 +8852,31 @@ async function main() {
     } catch (err) {
       log(`[model-caps] 实时拉 ${key} catalog 失败（${err?.message ?? err}），仅用本地表`);
     }
-    // vision + note 信息本地表独享（DSH catalog 没暴露）
+    // ── vision：实时读 DSH settings 里该模型的 `input` 声明（m13638 事故后加固）──
+    // catalog 不暴露 inputModalities，但 settings 暴露：provider.models[].input = ['text','image']。
+    // 这才是 DSH 真正用来决定「要不要把图片块降级成文本桩」的字段；本地表只是兜底。
+    // 返回 liveVision === null 表示 settings 里没读到该字段 → 回退本地表。
+    let liveVision = null, visionSource = 'local';
+    try {
+      const desc = unwrap(await api.settings.describe({}), 'settings.describe');
+      const nsList = desc?.namespaces;
+      const ns = Array.isArray(nsList)
+        ? nsList.find((n) => n?.ns === 'llm-pi-ai')
+        : nsList?.['llm-pi-ai'];
+      const prov = ns?.value?.providers?.[provider];
+      const entry = (Array.isArray(prov?.models) ? prov.models : [])
+        .find((m) => String(m?.id) === String(model));
+      const raw = Array.isArray(entry?.input) ? entry.input : (Array.isArray(prov?.input) ? prov.input : null);
+      if (raw) { liveVision = raw.map(String).includes('image'); visionSource = 'settings'; }
+    } catch (err) {
+      log(`[model-caps] 实时拉 ${key} 的 settings 失败（${err?.message ?? err}），vision 回退本地表`);
+    }
     const local = lookupModelCaps(provider, model);
     const caps = {
       efforts: efforts && efforts.length ? efforts : (local?.efforts ?? null),
       defaultEffort: defaultEffort ?? local?.defaultEffort ?? null,
-      vision: local?.vision === true,
+      vision: liveVision ?? (local?.vision === true),
+      visionSource, // 'settings' = 实时可信；'local' = 兜底猜的
       note: description ?? local?.note ?? null,
       live: Array.isArray(efforts) && efforts.length > 0, // 标记是否真的从 DSH 拉到了非空 reasoning 元数据
     };
@@ -8958,6 +8985,18 @@ async function main() {
       lastAppliedEffortReason.delete(sessionId);
     }
     log(`已设置会话模型 ${sessionId} -> ${result.selected.provider}/${result.selected.model} (${result.selected.reasoningEffort ?? '默认'}${fellBack ? ' [自动降级]' : ''})`);
+    // m13638：主人报「又识不了图」的根因是模型不声明 image 输入，DSH 会把图片块静默换成文本桩，
+    // 界面上看不出任何报错。这里每次应用会话模型时显式检查一次并吼出来，避免同类问题再潜伏十几小时。
+    try {
+      const visCaps = await resolveLiveCaps(provider, model);
+      if (visCaps?.vision !== true) {
+        log(`⚠️ 识图告警：${provider}/${model} 未声明图片输入（vision=false，来源 ${visCaps?.visionSource ?? 'unknown'}）——`
+          + `DSH 会把所有图片降级成 "[image unavailable: model does not declare image input]" 文本桩，鲸鲸将彻底看不见图。`
+          + `修法：在 DSH settings 的 llm-pi-ai.providers.${provider}.models 里给 ${model} 加 input: [text, image]（改完无需重启桥接）。`);
+      }
+    } catch (visErr) {
+      log(`[ensure-chat-model] 识图能力检查失败（忽略）: ${visErr?.message ?? visErr}`);
+    }
   }
 
   async function ensureSession(key) {
