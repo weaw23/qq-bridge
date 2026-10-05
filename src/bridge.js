@@ -1276,13 +1276,16 @@ async function main() {
     if (slangLearnerSessionId) {
       learnerSessions.add(slangLearnerSessionId);
       api.events.follow(slangLearnerSessionId);
+      // 复用路径原先完全不挂模型：桥接重启后从磁盘恢复的会话会保留上次的模型，
+      // 主模型换人后黑话学习会一直偷偷跑旧模型（m14912 分级路由时补上）。
+      await ensureChatModel(slangLearnerSessionId, 'learn');
       return slangLearnerSessionId;
     }
     if (saved?.sessionId && saved.preset === preset) {
       slangLearnerSessionId = String(saved.sessionId);
       learnerSessions.add(slangLearnerSessionId);
       api.events.follow(slangLearnerSessionId);
-      await ensureChatModel(slangLearnerSessionId);
+      await ensureChatModel(slangLearnerSessionId, 'learn');
       return slangLearnerSessionId;
     }
     const dir = path.join(STATE_DIR, 'slang-agent');
@@ -1298,7 +1301,7 @@ async function main() {
     slangLearnerSessionId = value.sessionId;
     learnerSessions.add(slangLearnerSessionId);
     api.events.follow(slangLearnerSessionId);
-    await ensureChatModel(slangLearnerSessionId);
+    await ensureChatModel(slangLearnerSessionId, 'learn');
     fs.mkdirSync(STATE_DIR, { recursive: true });
     atomicWriteJson(SLANG_SESSION_FILE, { sessionId: slangLearnerSessionId, preset });
     log(`黑话学习会话已创建：${slangLearnerSessionId}`);
@@ -1917,6 +1920,7 @@ async function main() {
     reverse.delete(sessionId);
     collectors.delete(sessionId);
     modelAppliedSessions.delete(sessionId);
+    sessionRoutes.delete(sessionId);
     sendToolSucceededSessions.delete(sessionId);
     pendingSendToolCalls.delete(sessionId);
     v2TurnStartAt.delete(sessionId);
@@ -6093,21 +6097,39 @@ async function main() {
             modelUsage: sizeOf(MODEL_USAGE_FILE),
             sessionCount
           };
-          // 面板·C4 模型用量：按供应商/模型分组的回合数（今日 + 累计）。
+          // 面板·C4 模型用量：按供应商/模型分组的回合数 + 真实 token（今日 + 累计）。
+          // m14912 起账本带 token：只看回合数会得出完全错误的结论——gemini-3.8-flash
+          // 只跑了 25 个回合，却因为没有 prompt 缓存把余额烧穿了一半。
           const usageEntries = readModelUsage(20000);
           const usageBy = new Map();
           for (const e of usageEntries) {
             if (!e?.provider || !e?.model) continue;
             const k = e.provider + '/' + e.model;
-            const rec = usageBy.get(k) ?? { provider: e.provider, model: e.model, turns: 0, turnsToday: 0 };
+            const rec = usageBy.get(k) ?? {
+              provider: e.provider, model: e.model, turns: 0, turnsToday: 0,
+              inputTokens: 0, cacheReadTokens: 0, outputTokens: 0, requests: 0,
+              inputTokensToday: 0, cacheReadTokensToday: 0,
+            };
             rec.turns += 1;
-            if (e.time && localDay(e.time) === todayKey) rec.turnsToday += 1;
+            rec.inputTokens += Number(e.inputTokens) || 0;
+            rec.cacheReadTokens += Number(e.cacheReadTokens) || 0;
+            rec.outputTokens += Number(e.outputTokens) || 0;
+            rec.requests += Number(e.requests) || 0;
+            if (e.time && localDay(e.time) === todayKey) {
+              rec.turnsToday += 1;
+              rec.inputTokensToday += Number(e.inputTokens) || 0;
+              rec.cacheReadTokensToday += Number(e.cacheReadTokens) || 0;
+            }
             usageBy.set(k, rec);
           }
           const modelUsage = {
-            note: '回合数（DSH 2.0.5 事件流不含 token 用量，如实用回合数观测成本）',
+            note: '回合数 + 真实 token（inputTokens=新增、cacheReadTokens=命中的历史前缀，真实上下文=两者相加；'
+              + '无缓存供应商会把整个上下文按新增计价，缓存命中率是最该盯的数字）',
             since: usageEntries.length ? usageEntries[0].time : null,
-            rows: [...usageBy.values()].sort((a, b) => b.turnsToday - a.turnsToday || b.turns - a.turns).slice(0, 20)
+            rows: [...usageBy.values()]
+              .map((r) => ({ ...r, cacheHitRate: (r.inputTokens + r.cacheReadTokens) > 0
+                ? Math.round(r.cacheReadTokens / (r.inputTokens + r.cacheReadTokens) * 1000) / 10 : null }))
+              .sort((a, b) => b.turnsToday - a.turnsToday || b.turns - a.turns).slice(0, 20)
           };
           sendJson({
             ok: true,
@@ -6164,7 +6186,12 @@ async function main() {
             dshReady,
             gateway: login.online,
             qq: login,
-            model: { provider: cfg.dsh?.provider ?? '', model: cfg.dsh?.model ?? '', reasoningEffort: cfg.dsh?.reasoningEffort ?? 'default', profile: cfg.dsh?.activeProfile ?? null },
+            model: {
+              provider: cfg.dsh?.provider ?? '', model: cfg.dsh?.model ?? '', reasoningEffort: cfg.dsh?.reasoningEffort ?? 'default', profile: cfg.dsh?.activeProfile ?? null,
+              // m14912 分级路由：面板要能看到「正聊走谁、学习走谁」，否则改完也不知道生效没有。
+              roles: cfg.dsh?.roles ?? {},
+              roleRoutes: { chat: resolveRoleRoute('chat'), learn: resolveRoleRoute('learn') }
+            },
             allowPrivate: cfg.allow?.private ?? [],
             allowGroups: cfg.allow?.groups ?? [],
             groupsDisabled: cfg.groupsDisabled ?? [],
@@ -6368,7 +6395,10 @@ async function main() {
                 fellBackReason: fellBackReasons[0] ?? null,
                 caps: curCaps || null,
               },
-              profiles: cfg.dsh?.profiles ?? {}
+              profiles: cfg.dsh?.profiles ?? {},
+              // m14912 分级路由：面板两个下拉要回显当前覆盖与实际生效值
+              roles: cfg.dsh?.roles ?? {},
+              roleRoutes: { chat: resolveRoleRoute('chat'), learn: resolveRoleRoute('learn') }
             });
           } catch (error) {
             sendJson({ ok: false, error: '读取 DSH 模型设置失败：' + (error?.message ?? error) }, 500);
@@ -6608,6 +6638,41 @@ async function main() {
           return;
         }
 
+        // B·分级路由（m14912）：把「背景学习任务」和「QQ 正聊」拆到不同供应商/模型——
+        // 不重要的连便宜的、重要的连贵的。body: { role:'chat'|'learn', provider, model, reasoningEffort? }；
+        // provider 与 model 都传空 = 清除该角色的覆盖，回落 cfg.dsh.*（等价于改动之前的行为）。
+        if (req.method === 'POST' && url.pathname === '/api/panel/model-role-save') {
+          const body = await readBody();
+          const role = String(body.role ?? '').trim();
+          if (role !== 'chat' && role !== 'learn') { sendJson({ ok: false, error: 'role 只能是 chat 或 learn' }, 400); return; }
+          const provider = String(body.provider ?? '').trim();
+          const model = String(body.model ?? '').trim();
+          const effort = String(body.reasoningEffort ?? '').trim();
+          const roles = { ...(cfg.dsh?.roles ?? {}) };
+          if (!provider && !model) delete roles[role];
+          else roles[role] = { provider, model, ...(effort ? { reasoningEffort: effort } : {}) };
+          cfg.dsh = { ...(cfg.dsh ?? {}), roles };
+          try {
+            const configFile = path.join(ROOT, 'config.json');
+            const file = readJsonSafe(configFile, null, true) ?? {};
+            file.dsh = { ...(file.dsh ?? {}), roles };
+            fs.writeFileSync(configFile, JSON.stringify(file, null, 2) + '\n');
+          } catch (error) { sendJson({ ok: false, error: '配置保存失败：' + (error?.message ?? error) }, 500); return; }
+          // 立刻热应用一遍：清会话级标记后按角色重挂。学习会话当场切档，QQ 会话不受影响。
+          modelAppliedSessions.clear();
+          const learnerIds = new Set([memorySessionId, slangLearnerSessionId].filter(Boolean));
+          const uniq = [...new Set([...Object.values(state.sessions ?? {}), ...learnerIds].filter(Boolean))];
+          let hot = 0;
+          for (const sid of uniq) {
+            await ensureChatModel(sid, learnerIds.has(sid) ? 'learn' : 'chat');
+            if (modelAppliedSessions.has(sid)) hot += 1;
+          }
+          const route = resolveRoleRoute(role);
+          log(`[panel] 分级路由 [${role}] 已保存：${provider || '(跟随主模型)'} / ${model || '(跟随主模型)'}${effort ? ' effort=' + effort : ''}；热切换 ${hot}/${uniq.length} 个会话（新会话立即生效）`);
+          sendJson({ ok: true, role, roles, route, hot, total: uniq.length });
+          return;
+        }
+
         // B·档案热切换：写默认配置 + 清应用标记 + 全部会话（含记忆/黑话两个内部会话）重跑 selectModel
         if (req.method === 'POST' && url.pathname === '/api/panel/model-profile-apply') {
           const body = await readBody();
@@ -6628,14 +6693,14 @@ async function main() {
             fs.writeFileSync(configFile, JSON.stringify(file, null, 2) + '\n');
           } catch (error) { sendJson({ ok: false, error: '配置保存失败：' + (error?.message ?? error) }, 500); return; }
           modelAppliedSessions.clear();
-          const targets = [...Object.values(state.sessions ?? {})];
-          if (memorySessionId) targets.push(memorySessionId);
-          if (slangLearnerSessionId) targets.push(slangLearnerSessionId);
+          // m14912 分级路由：两个内部学习会话走 learn 角色，QQ 会话走 chat 角色。
+          const learnerIds = new Set([memorySessionId, slangLearnerSessionId].filter(Boolean));
+          const targets = [...Object.values(state.sessions ?? {}), ...learnerIds];
           const uniq = [...new Set(targets.filter(Boolean))];
           let hot = 0;
           const failedSessions = [];
           for (const sid of uniq) {
-            await ensureChatModel(sid);
+            await ensureChatModel(sid, learnerIds.has(sid) ? 'learn' : 'chat');
             if (modelAppliedSessions.has(sid)) hot += 1; else failedSessions.push(sid);
           }
           // C3 预警：供应商不在目录 / 密钥未配置 → 前端红字展示
@@ -8909,11 +8974,37 @@ async function main() {
   const lastAppliedEffort = new Map();
   // 每个会话上次发生降级的人话原因（null/undefined = 上次无降级；其他 = 降级原因）。
   const lastAppliedEffortReason = new Map();
-  async function ensureChatModel(sessionId) {
+  // 每个会话**实际落地**的路由（provider/model/role）。
+  // 用量账本必须按它记账：一旦 roles 或模型档案把不同会话分到了不同供应商，
+  // 再用 cfg.dsh.* 记账就会把所有回合都算到主模型头上——那正好会让
+  // 「哪个模型在烧钱」这个最关键的问题失去答案（m14912 余额案就是这么被掩盖的）。
+  const sessionRoutes = new Map();
+  // ── 分级路由（m14912）──────────────────────────────────────────────
+  // 背景学习任务（记忆 Episode/事实账本/黑话/人格/兴趣/规划）量大、容错高、不需要多模态；
+  // QQ 正聊量小但要好模型。两者允许挂不同供应商/模型：
+  //   cfg.dsh.roles = { chat: {provider,model,reasoningEffort}, learn: {...} }
+  // 未配置 roles、或某角色缺某个字段时，逐字段回落到 cfg.dsh.*，行为与配置前完全等价。
+  // 之所以做成「角色 → 路由」而不是「一律 selectModel 覆盖」：DSH 的 selectModel 是
+  // 会话级且幂等，桥接需要在建会话那一刻就知道该给这个会话挂哪条路由。
+  function resolveRoleRoute(role) {
+    const baseProvider = String(cfg.dsh?.provider || 'deepseek-official');
+    const baseModel = String(cfg.dsh?.model || 'deepseek-flash');
+    const baseEffort = cfg.dsh?.reasoningEffort;
+    const r = (cfg.dsh?.roles && cfg.dsh.roles[role]) || null;
+    if (!r) return { provider: baseProvider, model: baseModel, reasoningEffort: baseEffort };
+    return {
+      provider: String(r.provider || baseProvider),
+      model: String(r.model || baseModel),
+      reasoningEffort: r.reasoningEffort === undefined ? baseEffort : r.reasoningEffort,
+    };
+  }
+
+  async function ensureChatModel(sessionId, role = 'chat') {
     if (modelAppliedSessions.has(sessionId)) return;
-    const provider = String(cfg.dsh?.provider || 'deepseek-official');
-    const model = String(cfg.dsh?.model || 'deepseek-flash');
-    const rawEffort = cfg.dsh?.reasoningEffort;
+    const route = resolveRoleRoute(role);
+    const provider = route.provider;
+    const model = route.model;
+    const rawEffort = route.reasoningEffort;
     // 本机模型目录各自声明支持的 effort 档位；'default'/空 = 不发送该字段，交给模型默认档。
     const effort = rawEffort === undefined || rawEffort === null || String(rawEffort) === '' || String(rawEffort) === 'default'
       ? undefined
@@ -8987,12 +9078,17 @@ async function main() {
     }
     modelAppliedSessions.add(sessionId);
     lastAppliedEffort.set(sessionId, effortUsed);
+    sessionRoutes.set(sessionId, {
+      provider: String(result.selected.provider ?? provider),
+      model: String(result.selected.model ?? model),
+      role,
+    });
     if (fellBack) {
       lastAppliedEffortReason.set(sessionId, `档位 ${userEffort ?? '(default)'} 不被 ${provider}/${model} 支持，已自动改用模型内置默认档`);
     } else {
       lastAppliedEffortReason.delete(sessionId);
     }
-    log(`已设置会话模型 ${sessionId} -> ${result.selected.provider}/${result.selected.model} (${result.selected.reasoningEffort ?? '默认'}${fellBack ? ' [自动降级]' : ''})`);
+    log(`已设置会话模型 ${sessionId} [${role}] -> ${result.selected.provider}/${result.selected.model} (${result.selected.reasoningEffort ?? '默认'}${fellBack ? ' [自动降级]' : ''})`);
     // m13638：主人报「又识不了图」的根因是模型不声明 image 输入，DSH 会把图片块静默换成文本桩，
     // 界面上看不出任何报错。这里每次应用会话模型时显式检查一次并吼出来，避免同类问题再潜伏十几小时。
     try {
@@ -11173,7 +11269,13 @@ async function main() {
         spanFrom: lines[0]?.time, spanTo: lines[lines.length - 1]?.time,
         msgCount: lines.length, now: Date.now()
       });
-      if (!episode) { log('[memoryV2] Episode 解析为空（' + key + '）'); failMap[key] = Date.now(); saveMemoryV2MetaSoon(); return; }
+      // 「解析为空」原先只在日志里留一句结论，模型到底回了什么完全看不到，事后无法定位是
+      // 模型跑题、被截断，还是 learn 档模型不接受这个 prompt 形状。带上原始输出片段（m14912）。
+      if (!episode) {
+        const raw = String(output ?? '').replace(/\s+/g, ' ').slice(0, 220);
+        log(`[memoryV2] Episode 解析为空（${key}）原始输出(${String(output ?? '').length}字)：${raw || '(空字符串)'}`);
+        failMap[key] = Date.now(); saveMemoryV2MetaSoon(); return;
+      }
       memoryV2Store.episodes.push(episode);
       const maxKeep = Number(opts.maxKeep) || 5000;
       if (memoryV2Store.episodes.length > maxKeep) memoryV2Store.episodes = memoryV2Store.episodes.slice(-maxKeep);
@@ -11579,13 +11681,16 @@ async function main() {
     if (memorySessionId) {
       learnerSessions.add(memorySessionId);
       api.events.follow(memorySessionId);
+      // 复用路径原先不挂模型（同黑话会话）：桥接重启后记忆会话会保留上次的模型。
+      // m14912 分级路由：背景学习任务统一走 learn 角色。
+      await ensureChatModel(memorySessionId, 'learn');
       return memorySessionId;
     }
     if (saved?.sessionId && saved.preset === preset) {
       memorySessionId = String(saved.sessionId);
       learnerSessions.add(memorySessionId);
       api.events.follow(memorySessionId);
-      await ensureChatModel(memorySessionId);
+      await ensureChatModel(memorySessionId, 'learn');
       return memorySessionId;
     }
     const dir = path.join(STATE_DIR, 'memory-agent');
@@ -11596,7 +11701,7 @@ async function main() {
     memorySessionId = String(value.sessionId);
     learnerSessions.add(memorySessionId);
     api.events.follow(memorySessionId);
-    await ensureChatModel(memorySessionId);
+    await ensureChatModel(memorySessionId, 'learn');
     try { fs.writeFileSync(MEMORY_SESSION_FILE, JSON.stringify({ sessionId: memorySessionId, preset }, null, 2)); } catch {}
     log('记忆整理会话已创建: ' + memorySessionId);
     return memorySessionId;
@@ -12129,8 +12234,9 @@ async function main() {
     }
   }
 
-  // 面板·C4 模型用量记账：每个回合（turn/end）落一行 {time,key,provider,model}。
-  // DSH 2.0.5 事件流不暴露 token 用量，如实用「回合数」做成本观测，不假装有 token 数。
+  // 面板·C4 模型用量账本：每个回合（turn/end）落一行
+  // {time,key,provider,model,requests,inputTokens,cacheReadTokens,outputTokens,maxContext}。
+  // m14912 之前只有前四项（当时误判 DSH 不暴露 token），导致「便宜模型烧掉一半余额」无法解释。
   function readModelUsage(limit = 5000) {
     try {
       const raw = fs.readFileSync(MODEL_USAGE_FILE, 'utf8');
@@ -12145,14 +12251,28 @@ async function main() {
     }
   }
 
+  // 模型用量账本。原本只记「谁在什么时候跑了一回合」，token 数当时认为 DSH 不暴露；
+  // m14912 余额案之后确认 DSH 事件流里的 assistant/chunk > usage 块带真实 token 账
+  // （inputTokens=新增、cacheReadTokens=被缓存的历史前缀，真实上下文=两者相加），
+  // 所以现在把每回合的 token 也记下来——不然「便宜一半却烧掉一半余额」这种事
+  // 只能等余额见底才知道。
   function appendModelUsage(entry) {
     try {
       fs.mkdirSync(STATE_DIR, { recursive: true });
-      fs.appendFileSync(MODEL_USAGE_FILE, JSON.stringify({
+      const row = {
         time: entry.time || new Date().toISOString(),
         key: entry.key, provider: entry.provider, model: entry.model
-      }) + '\n', 'utf8');
+      };
+      if (entry.requests != null) row.requests = entry.requests;
+      if (entry.inputTokens != null) row.inputTokens = entry.inputTokens;
+      if (entry.cacheReadTokens != null) row.cacheReadTokens = entry.cacheReadTokens;
+      if (entry.outputTokens != null) row.outputTokens = entry.outputTokens;
+      if (entry.maxContext != null) row.maxContext = entry.maxContext;
+      fs.appendFileSync(MODEL_USAGE_FILE, JSON.stringify(row) + '\n', 'utf8');
       // 与工具日志同样的防膨胀：保留最近 20000 行（按回合计，一天几百回合也够用近两个月）。
+      // 但每次回合都整文件读一遍会很浪费（现在每行还带 token，文件更大），
+      // 所以先看体积，只有明显超了才真去裁剪。
+      if (fs.statSync(MODEL_USAGE_FILE).size < 4 * 1024 * 1024) return;
       const raw = fs.readFileSync(MODEL_USAGE_FILE, 'utf8');
       const lines = raw.split('\n');
       if (lines.length > 20000) {
@@ -13953,6 +14073,31 @@ async function main() {
                 const learnerEnded = learnerCollector.push(frame.event);
                 if (learnerEnded) {
                   learnerCollectors.delete(frame.sessionId);
+                  // 背景学习任务的用量单独记账：这是「量大、容错高」的那一半流量，
+                  // 也是分级路由里最该被压到便宜模型上的一半。以前完全不记，
+                  // 于是学习会话烧掉多少 token 根本无从查起（m14912）。
+                  try {
+                    const lr = sessionRoutes.get(frame.sessionId) ?? resolveRoleRoute('learn');
+                    const lu = learnerEnded.usage;
+                    appendModelUsage({
+                      time: new Date().toISOString(),
+                      key: frame.sessionId === memorySessionId ? 'learn:memory'
+                        : (frame.sessionId === slangLearnerSessionId ? 'learn:slang' : 'learn:other'),
+                      provider: lr.provider, model: lr.model,
+                      requests: lu?.requests ?? null,
+                      inputTokens: lu?.inputTokens ?? null,
+                      cacheReadTokens: lu?.cacheReadTokens ?? null,
+                      outputTokens: lu?.outputTokens ?? null,
+                      maxContext: lu?.maxContext ?? null,
+                    });
+                    // 学习任务失败/重试是「钱花了但什么也没学到」的主要来源，必须留下人话痕迹。
+                    if (learnerEnded.reason?.kind !== 'completed' && lu?.requests) {
+                      log(`[用量] 学习回合未正常完成（${lr.provider}/${lr.model}，${lu.requests} 次请求 / ${
+                        (lu.inputTokens + lu.cacheReadTokens).toLocaleString('en-US')} 上下文 token / 缓存命中 ${
+                        lu.inputTokens + lu.cacheReadTokens > 0 ? Math.round(lu.cacheReadTokens / (lu.inputTokens + lu.cacheReadTokens) * 100) : 0}%）：${
+                        learnerEnded.reason?.error?.message ?? learnerEnded.reason?.kind}`);
+                    }
+                  } catch {}
                   const waiters = learnerWaiters.get(frame.sessionId) ?? [];
                   const waiter = waiters.shift();
                   if (waiters.length === 0) learnerWaiters.delete(frame.sessionId);
@@ -13964,8 +14109,14 @@ async function main() {
                       waiter.reject(new Error(`学习会话 turn 未正常完成：${learnerEnded.reason.kind}`));
                     }
                   }
-                  // 旧学习会话 turn 结束后从集合移除，避免残留
-                  if (frame.sessionId !== slangLearnerSessionId) learnerSessions.delete(frame.sessionId);
+                  // 旧学习会话 turn 结束后从集合移除，避免残留。
+                  // 但 memorySessionId / slangLearnerSessionId 是长驻学习会话，必须始终留在集合里：
+                  // 一旦被摘除，与上一个任务重叠的等待者就再也收不到 turn/end —— 这就是
+                  // 「等待学习会话 turn 超时」的根因：两个学习任务重叠时，A 的 turn/end 把会话
+                  // 摘掉，B 排在其后的 turn/end 落进 !learnerSessions.has() 分支被 continue 丢弃，
+                  // B 的 waiter 只能等满 60s 超时。记忆 Episode/事实、人格刷新、兴趣评估、晨间规划
+                  // 全都排队挤在这一个会话上，重叠是常态而非例外。
+                  if (frame.sessionId !== slangLearnerSessionId && frame.sessionId !== memorySessionId) learnerSessions.delete(frame.sessionId);
                 }
               }
               continue;
@@ -14033,8 +14184,28 @@ async function main() {
             const ended = collector.push(frame.event);
             if (ended) {
               // 面板·C4 模型用量记账：每个映射会话的 turn 都过这里（含静默投喂 turn）。
-              // token 数 DSH 2.0.5 事件流不暴露，只记回合数——诚实不假装。
-              appendModelUsage({ time: new Date().toISOString(), key: key ?? null, provider: String(cfg.dsh?.provider ?? ''), model: String(cfg.dsh?.model ?? '') });
+              // m14912 起带真实 token：usage 来自 DSH 事件流 assistant/chunk 的 usage 块。
+              // 按 sessionRoutes 里实际落地的路由记账，而不是 cfg.dsh.*——否则分级路由
+              // 一旦生效，账本会把学习会话的消耗也算到正聊模型头上。
+              {
+                const sr = sessionRoutes.get(frame.sessionId)
+                  ?? { provider: String(cfg.dsh?.provider ?? ''), model: String(cfg.dsh?.model ?? '') };
+                const u = ended.usage;
+                appendModelUsage({
+                  time: new Date().toISOString(), key: key ?? null,
+                  provider: sr.provider, model: sr.model,
+                  requests: u?.requests ?? null,
+                  inputTokens: u?.inputTokens ?? null,
+                  cacheReadTokens: u?.cacheReadTokens ?? null,
+                  outputTokens: u?.outputTokens ?? null,
+                  maxContext: u?.maxContext ?? null,
+                });
+                // 重试是账单上最贵的一种「什么都没发生」：同一个 step 反复全额重发上下文。
+                if (u && u.attempts > u.requests) {
+                  log(`[用量] 回合重试告警（${sr.provider}/${sr.model}）：${u.attempts} 次尝试 / ${u.requests} 个 step，`
+                    + `上下文 ${u.maxContext.toLocaleString('en-US')} token，本次共发出 ${(u.inputTokens + u.cacheReadTokens).toLocaleString('en-US')} input token`);
+                }
+              }
               // reserved2 无行动兜底：普通唤醒回合若既没发消息、也没 mark_read / set_wake_config，
               // 则累计 noActionCount；达到阈值后自动重置 WakeConfig，避免 AI 卡死。
               const silentQueueNow = social.silentTurns.get(frame.sessionId) ?? [];

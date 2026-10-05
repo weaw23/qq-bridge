@@ -344,6 +344,25 @@
       </div>
     </details>
     <div class="sep"></div>
+    <h2>分级路由<span class="hint">不重要的活连便宜模型、重要的活连贵模型；两处都留空 = 跟随主模型</span></h2>
+    <div class="rowstack" style="margin-bottom:10px">
+      <div class="lbl">QQ 正聊（chat）<span class="hint">主人和群友当下的对话，最看重质量、延迟和缓存命中</span></div>
+      <div class="ctl">
+        <select id="roleChatProvider" onchange="onRoleProviderChange('chat')" style="min-width:150px"></select>
+        <select id="roleChatModel" style="min-width:200px"></select>
+        <button class="sm primary" onclick="saveRole('chat')">保存并热应用</button>
+      </div>
+    </div>
+    <div class="rowstack">
+      <div class="lbl">背景学习（learn）<span class="hint">记忆 Episode / 事实账本 / 黑话 / 人格刷新 / 兴趣评估 / 晨间规划——量大、容错高、看不到输出</span></div>
+      <div class="ctl">
+        <select id="roleLearnProvider" onchange="onRoleProviderChange('learn')" style="min-width:150px"></select>
+        <select id="roleLearnModel" style="min-width:200px"></select>
+        <button class="sm primary" onclick="saveRole('learn')">保存并热应用</button>
+      </div>
+    </div>
+    <div class="muted" id="roleHint" style="margin-top:8px;font-size:11.5px;line-height:1.6"></div>
+    <div class="sep"></div>
     <div class="rowstack">
       <div class="lbl">网页搜索密钥（web-search-deepseek）<span class="hint">她上网搜资料用的 DeepSeek key，配好搜索工具才能用</span><span id="wsKeyState"></span></div>
       <div class="ctl">
@@ -890,10 +909,26 @@ async function refreshHealth(allowRetry = true) {
   const wd = h.watchdog || {};
   const today = h.today || {};
   const st = h.storage || {};
-  // C4：模型用量（按供应商/模型分组的回合数）
+  // C4：模型用量（按供应商/模型分组的回合数 + 真实 token）
   const mu = h.modelUsage || {};
-  const muRows = (mu.rows || []).map((r) =>
-    `<tr><td>${esc(r.provider)}</td><td>${esc(r.model)}</td><td class="num">${r.turnsToday ?? 0}</td><td class="num">${r.turns ?? 0}</td></tr>`).join('');
+  // 单位换算：token 数动辄上亿，原样打印没法看
+  const fmtTok = (n) => {
+    const v = Number(n) || 0;
+    if (v >= 1e9) return (v / 1e9).toFixed(2) + 'B';
+    if (v >= 1e6) return (v / 1e6).toFixed(2) + 'M';
+    if (v >= 1e3) return (v / 1e3).toFixed(1) + 'K';
+    return String(v);
+  };
+  const muRows = (mu.rows || []).map((r) => {
+    const hr = (r.cacheHitRate == null) ? '–' : r.cacheHitRate + '%';
+    // 缓存命中率低 = 每回合把整段上下文按新增计价重发。
+    // 这正是「单价便宜一半却烧掉一半余额」的机制，所以低命中直接标红。
+    const lowCache = r.cacheHitRate != null && r.cacheHitRate < 50 && (Number(r.inputTokens) + Number(r.cacheReadTokens)) > 0;
+    return `<tr><td>${esc(r.provider)}</td><td>${esc(r.model)}</td>`
+      + `<td class="num">${r.turnsToday ?? 0}</td><td class="num">${fmtTok(r.inputTokensToday)}</td>`
+      + `<td class="num">${fmtTok(r.inputTokens)}</td><td class="num">${fmtTok(r.cacheReadTokens)}</td>`
+      + `<td class="num ${lowCache ? 'bad' : ''}">${hr}</td></tr>`;
+  }).join('');
   const proactive = (today.proactive || []).map((p) =>
     `<div class="k">${esc(keyLabel(p.key))}</div><div>${p.used} / ${p.quota}（今日主动配额${p.allowed === false ? '，已满' : ''}）</div>`).join('');
   $('healthBody').innerHTML = `
@@ -938,8 +973,9 @@ async function refreshHealth(allowRetry = true) {
     </div>
     <div class="tile">
       <h3>模型用量（按供应商）</h3>
-      ${muRows ? `<table><tr><th>供应商</th><th>模型</th><th>今日回合</th><th>累计回合</th></tr>${muRows}</table>
-        <div class="muted" style="font-size:11.5px;margin-top:6px">${esc(mu.note || '')}${mu.since ? ' · 记账始于 ' + fmtTime(Date.parse(mu.since)) : ''}</div>`
+      ${muRows ? `<table><tr><th>供应商</th><th>模型</th><th>今日回合</th><th>今日新增 token</th><th>累计新增</th><th>累计缓存</th><th>缓存命中</th></tr>${muRows}</table>
+        <div class="muted" style="font-size:11.5px;margin-top:6px">${esc(mu.note || '')}${mu.since ? ' · 记账始于 ' + fmtTime(Date.parse(mu.since)) : ''}</div>
+        <div class="muted" style="font-size:11.5px;margin-top:4px">「新增 token」= 真正新算的部分；「缓存」= 命中缓存的既有上下文。缓存命中率低甚至为 0 的供应商，每次对话都会把整段上下文按新增价重发——单价再便宜也会烧穿余额。</div>`
         : '<div class="muted">还没有回合记录（她被唤醒并完成一轮后才开始记账）</div>'}
     </div>`;
 }
@@ -1015,6 +1051,7 @@ function renderLlm() {
       <div id="applyResult-${esc(name)}" class="muted" style="font-size:11.5px;margin-top:4px"></div>
     </div>`;
   }).join('') : '<div class="muted">还没有档案：建一套「日常档」「省钱档」，一键切换、会话不断</div>';
+  renderRoles();
 }
 
 // ── 供应商表单 ──
@@ -1178,6 +1215,60 @@ async function applyProfile(name) {
     if (box) { box.style.color = 'var(--bad)'; box.textContent = '切换失败：' + e.message; }
     toast('切换失败：' + e.message, true);
   }
+}
+
+// ── 分级路由（m14912）：chat / learn 两档各自挂供应商与模型 ──
+// 留空 = 跟随主模型（cfg.dsh.provider/model），等价于这个功能存在之前的行为。
+function fillRoleSelectors(role, provider, model) {
+  const all = [...(LLM?.providers || []), ...(LLM?.builtins || [])];
+  const psel = $(role === 'learn' ? 'roleLearnProvider' : 'roleChatProvider');
+  psel.innerHTML = '<option value="">（跟随主模型）</option>' + all.map((p) =>
+    `<option value="${esc(p.id)}" ${p.id === provider ? 'selected' : ''}>${esc(p.label || p.id)}${p.keyConfigured === false ? ' ⚠密钥未配' : ''}</option>`).join('');
+  fillRoleModels(role, model);
+}
+function fillRoleModels(role, presetModel) {
+  const psel = $(role === 'learn' ? 'roleLearnProvider' : 'roleChatProvider');
+  const msel = $(role === 'learn' ? 'roleLearnModel' : 'roleChatModel');
+  if (!psel.value) { msel.innerHTML = '<option value="">（跟随主模型）</option>'; msel.disabled = true; return; }
+  msel.disabled = false;
+  const all = [...(LLM?.providers || []), ...(LLM?.builtins || [])];
+  const p = all.find((x) => x.id === psel.value);
+  const models = (p?.models || []).map((m) => m.id);
+  msel.innerHTML = models.length
+    ? models.map((m) => `<option value="${esc(m)}" ${m === presetModel ? 'selected' : ''}>${esc(m)}</option>`).join('')
+    : '<option value="">（该供应商还没有模型，先去编辑供应商）</option>';
+  // 覆盖里引用了已删掉的供应商/模型时也回显出来，避免下拉静默改成别的值
+  if (presetModel && !models.includes(presetModel)) {
+    msel.insertAdjacentHTML('beforeend', `<option value="${esc(presetModel)}" selected>${esc(presetModel)}（不在目录）</option>`);
+  }
+}
+function onRoleProviderChange(role) { fillRoleModels(role, ''); }
+function renderRoles() {
+  if (!$('roleChatProvider') || !$('roleLearnProvider')) return;   // 页面还是旧版时静默跳过
+  const m = LLM?.current || {};
+  const saved = m.roles || {};
+  const routes = m.roleRoutes || {};
+  for (const role of ['chat', 'learn']) fillRoleSelectors(role, saved[role]?.provider || '', saved[role]?.model || '');
+  const cur = (r) => (r && r.provider) ? `${r.provider}/${r.model}` : '–';
+  $('roleHint').innerHTML =
+    `现在实际生效：正聊 <b>${esc(cur(routes.chat))}</b>${saved.chat ? '（已单独指定）' : '（跟随主模型）'} · ` +
+    `学习 <b>${esc(cur(routes.learn))}</b>${saved.learn ? '（已单独指定）' : '（跟随主模型）'}` +
+    `<br>挑学习档务必选<b>带 prompt 缓存</b>的供应商：背景任务每回合都要重发整段上下文，` +
+    `实测缓存命中 deepseek 97.8% / MiniMax-M3 93.7%，而没有缓存的供应商是全额计价——` +
+    `gemini-3.8-flash 那次 188 个请求打掉一亿两千七百万输入 token 就是这么烧的。`;
+}
+async function saveRole(role) {
+  const psel = $(role === 'learn' ? 'roleLearnProvider' : 'roleChatProvider');
+  const msel = $(role === 'learn' ? 'roleLearnModel' : 'roleChatModel');
+  const provider = psel.value, model = msel.value;
+  const label = role === 'learn' ? '背景学习' : 'QQ 正聊';
+  if (provider && !model) { toast('选了供应商就得选模型；想清除覆盖请两边都留空', true); return; }
+  try {
+    const r = await api('/api/panel/model-role-save', { method: 'POST', body: JSON.stringify({ role, provider, model }) });
+    toast(`${label} 已保存：${provider ? provider + ' / ' + model : '跟随主模型'}（热切换 ${r.hot}/${r.total} 个会话）`);
+    await refreshLlm(true);
+    refreshHer();
+  } catch (e) { toast('保存失败：' + e.message, true); }
 }
 
 // ── C2：网页搜索密钥 ──

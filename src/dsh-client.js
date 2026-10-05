@@ -628,19 +628,47 @@ export function unwrap(response, label) {
   throw new Error(`${label} failed: ${code}: ${message}`);
 }
 
-/** 在会话事件流里收集一次 turn 的 assistant 文本（按 turn 分组）。 */
+/**
+ * 在会话事件流里收集一次 turn 的 assistant 文本（按 turn 分组），顺带收集 token 账。
+ *
+ * 关于 token：DSH 的 usage 块藏在 `assistant/chunk` 流里（形如
+ * `{type:'assistant/chunk', data:{turn, step, chunk:{type:'usage', usage:{inputTokens,
+ * outputTokens, totalTokens, cacheReadTokens}}}}`）。语义是
+ *   inputTokens     = 本步新增（真正新算的）token
+ *   cacheReadTokens = 命中 prompt 缓存的既有上下文
+ *   真实上下文       = 两者相加
+ * 一个 turn 可能有多个 step（工具往返），每步都是一次真实计费请求，所以要累加而不是取最后一次。
+ * 一个 turn 若被告知传输错误（例如中转不返回 finish_reason），DSH 会对同一个 step 反复重试，
+ * 每次重试都全额重发上下文——这里的 requests 数正是为了把这种「重试风暴」暴露出来。
+ */
 export function createTurnCollector() {
-  const turns = new Map(); // turn -> { text }
+  const turns = new Map(); // turn -> { text, usage }
   return {
-    /** 处理一条 session/event，返回该事件是否终结了一个 turn（此时可取最终文本）。 */
+    /** 处理一条 session/event，返回该事件是否终结了一个 turn（此时可取最终文本与用量）。 */
     push(event) {
       if (event.type === 'turn/start') {
-        turns.set(event.data.turn, { text: '' });
+        turns.set(event.data.turn, { text: '', input: 0, cache: 0, output: 0, steps: new Set(), maxContext: 0, seen: 0 });
         return null;
       }
       if (event.type === 'assistant/chunk') {
         // 忽略流式分块：assistant/message 携带同一内容的完整组装文本，
         // 两者都累加会导致回复文本翻倍（曾因此把「收到」发成「收到收到」）。
+        // 但 usage 块必须收：DSH 只在这里报 token 账，漏掉就永远算不出钱花在哪儿。
+        const chunk = event.data?.chunk;
+        if (chunk?.type === 'usage' && chunk.usage) {
+          const t = turns.get(event.data.turn);
+          if (t) {
+            const u = chunk.usage;
+            const inTok = Number(u.inputTokens) || 0;
+            const cacheTok = Number(u.cacheReadTokens) || 0;
+            t.input += inTok;
+            t.cache += cacheTok;
+            t.output += Number(u.outputTokens) || 0;
+            t.seen += 1;
+            t.maxContext = Math.max(t.maxContext, inTok + cacheTok);
+            t.steps.add(String(event.data.step ?? t.seen));
+          }
+        }
         return null;
       }
       if (event.type === 'assistant/message') {
@@ -655,7 +683,20 @@ export function createTurnCollector() {
         const t = turns.get(event.data.turn);
         turns.delete(event.data.turn);
         if (!t) return null;
-        return { turn: event.data.turn, reason: event.data.reason, text: t.text };
+        return {
+          turn: event.data.turn,
+          reason: event.data.reason,
+          text: t.text,
+          // 没有任何 usage 块时给 null，让调用方知道「这次是真没数」而不是「数是 0」。
+          usage: t.seen ? {
+            requests: t.steps.size || t.seen,
+            attempts: t.seen,
+            inputTokens: t.input,
+            cacheReadTokens: t.cache,
+            outputTokens: t.output,
+            maxContext: t.maxContext
+          } : null
+        };
       }
       return null;
     },
