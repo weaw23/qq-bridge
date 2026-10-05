@@ -1245,7 +1245,11 @@ function fillRoleModels(role, presetModel) {
 function onRoleProviderChange(role) { fillRoleModels(role, ''); }
 function renderRoles() {
   if (!$('roleChatProvider') || !$('roleLearnProvider')) return;   // 页面还是旧版时静默跳过
-  const m = LLM?.current || {};
+  // Bug #26（2026-10-05）：roles/roleRoutes 是 /api/panel/llm-ns 的**顶层**字段
+  // （bridge.js:6192-6193 与 :6400-6401 都写在 sendJson 顶层，和 current 平级），
+  // 原来读 LLM.current.roles 永远拿到 undefined —— 面板每次都显示「跟随主模型」、
+  // 下拉回显不出已保存的值。主人要在控制台里配这个，回显错了就等于配不了。
+  const m = LLM || {};
   const saved = m.roles || {};
   const routes = m.roleRoutes || {};
   for (const role of ['chat', 'learn']) fillRoleSelectors(role, saved[role]?.provider || '', saved[role]?.model || '');
@@ -1253,9 +1257,10 @@ function renderRoles() {
   $('roleHint').innerHTML =
     `现在实际生效：正聊 <b>${esc(cur(routes.chat))}</b>${saved.chat ? '（已单独指定）' : '（跟随主模型）'} · ` +
     `学习 <b>${esc(cur(routes.learn))}</b>${saved.learn ? '（已单独指定）' : '（跟随主模型）'}` +
-    `<br>挑学习档务必选<b>带 prompt 缓存</b>的供应商：背景任务每回合都要重发整段上下文，` +
-    `实测缓存命中 deepseek 97.8% / MiniMax-M3 93.7%，而没有缓存的供应商是全额计价——` +
-    `gemini-3.8-flash 那次 188 个请求打掉一亿两千七百万输入 token 就是这么烧的。`;
+    `<br>主人已购 <b>MiniMax-M3 订购服务</b>，所以「贵/便宜」看的不是单价：M3 走订购、边际成本≈0，` +
+    `学习档跟随主模型（M3）通常最省。真要换供应商，务必挑<b>带 prompt 缓存</b>的——` +
+    `背景任务每回合都要重发整段上下文，实测缓存命中 deepseek 97.8% / MiniMax-M3 93.7%；` +
+    `gemini-3.8-flash 没有缓存，188 个请求就打掉一亿两千七百万输入 token。`;
 }
 async function saveRole(role) {
   const psel = $(role === 'learn' ? 'roleLearnProvider' : 'roleChatProvider');
